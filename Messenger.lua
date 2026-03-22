@@ -14,6 +14,8 @@ local os = require 'os'
 local io = require 'io'
 local ffi = require 'ffi'
 
+math.randomseed(os.time())
+
 ffi.cdef[[
     void* ShellExecuteA(void* hwnd, const char* lpOperation, const char* lpFile, const char* lpParameters, const char* lpDirectory, int nShowCmd);
 ]]
@@ -21,8 +23,6 @@ local shell32 = ffi.load('shell32')
 
 local dataFile = getWorkingDirectory() .. '\\config\\messenger_data.json'
 local settingsFile = getWorkingDirectory() .. '\\config\\messenger_settings.json'
-local updateFile = getWorkingDirectory() .. '\\config\\msg_update.json'
-local changelogFile = getWorkingDirectory() .. '\\config\\msg_changelog.txt'
 local phoneData = {}
 local imageCache = {}
 local activeTempFiles = {}
@@ -119,7 +119,7 @@ local months = {
 }
 
 local function save_json(path, data)
-    local file = io.open(path, "w")
+    local file = io.open(path, "wb")
     if file then
         local function serialize(tbl)
             local str = "{"
@@ -142,7 +142,7 @@ local function save_json(path, data)
 end
 
 local function load_json(path)
-    local file = io.open(path, "r")
+    local file = io.open(path, "rb")
     if file then
         local content = file:read("*a")
         file:close()
@@ -213,38 +213,53 @@ end
 function checkUpdates()
     if not globalSettings.autoUpdate then return end
     
-    downloadUrlToFile(updateUrl, updateFile, function(id, status)
+    local updateFile_tmp = getWorkingDirectory() .. '\\config\\msg_update_' .. tostring(math.random(100000, 999999)) .. '.json'
+    activeTempFiles[updateFile_tmp] = true
+    
+    local url_no_cache = updateUrl .. "?t=" .. tostring(os.time())
+    downloadUrlToFile(url_no_cache, updateFile_tmp, function(id, status)
         if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-            local f = io.open(updateFile, "r")
+            local f = io.open(updateFile_tmp, "rb")
+            local content = nil
             if f then
-                local content = f:read("*a")
+                content = f:read("*a")
                 f:close()
-                os.remove(updateFile)
-                if content then
-                    local data = nil
-                    local ok, res = pcall(decodeJson, content)
-                    if ok and type(res) == "table" then
-                        data = res
-                    else
-                        pcall(function()
-                            local func = load("return " .. content)
-                            if func then data = func() end
-                        end)
-                    end
-                    
-                    if data and data.version and data.url then
-                        if tonumber(data.version) > script_version then
-                            showSystemNotification(u8"Найдено обновление! Загрузка...", 3)
+            end
+            os.remove(updateFile_tmp)
+            activeTempFiles[updateFile_tmp] = nil
+            
+            if content and content ~= "" then
+                local data = nil
+                local ok, res = pcall(decodeJson, content)
+                if ok and type(res) == "table" then
+                    data = res
+                else
+                    pcall(function()
+                        local func = load("return " .. content)
+                        if func then data = func() end
+                    end)
+                end
+                
+                if data and data.version and data.url then
+                    if tonumber(data.version) > tonumber(script_version) then
+                        showSystemNotification(u8"Найдено обновление! Загрузка...", 3)
+                        
+                        lua_thread.create(function()
+                            wait(100)
+                            local changelogFile_tmp = getWorkingDirectory() .. '\\config\\msg_changelog_' .. tostring(math.random(100000, 999999)) .. '.txt'
+                            activeTempFiles[changelogFile_tmp] = true
                             
-                            downloadUrlToFile(changelogUrl, changelogFile, function(id_cl, status_cl)
+                            local cl_no_cache = changelogUrl .. "?t=" .. tostring(os.time())
+                            downloadUrlToFile(cl_no_cache, changelogFile_tmp, function(id_cl, status_cl)
                                 if status_cl == dlstatus.STATUS_ENDDOWNLOADDATA then
-                                    local fc = io.open(changelogFile, "r")
+                                    local fc = io.open(changelogFile_tmp, "rb")
                                     local changelogText = ""
                                     if fc then
                                         changelogText = fc:read("*a")
                                         fc:close()
-                                        os.remove(changelogFile)
                                     end
+                                    os.remove(changelogFile_tmp)
+                                    activeTempFiles[changelogFile_tmp] = nil
                                     
                                     local targetNick = actualPlayerNick
                                     if targetNick == "Default" then targetNick = myNick end
@@ -263,22 +278,62 @@ function checkUpdates()
                                         save_json(dataFile, phoneData)
                                     end
 
-                                    local scriptPath = thisScript().path
-                                    downloadUrlToFile(data.url, scriptPath, function(id2, status2)
-                                        if status2 == dlstatus.STATUS_ENDDOWNLOADDATA then
-                                            showSystemNotification(u8"Успешно обновлено! Перезапуск...", 1)
-                                            lua_thread.create(function()
-                                                wait(1500)
-                                                thisScript():reload()
-                                            end)
-                                        end
+                                    lua_thread.create(function()
+                                        wait(100)
+                                        local scriptPath = thisScript().path
+                                        local tempPath = scriptPath .. tostring(math.random(10000, 99999)) .. ".tmp"
+                                        activeTempFiles[tempPath] = true
+                                        
+                                        local dl_url_no_cache = data.url .. "?t=" .. tostring(os.time())
+                                        downloadUrlToFile(dl_url_no_cache, tempPath, function(id2, status2)
+                                            if status2 == dlstatus.STATUS_ENDDOWNLOADDATA then
+                                                local fTmp = io.open(tempPath, "rb")
+                                                if fTmp then
+                                                    local newCode = fTmp:read("*a")
+                                                    fTmp:close()
+                                                    os.remove(tempPath)
+                                                    activeTempFiles[tempPath] = nil
+                                                    
+                                                    if newCode:find("\208[\128-\191]") or newCode:find("\209[\128-\191]") then
+                                                        local decoded = u8:decode(newCode)
+                                                        if decoded then
+                                                            newCode = decoded
+                                                        end
+                                                    end
+                                                    
+                                                    local fOut = io.open(scriptPath, "wb")
+                                                    if fOut then
+                                                        fOut:write(newCode)
+                                                        fOut:close()
+                                                        
+                                                        showSystemNotification(u8"Успешно обновлено! Перезапуск...", 1)
+                                                        lua_thread.create(function()
+                                                            wait(1500)
+                                                            thisScript():reload()
+                                                        end)
+                                                    else
+                                                        showSystemNotification(u8"Ошибка: Файл скрипта занят!", 2)
+                                                    end
+                                                end
+                                            elseif status2 == dlstatus.STATUS_EX_ERROR then
+                                                os.remove(tempPath)
+                                                activeTempFiles[tempPath] = nil
+                                                showSystemNotification(u8"Ошибка при скачивании обновления!", 2)
+                                            end
+                                        end)
                                     end)
+                                elseif status_cl == dlstatus.STATUS_EX_ERROR then
+                                    os.remove(changelogFile_tmp)
+                                    activeTempFiles[changelogFile_tmp] = nil
                                 end
                             end)
-                        end
+                        end)
                     end
                 end
             end
+        elseif status == dlstatus.STATUS_EX_ERROR then
+            os.remove(updateFile_tmp)
+            activeTempFiles[updateFile_tmp] = nil
         end
     end)
 end
@@ -330,14 +385,18 @@ function main()
 
     checkUpdates()
 
-    local temp_news_file = getWorkingDirectory() .. '\\config\\temp_news.txt'
-    downloadUrlToFile(newsUrl, temp_news_file, function(id, status, p1, p2)
+    local temp_news_file = getWorkingDirectory() .. '\\config\\temp_news_' .. tostring(math.random(100000, 999999)) .. '.txt'
+    activeTempFiles[temp_news_file] = true
+    
+    local news_url_no_cache = newsUrl .. "?t=" .. tostring(os.time())
+    downloadUrlToFile(news_url_no_cache, temp_news_file, function(id, status, p1, p2)
         if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-            local f = io.open(temp_news_file, "r")
+            local f = io.open(temp_news_file, "rb")
             if f then
                 local text_utf8 = f:read("*a")
                 f:close()
                 os.remove(temp_news_file)
+                activeTempFiles[temp_news_file] = nil
 
                 if text_utf8 then
                     text_utf8 = text_utf8:gsub("\r", "")
@@ -375,6 +434,9 @@ function main()
                     end
                 end
             end
+        elseif status == dlstatus.STATUS_EX_ERROR then
+            os.remove(temp_news_file)
+            activeTempFiles[temp_news_file] = nil
         end
     end)
 
@@ -947,7 +1009,9 @@ local newFrame = imgui.OnFrame(
             if imgui.BeginPopupModal("SettingsModal", nil, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoTitleBar) then
                 imgui.Text(u8"Настройки мессенджера")
                 imgui.SameLine()
-                imgui.TextColored(imgui.ImVec4(0.5, 0.5, 0.5, 1.0), "v" .. tostring(script_version))
+                local ver_str = tostring(script_version)
+                if not ver_str:find("%.") then ver_str = ver_str .. ".0" end
+                imgui.TextColored(imgui.ImVec4(0.5, 0.5, 0.5, 1.0), "v" .. ver_str)
                 imgui.Spacing()
                 
                 imgui.Text(u8"Ваш профиль:")
