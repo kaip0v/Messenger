@@ -269,9 +269,7 @@ function checkUpdates()
                                         local sys_num = "System_News"
                                         if not profile.contacts[sys_num] then profile.contacts[sys_num] = "Уведомления" end
                                         
-                                        local header = "Скрипт обновлен до версии " .. tostring(data.version) .. "!\n\nЧто нового:\n"
-                                        local full_text = header .. changelogText
-                                        local text_cp1251 = u8:decode(full_text)
+                                        local text_cp1251 = u8:decode(changelogText)
                                         
                                         addSmsToHistory(profile, sys_num, "them", text_cp1251, os.time())
                                         profile.unread[sys_num] = true
@@ -1047,8 +1045,8 @@ local newFrame = imgui.OnFrame(
                                 phoneData[myNick] = { contacts = {}, history = {}, unread = {} }
                             end
                         else
-                            local any = next(phoneData)
-                            if any then myNick = any else myNick = "Default" end
+                            local local_any = next(phoneData)
+                            if local_any then myNick = local_any else myNick = "Default" end
                         end
                     end
                     
