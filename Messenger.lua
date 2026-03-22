@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1
+local script_version = 1.0
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -20,11 +20,22 @@ ffi.cdef[[
 local shell32 = ffi.load('shell32')
 
 local dataFile = getWorkingDirectory() .. '\\config\\messenger_data.json'
+local settingsFile = getWorkingDirectory() .. '\\config\\messenger_settings.json'
 local updateFile = getWorkingDirectory() .. '\\config\\msg_update.json'
 local changelogFile = getWorkingDirectory() .. '\\config\\msg_changelog.txt'
 local phoneData = {}
 local imageCache = {}
 local activeTempFiles = {}
+
+local globalSettings = {
+    theme = 1,
+    useScreenNotifications = false,
+    logBank = false,
+    hideSmsJunk = false,
+    autoUpdate = true,
+    lastNewsText = "",
+    notifPos = 3
+}
 
 local newsUrl = "https://raw.githubusercontent.com/kaip0v/Messenger/main/news.txt"
 local updateUrl = "https://raw.githubusercontent.com/kaip0v/Messenger/main/update.json"
@@ -57,6 +68,7 @@ local inputMessage = imgui.new.char[512]("")
 local settingScreenNotif = imgui.new.bool(false)
 local settingLogBank = imgui.new.bool(false)
 local settingHideJunk = imgui.new.bool(false)
+local settingAutoUpdate = imgui.new.bool(false)
 
 local lastSmsPhone = nil
 local lastSmsType = nil
@@ -199,6 +211,8 @@ local function addSmsToHistory(profile, number, sender, text, ts)
 end
 
 function checkUpdates()
+    if not globalSettings.autoUpdate then return end
+    
     downloadUrlToFile(updateUrl, updateFile, function(id, status)
         if status == dlstatus.STATUS_ENDDOWNLOADDATA then
             local f = io.open(updateFile, "r")
@@ -273,6 +287,15 @@ function main()
     if not isSampLoaded() or not isSampfuncsLoaded() then return end
     while not isSampAvailable() do wait(100) end
     
+    local loadedSettings = load_json(settingsFile)
+    if loadedSettings.theme ~= nil then globalSettings.theme = loadedSettings.theme end
+    if loadedSettings.notifPos ~= nil then globalSettings.notifPos = loadedSettings.notifPos end
+    if loadedSettings.useScreenNotifications ~= nil then globalSettings.useScreenNotifications = loadedSettings.useScreenNotifications end
+    if loadedSettings.hideSmsJunk ~= nil then globalSettings.hideSmsJunk = loadedSettings.hideSmsJunk end
+    if loadedSettings.logBank ~= nil then globalSettings.logBank = loadedSettings.logBank end
+    if loadedSettings.autoUpdate ~= nil then globalSettings.autoUpdate = loadedSettings.autoUpdate end
+    if loadedSettings.lastNewsText ~= nil then globalSettings.lastNewsText = loadedSettings.lastNewsText end
+    
     local result, myId = sampGetPlayerIdByCharHandle(PLAYER_PED)
     if result then
         local tempNick = sampGetPlayerNickname(myId)
@@ -289,13 +312,7 @@ function main()
         if not pData.unread then pData.unread = {} end
         if not pData.contacts then pData.contacts = {} end
         if not pData.history then pData.history = {} end
-        if not pData.settings then pData.settings = { theme = 1, useScreenNotifications = false, logBank = false, hideSmsJunk = false, lastNewsText = "", notifPos = 3 } end
-        
-        if type(pData.settings.useScreenNotifications) ~= "boolean" then pData.settings.useScreenNotifications = false end
-        if type(pData.settings.logBank) ~= "boolean" then pData.settings.logBank = false end
-        if type(pData.settings.hideSmsJunk) ~= "boolean" then pData.settings.hideSmsJunk = false end
-        if type(pData.settings.lastNewsText) ~= "string" then pData.settings.lastNewsText = "" end
-        if type(pData.settings.notifPos) ~= "number" then pData.settings.notifPos = 3 end
+        pData.settings = nil
         
         for cNum, cHist in pairs(pData.history) do
             for _, msg in ipairs(cHist) do
@@ -307,7 +324,7 @@ function main()
     end
     
     if myNick ~= "Default" and myNick:find("_") and not phoneData[myNick] then
-        phoneData[myNick] = { contacts = {}, history = {}, unread = {}, settings = { theme = 1, useScreenNotifications = false, logBank = false, hideSmsJunk = false, lastNewsText = "", notifPos = 3 } }
+        phoneData[myNick] = { contacts = {}, history = {}, unread = {} }
         save_json(dataFile, phoneData)
     end
 
@@ -331,15 +348,17 @@ function main()
                         if profile then
                             local text_cp1251 = u8:decode(text_utf8)
                             
-                            if profile.settings.lastNewsText ~= text_cp1251 then
-                                profile.settings.lastNewsText = text_cp1251
+                            if globalSettings.lastNewsText ~= text_cp1251 then
+                                globalSettings.lastNewsText = text_cp1251
+                                save_json(settingsFile, globalSettings)
+                                
                                 local sys_num = "System_News"
                                 if not profile.contacts[sys_num] then profile.contacts[sys_num] = "Уведомления" end
                                 addSmsToHistory(profile, sys_num, "them", text_cp1251, os.time())
 
                                 if activeContact ~= sys_num or not windowState[0] then
                                     profile.unread[sys_num] = true
-                                    if profile.settings.useScreenNotifications then
+                                    if globalSettings.useScreenNotifications then
                                         activeNotification = {
                                             number = sys_num,
                                             name = "Уведомления",
@@ -388,7 +407,7 @@ function main()
                             needSortContacts = true
                             
                             if not phoneData[myNick] then
-                                phoneData[myNick] = { contacts = {}, history = {}, unread = {}, settings = { theme = 1, useScreenNotifications = false, logBank = false, hideSmsJunk = false, lastNewsText = "", notifPos = 3 } }
+                                phoneData[myNick] = { contacts = {}, history = {}, unread = {} }
                                 save_json(dataFile, phoneData)
                             end
                         end
@@ -580,24 +599,24 @@ function samp.onServerMessage(color, text)
     end
     
     if plain_text:find("Осталось сообщений до лимита: %d+ шт%.") then
-        if profile.settings.useScreenNotifications or profile.settings.hideSmsJunk then
+        if globalSettings.useScreenNotifications or globalSettings.hideSmsJunk then
             return false
         end
     end
     
     if plain_text:find("^%| С вашего банковского счета списано %$%d+ за отправку SMS") then
-        if profile.settings.useScreenNotifications or profile.settings.hideSmsJunk then
+        if globalSettings.useScreenNotifications or globalSettings.hideSmsJunk then
             return false
         end
     end
 
     if plain_text:find("Чтобы убрать телефон, нажмите кнопку \"ESC\"") then
-        if profile.settings.useScreenNotifications or profile.settings.hideSmsJunk then
+        if globalSettings.useScreenNotifications or globalSettings.hideSmsJunk then
             return false
         end
     end
     
-    if profile.settings.logBank then
+    if globalSettings.logBank then
         if plain_text:match("^%s*%|%s*Вы отыграли час") then
             isCollectingBank = true
             bankMessageBuffer = { plain_text }
@@ -613,7 +632,7 @@ function samp.onServerMessage(color, text)
                     
                     if myNick == actualPlayerNick and activeContact ~= "Bank_System" or not windowState[0] then
                         profile.unread["Bank_System"] = true
-                        if profile.settings.useScreenNotifications then
+                        if globalSettings.useScreenNotifications then
                             activeNotification = {
                                 number = "Bank_System",
                                 name = "Банк",
@@ -643,7 +662,7 @@ function samp.onServerMessage(color, text)
         
         if myNick ~= actualPlayerNick or activeContact ~= inc_num or not windowState[0] then
             profile.unread[inc_num] = true
-            if profile.settings.useScreenNotifications then
+            if globalSettings.useScreenNotifications then
                 local cName = profile.contacts[inc_num]
                 activeNotification = {
                     number = inc_num,
@@ -656,7 +675,7 @@ function samp.onServerMessage(color, text)
         save_json(dataFile, phoneData)
         if myNick == actualPlayerNick and activeContact == inc_num then scrollToBottom = true end
         
-        if profile.settings.useScreenNotifications then
+        if globalSettings.useScreenNotifications then
             return false
         else
             if profile.contacts[inc_num] and profile.contacts[inc_num] ~= "" then
@@ -675,7 +694,7 @@ function samp.onServerMessage(color, text)
         addSmsToHistory(profile, out_num, "me", out_text, ts)
         if myNick == actualPlayerNick and activeContact == out_num then scrollToBottom = true end
         
-        if profile.settings.useScreenNotifications then
+        if globalSettings.useScreenNotifications then
             return false
         else
             if profile.contacts[out_num] and profile.contacts[out_num] ~= "" then
@@ -698,7 +717,7 @@ function samp.onServerMessage(color, text)
             save_json(dataFile, phoneData)
             if myNick == actualPlayerNick and activeContact == lastSmsPhone then scrollToBottom = true end
         end
-        if profile.settings.useScreenNotifications then
+        if globalSettings.useScreenNotifications then
             return false
         end
         return
@@ -719,7 +738,7 @@ local notifyFrame = imgui.OnFrame(
         
         local profile = phoneData[actualPlayerNick]
         if not profile then return end
-        local current_theme_idx = (profile and profile.settings and profile.settings.theme) or 1
+        local current_theme_idx = globalSettings.theme
         local active_theme = themes[current_theme_idx] or themes[1]
         local acc = active_theme.me
         
@@ -766,7 +785,7 @@ local unreadIndicatorFrame = imgui.OnFrame(
     function(player)
         local profile = phoneData[actualPlayerNick]
         if not profile then return end
-        local notifPos = (profile and profile.settings and profile.settings.notifPos) or 3
+        local notifPos = globalSettings.notifPos
         
         local resX, resY = getScreenResolution()
         local posX, posY = resX - 20, resY - 20
@@ -802,7 +821,7 @@ local unreadIndicatorFrame = imgui.OnFrame(
             end
         else
             textToShow = u8"У вас есть непрочитанные сообщения (открыть: /p)"
-            local current_theme_idx = (profile and profile.settings and profile.settings.theme) or 1
+            local current_theme_idx = globalSettings.theme
             local acc = themes[current_theme_idx] and themes[current_theme_idx].me or imgui.ImVec4(0.18, 0.35, 0.58, 1.0)
             borderColor = imgui.ImVec4(acc.x, acc.y, acc.z, 0.80)
         end
@@ -836,7 +855,7 @@ local newFrame = imgui.OnFrame(
         
         local profile = phoneData[myNick]
         if not profile then return end
-        local current_theme_idx = (profile and profile.settings and profile.settings.theme) or 1
+        local current_theme_idx = globalSettings.theme
         local active_theme = themes[current_theme_idx] or themes[1]
         
         ApplyTheme(current_theme_idx, 0.95)
@@ -927,6 +946,8 @@ local newFrame = imgui.OnFrame(
 
             if imgui.BeginPopupModal("SettingsModal", nil, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoTitleBar) then
                 imgui.Text(u8"Настройки мессенджера")
+                imgui.SameLine()
+                imgui.TextColored(imgui.ImVec4(0.5, 0.5, 0.5, 1.0), "v" .. tostring(script_version))
                 imgui.Spacing()
                 
                 imgui.Text(u8"Ваш профиль:")
@@ -954,12 +975,12 @@ local newFrame = imgui.OnFrame(
                     phoneData[myNick] = nil
                     
                     if myNick == actualNick and actualNick:find("_") then
-                        phoneData[actualNick] = { contacts = {}, history = {}, unread = {}, settings = { theme = 1, useScreenNotifications = false, logBank = false, hideSmsJunk = false, lastNewsText = "", notifPos = 3 } }
+                        phoneData[actualNick] = { contacts = {}, history = {}, unread = {} }
                     else
                         if actualNick:find("_") then
                             myNick = actualNick
                             if not phoneData[myNick] then
-                                phoneData[myNick] = { contacts = {}, history = {}, unread = {}, settings = { theme = 1, useScreenNotifications = false, logBank = false, hideSmsJunk = false, lastNewsText = "", notifPos = 3 } }
+                                phoneData[myNick] = { contacts = {}, history = {}, unread = {} }
                             end
                         else
                             local any = next(phoneData)
@@ -980,8 +1001,8 @@ local newFrame = imgui.OnFrame(
                 if imgui.BeginCombo("##SetThemeCombo", u8(active_theme_name)) then
                     for i, theme in ipairs(themes) do
                         if imgui.Selectable(u8(theme.name), current_theme_idx == i) then
-                            profile.settings.theme = i
-                            save_json(dataFile, phoneData)
+                            globalSettings.theme = i
+                            save_json(settingsFile, globalSettings)
                         end
                     end
                     imgui.EndCombo()
@@ -989,12 +1010,12 @@ local newFrame = imgui.OnFrame(
                 
                 imgui.Spacing()
                 imgui.Text(u8"Положение системных уведомлений:")
-                local current_pos_idx = profile.settings.notifPos or 3
+                local current_pos_idx = globalSettings.notifPos
                 if imgui.BeginCombo("##NotifPosCombo", notifPositions[current_pos_idx]) then
                     for i, posName in ipairs(notifPositions) do
                         if imgui.Selectable(posName, current_pos_idx == i) then
-                            profile.settings.notifPos = i
-                            save_json(dataFile, phoneData)
+                            globalSettings.notifPos = i
+                            save_json(settingsFile, globalSettings)
                         end
                     end
                     imgui.EndCombo()
@@ -1005,22 +1026,28 @@ local newFrame = imgui.OnFrame(
                 imgui.Separator()
                 imgui.Spacing()
                 
-                settingScreenNotif[0] = profile.settings.useScreenNotifications
+                settingScreenNotif[0] = globalSettings.useScreenNotifications
                 if imgui.Checkbox(u8"Всплывающие уведомления (и скрытие SMS из чата)", settingScreenNotif) then
-                    profile.settings.useScreenNotifications = settingScreenNotif[0]
-                    save_json(dataFile, phoneData)
+                    globalSettings.useScreenNotifications = settingScreenNotif[0]
+                    save_json(settingsFile, globalSettings)
                 end
                 
-                settingHideJunk[0] = profile.settings.hideSmsJunk
+                settingHideJunk[0] = globalSettings.hideSmsJunk
                 if imgui.Checkbox(u8"Отключение серверного шлака телефона", settingHideJunk) then
-                    profile.settings.hideSmsJunk = settingHideJunk[0]
-                    save_json(dataFile, phoneData)
+                    globalSettings.hideSmsJunk = settingHideJunk[0]
+                    save_json(settingsFile, globalSettings)
                 end
                 
-                settingLogBank[0] = profile.settings.logBank
+                settingLogBank[0] = globalSettings.logBank
                 if imgui.Checkbox(u8"Сохранять выписки из банка (PayDay) в отдельный диалог", settingLogBank) then
-                    profile.settings.logBank = settingLogBank[0]
-                    save_json(dataFile, phoneData)
+                    globalSettings.logBank = settingLogBank[0]
+                    save_json(settingsFile, globalSettings)
+                end
+
+                settingAutoUpdate[0] = globalSettings.autoUpdate
+                if imgui.Checkbox(u8"Автообновление скрипта", settingAutoUpdate) then
+                    globalSettings.autoUpdate = settingAutoUpdate[0]
+                    save_json(settingsFile, globalSettings)
                 end
                 
                 imgui.Spacing()
@@ -1512,7 +1539,7 @@ local newFrame = imgui.OnFrame(
 
                             if msgData.textToDisplay ~= "" then
                                 imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
-                                local isGeo = (msgData.textToDisplay == u8"[Геопозиция]")
+                                local isGeo = (msgData.textToDisplay == "[Геопозиция]" or msgData.textToDisplay == u8"[Геопозиция]")
                                 if isGeo then
                                     imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.4, 0.7, 1.0, 1.0))
                                 else
