@@ -1,11 +1,12 @@
 script_name("ImGui Messenger")
-local script_version = 1.1
+local script_version = 1.2
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
 local encoding = require 'encoding'
 local vkeys = require 'vkeys'
 local dlstatus = require('moonloader').download_status
+local lfs = require 'lfs'
 
 encoding.default = 'CP1251'
 local u8 = encoding.UTF8
@@ -21,8 +22,10 @@ ffi.cdef[[
 ]]
 local shell32 = ffi.load('shell32')
 
-local dataFile = getWorkingDirectory() .. '\\config\\messenger_data.json'
-local settingsFile = getWorkingDirectory() .. '\\config\\messenger_settings.json'
+local masterFile = getWorkingDirectory() .. '\\config\\Messenger.json'
+local oldDataFile = getWorkingDirectory() .. '\\config\\messenger_data.json'
+local oldSettingsFile = getWorkingDirectory() .. '\\config\\messenger_settings.json'
+
 local phoneData = {}
 local imageCache = {}
 local activeTempFiles = {}
@@ -49,6 +52,7 @@ local activeContact = nil
 
 local requestFocus = false
 local scrollToBottom = false
+local requestFocusSearch = false
 
 local contactToDelete = nil
 local requestDeletePopup = false
@@ -64,6 +68,10 @@ local bankMessageBuffer = {}
 local inputName = imgui.new.char[256]("")
 local inputNumber = imgui.new.char[256]("")
 local inputMessage = imgui.new.char[512]("")
+local inputSearchContact = imgui.new.char[256]("")
+local inputSearchMessage = imgui.new.char[256]("")
+
+local showMessageSearch = false
 
 local settingScreenNotif = imgui.new.bool(false)
 local settingLogBank = imgui.new.bool(false)
@@ -88,6 +96,8 @@ local tempSysNotifText = nil
 local tempSysNotifTimer = 0
 local tempSysNotifType = 0
 
+local wasTypingEscape = false
+
 local function showSystemNotification(text, nType)
     tempSysNotifText = text
     tempSysNotifType = nType or 0
@@ -95,15 +105,60 @@ local function showSystemNotification(text, nType)
 end
 
 local themes = {
-    { name = "Классический синий", me = imgui.ImVec4(0.18, 0.35, 0.58, 1.0), them = imgui.ImVec4(0.25, 0.25, 0.25, 1.0) },
-    { name = "Темная ночь",        me = imgui.ImVec4(0.35, 0.35, 0.35, 1.0), them = imgui.ImVec4(0.12, 0.12, 0.12, 1.0) },
-    { name = "Telegram (Dark)",    me = imgui.ImVec4(0.17, 0.35, 0.53, 1.0), them = imgui.ImVec4(0.11, 0.14, 0.18, 1.0) },
-    { name = "WhatsApp (Dark)",    me = imgui.ImVec4(0.02, 0.38, 0.33, 1.0), them = imgui.ImVec4(0.12, 0.17, 0.20, 1.0) },
-    { name = "AMOLED Черный",      me = imgui.ImVec4(0.25, 0.25, 0.25, 1.0), them = imgui.ImVec4(0.05, 0.05, 0.05, 1.0) },
-    { name = "Изумрудный",         me = imgui.ImVec4(0.15, 0.45, 0.25, 1.0), them = imgui.ImVec4(0.20, 0.25, 0.20, 1.0) },
-    { name = "Малиновый закат",    me = imgui.ImVec4(0.50, 0.20, 0.35, 1.0), them = imgui.ImVec4(0.25, 0.15, 0.20, 1.0) },
-    { name = "Осенний лес",        me = imgui.ImVec4(0.65, 0.33, 0.05, 1.0), them = imgui.ImVec4(0.25, 0.32, 0.22, 1.0) },
-    { name = "Океанская бездна",   me = imgui.ImVec4(0.05, 0.30, 0.45, 1.0), them = imgui.ImVec4(0.05, 0.15, 0.25, 1.0) }
+    { 
+        name = "Классический синий", 
+        me = imgui.ImVec4(0.18, 0.35, 0.58, 1.0), them = imgui.ImVec4(0.25, 0.25, 0.25, 1.0), warn = imgui.ImVec4(0.20, 0.60, 0.90, 1.0),
+        notif_bg = imgui.ImVec4(0.12, 0.12, 0.12, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0),
+        sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.20, 0.60, 0.90, 0.80)
+    },
+    { 
+        name = "Темная ночь", 
+        me = imgui.ImVec4(0.35, 0.35, 0.35, 1.0), them = imgui.ImVec4(0.12, 0.12, 0.12, 1.0), warn = imgui.ImVec4(0.70, 0.70, 0.70, 1.0),
+        notif_bg = imgui.ImVec4(0.08, 0.08, 0.08, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0),
+        sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.50, 0.50, 0.50, 0.80)
+    },
+    { 
+        name = "Telegram (Dark)", 
+        me = imgui.ImVec4(0.17, 0.35, 0.53, 1.0), them = imgui.ImVec4(0.11, 0.14, 0.18, 1.0), warn = imgui.ImVec4(0.25, 0.55, 0.85, 1.0),
+        notif_bg = imgui.ImVec4(0.09, 0.11, 0.14, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0),
+        sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.25, 0.55, 0.85, 0.80)
+    },
+    { 
+        name = "WhatsApp (Dark)", 
+        me = imgui.ImVec4(0.02, 0.38, 0.33, 1.0), them = imgui.ImVec4(0.12, 0.17, 0.20, 1.0), warn = imgui.ImVec4(0.10, 0.70, 0.40, 1.0),
+        notif_bg = imgui.ImVec4(0.07, 0.12, 0.13, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0),
+        sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.10, 0.70, 0.40, 0.80)
+    },
+    { 
+        name = "AMOLED Черный", 
+        me = imgui.ImVec4(0.25, 0.25, 0.25, 1.0), them = imgui.ImVec4(0.05, 0.05, 0.05, 1.0), warn = imgui.ImVec4(0.80, 0.80, 0.80, 1.0),
+        notif_bg = imgui.ImVec4(0.0, 0.0, 0.0, 0.95), notif_text = imgui.ImVec4(0.95, 0.95, 0.95, 1.0),
+        sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.60, 0.60, 0.60, 0.80)
+    },
+    { 
+        name = "Изумрудный", 
+        me = imgui.ImVec4(0.15, 0.45, 0.25, 1.0), them = imgui.ImVec4(0.20, 0.25, 0.20, 1.0), warn = imgui.ImVec4(0.20, 0.70, 0.30, 1.0),
+        notif_bg = imgui.ImVec4(0.08, 0.15, 0.10, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0),
+        sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.20, 0.70, 0.30, 0.80)
+    },
+    { 
+        name = "Малиновый закат", 
+        me = imgui.ImVec4(0.50, 0.20, 0.35, 1.0), them = imgui.ImVec4(0.25, 0.15, 0.20, 1.0), warn = imgui.ImVec4(0.80, 0.30, 0.50, 1.0),
+        notif_bg = imgui.ImVec4(0.15, 0.08, 0.12, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0),
+        sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.80, 0.30, 0.50, 0.80)
+    },
+    { 
+        name = "Осенний лес", 
+        me = imgui.ImVec4(0.65, 0.33, 0.05, 1.0), them = imgui.ImVec4(0.25, 0.32, 0.22, 1.0), warn = imgui.ImVec4(0.90, 0.50, 0.10, 1.0),
+        notif_bg = imgui.ImVec4(0.15, 0.12, 0.08, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0),
+        sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.90, 0.50, 0.10, 0.80)
+    },
+    { 
+        name = "Океанская бездна", 
+        me = imgui.ImVec4(0.05, 0.30, 0.45, 1.0), them = imgui.ImVec4(0.05, 0.15, 0.25, 1.0), warn = imgui.ImVec4(0.10, 0.60, 0.80, 1.0),
+        notif_bg = imgui.ImVec4(0.04, 0.08, 0.15, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0),
+        sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.10, 0.60, 0.80, 0.80)
+    }
 }
 
 local notifPositions = {
@@ -117,6 +172,59 @@ local months = {
     "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря"
 }
+
+local function cp1251_lower(str)
+    local res = {}
+    for i = 1, #str do
+        local b = str:byte(i)
+        if b >= 192 and b <= 223 then
+            res[i] = string.char(b + 32)
+        elseif b == 168 then
+            res[i] = string.char(184)
+        elseif b >= 65 and b <= 90 then
+            res[i] = string.char(b + 32)
+        else
+            res[i] = string.char(b)
+        end
+    end
+    return table.concat(res)
+end
+
+local function truncateToLastWord(text, maxWidth)
+    if imgui.CalcTextSize(text).x <= maxWidth then return text end
+    local current_str = ""
+    local ellipsis = "..."
+    for word in text:gmatch("%S+") do
+        local test_str = current_str == "" and word or (current_str .. " " .. word)
+        if imgui.CalcTextSize(test_str .. ellipsis).x > maxWidth then
+            if current_str == "" then return ellipsis end
+            return current_str .. ellipsis
+        end
+        current_str = test_str
+    end
+    return current_str .. ellipsis
+end
+
+local function cleanupGhostFiles()
+    local cfgPath = getWorkingDirectory() .. '\\config\\'
+    pcall(function()
+        for file in lfs.dir(cfgPath) do
+            if type(file) == 'string' then
+                if file:match("^msg_update_%d+%.json$") or
+                   file:match("^msg_changelog_%d+%.txt$") or
+                   file:match("^temp_news_%d+%.txt$") or
+                   file:match("^img_%d+%.%a+$") then
+                    pcall(os.remove, cfgPath .. file)
+                end
+            end
+        end
+    end)
+end
+
+local function file_exists(name)
+    local f = io.open(name, "r")
+    if f ~= nil then io.close(f) return true else return false end
+end
 
 local function save_json(path, data)
     local file = io.open(path, "wb")
@@ -150,6 +258,14 @@ local function load_json(path)
         if func then return func() end
     end
     return {}
+end
+
+local function save_all_data()
+    local toSave = {
+        global_settings = globalSettings,
+        profiles = phoneData
+    }
+    save_json(masterFile, toSave)
 end
 
 local function decodeJsonSafe(str)
@@ -207,7 +323,7 @@ local function addSmsToHistory(profile, number, sender, text, ts)
     if not profile.contacts[number] then profile.contacts[number] = "" end
     if not profile.history[number] then profile.history[number] = {} end
     table.insert(profile.history[number], {sender = sender, msg = text, timestamp = ts})
-    save_json(dataFile, phoneData)
+    save_all_data()
 end
 
 function checkUpdates()
@@ -225,7 +341,7 @@ function checkUpdates()
                 content = f:read("*a")
                 f:close()
             end
-            os.remove(updateFile_tmp)
+            pcall(os.remove, updateFile_tmp)
             activeTempFiles[updateFile_tmp] = nil
             
             if content and content ~= "" then
@@ -258,7 +374,7 @@ function checkUpdates()
                                         changelogText = fc:read("*a")
                                         fc:close()
                                     end
-                                    os.remove(changelogFile_tmp)
+                                    pcall(os.remove, changelogFile_tmp)
                                     activeTempFiles[changelogFile_tmp] = nil
                                     
                                     local targetNick = actualPlayerNick
@@ -273,7 +389,7 @@ function checkUpdates()
                                         
                                         addSmsToHistory(profile, sys_num, "them", text_cp1251, os.time())
                                         profile.unread[sys_num] = true
-                                        save_json(dataFile, phoneData)
+                                        save_all_data()
                                     end
 
                                     lua_thread.create(function()
@@ -289,7 +405,7 @@ function checkUpdates()
                                                 if fTmp then
                                                     local newCode = fTmp:read("*a")
                                                     fTmp:close()
-                                                    os.remove(tempPath)
+                                                    pcall(os.remove, tempPath)
                                                     activeTempFiles[tempPath] = nil
                                                     
                                                     if newCode:find("\208[\128-\191]") or newCode:find("\209[\128-\191]") then
@@ -314,14 +430,14 @@ function checkUpdates()
                                                     end
                                                 end
                                             elseif status2 == dlstatus.STATUS_EX_ERROR then
-                                                os.remove(tempPath)
+                                                pcall(os.remove, tempPath)
                                                 activeTempFiles[tempPath] = nil
                                                 showSystemNotification(u8"Ошибка при скачивании обновления!", 2)
                                             end
                                         end)
                                     end)
                                 elseif status_cl == dlstatus.STATUS_EX_ERROR then
-                                    os.remove(changelogFile_tmp)
+                                    pcall(os.remove, changelogFile_tmp)
                                     activeTempFiles[changelogFile_tmp] = nil
                                 end
                             end)
@@ -330,24 +446,58 @@ function checkUpdates()
                 end
             end
         elseif status == dlstatus.STATUS_EX_ERROR then
-            os.remove(updateFile_tmp)
+            pcall(os.remove, updateFile_tmp)
             activeTempFiles[updateFile_tmp] = nil
         end
     end)
 end
 
+addEventHandler('onWindowMessage', function(msg, wparam, lparam)
+    if msg == 0x0100 or msg == 0x0101 then 
+        if wparam == vkeys.VK_ESCAPE and windowState[0] then
+            consumeWindowMessage(true, false)
+            if msg == 0x0100 then
+                wasTypingEscape = imgui.GetIO().WantCaptureKeyboard
+            elseif msg == 0x0101 then
+                if not wasTypingEscape then
+                    windowState[0] = false
+                end
+                wasTypingEscape = false
+            end
+        end
+    end
+end)
+
 function main()
     if not isSampLoaded() or not isSampfuncsLoaded() then return end
     while not isSampAvailable() do wait(100) end
     
-    local loadedSettings = load_json(settingsFile)
-    if loadedSettings.theme ~= nil then globalSettings.theme = loadedSettings.theme end
-    if loadedSettings.notifPos ~= nil then globalSettings.notifPos = loadedSettings.notifPos end
-    if loadedSettings.useScreenNotifications ~= nil then globalSettings.useScreenNotifications = loadedSettings.useScreenNotifications end
-    if loadedSettings.hideSmsJunk ~= nil then globalSettings.hideSmsJunk = loadedSettings.hideSmsJunk end
-    if loadedSettings.logBank ~= nil then globalSettings.logBank = loadedSettings.logBank end
-    if loadedSettings.autoUpdate ~= nil then globalSettings.autoUpdate = loadedSettings.autoUpdate end
-    if loadedSettings.lastNewsText ~= nil then globalSettings.lastNewsText = loadedSettings.lastNewsText end
+    cleanupGhostFiles()
+    
+    if file_exists(masterFile) then
+        local masterData = load_json(masterFile)
+        if masterData.global_settings then
+            for k, v in pairs(masterData.global_settings) do
+                globalSettings[k] = v
+            end
+        end
+        if masterData.profiles then
+            phoneData = masterData.profiles
+        end
+    else
+        if file_exists(oldDataFile) then
+            phoneData = load_json(oldDataFile)
+            pcall(os.remove, oldDataFile)
+        end
+        if file_exists(oldSettingsFile) then
+            local loadedSettings = load_json(oldSettingsFile)
+            for k, v in pairs(loadedSettings) do
+                globalSettings[k] = v
+            end
+            pcall(os.remove, oldSettingsFile)
+        end
+        save_all_data()
+    end
     
     local result, myId = sampGetPlayerIdByCharHandle(PLAYER_PED)
     if result then
@@ -358,8 +508,6 @@ function main()
             actualPlayerNick = tempNick
         end
     end
-    
-    phoneData = load_json(dataFile)
     
     for pName, pData in pairs(phoneData) do
         if not pData.unread then pData.unread = {} end
@@ -378,7 +526,7 @@ function main()
     
     if myNick ~= "Default" and myNick:find("_") and not phoneData[myNick] then
         phoneData[myNick] = { contacts = {}, history = {}, unread = {} }
-        save_json(dataFile, phoneData)
+        save_all_data()
     end
 
     checkUpdates()
@@ -393,7 +541,7 @@ function main()
             if f then
                 local text_utf8 = f:read("*a")
                 f:close()
-                os.remove(temp_news_file)
+                pcall(os.remove, temp_news_file)
                 activeTempFiles[temp_news_file] = nil
 
                 if text_utf8 then
@@ -407,7 +555,7 @@ function main()
                             
                             if globalSettings.lastNewsText ~= text_cp1251 then
                                 globalSettings.lastNewsText = text_cp1251
-                                save_json(settingsFile, globalSettings)
+                                save_all_data()
                                 
                                 local sys_num = "System_News"
                                 if not profile.contacts[sys_num] then profile.contacts[sys_num] = "Уведомления" end
@@ -424,7 +572,7 @@ function main()
                                         }
                                     end
                                 end
-                                save_json(dataFile, phoneData)
+                                save_all_data()
                                 if activeContact == sys_num then scrollToBottom = true end
                                 needSortContacts = true
                             end
@@ -433,7 +581,7 @@ function main()
                 end
             end
         elseif status == dlstatus.STATUS_EX_ERROR then
-            os.remove(temp_news_file)
+            pcall(os.remove, temp_news_file)
             activeTempFiles[temp_news_file] = nil
         end
     end)
@@ -468,7 +616,7 @@ function main()
                             
                             if not phoneData[myNick] then
                                 phoneData[myNick] = { contacts = {}, history = {}, unread = {} }
-                                save_json(dataFile, phoneData)
+                                save_all_data()
                             end
                         end
                     end
@@ -483,6 +631,18 @@ function main()
                 scrollToBottom = true
                 requestFocus = true
                 activeNotification = nil 
+            end
+        end
+
+        if not sampIsChatInputActive() and not sampIsDialogActive() then
+            if isKeyDown(vkeys.VK_MENU) and isKeyJustPressed(vkeys.VK_P) then
+                if not windowState[0] or not imgui.GetIO().WantCaptureKeyboard then
+                    windowState[0] = not windowState[0]
+                    if windowState[0] then
+                        requestFocus = true
+                        scrollToBottom = true
+                    end
+                end
             end
         end
     end
@@ -701,7 +861,7 @@ function samp.onServerMessage(color, text)
                             }
                         end
                     end
-                    save_json(dataFile, phoneData)
+                    save_all_data()
                     if myNick == actualPlayerNick and activeContact == "Bank_System" then scrollToBottom = true end
                 end
             end)
@@ -732,7 +892,7 @@ function samp.onServerMessage(color, text)
                 }
             end
         end
-        save_json(dataFile, phoneData)
+        save_all_data()
         if myNick == actualPlayerNick and activeContact == inc_num then scrollToBottom = true end
         
         if globalSettings.useScreenNotifications then
@@ -774,7 +934,7 @@ function samp.onServerMessage(color, text)
             prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
             hist[#hist].msg = prev_msg .. " " .. continued_text
             hist[#hist].bubbleSize = nil 
-            save_json(dataFile, phoneData)
+            save_all_data()
             if myNick == actualPlayerNick and activeContact == lastSmsPhone then scrollToBottom = true end
         end
         if globalSettings.useScreenNotifications then
@@ -803,13 +963,19 @@ local notifyFrame = imgui.OnFrame(
         local acc = active_theme.me
         
         ApplyTheme(current_theme_idx, 0.90)
+        
+        imgui.PushStyleColor(imgui.Col.WindowBg, active_theme.notif_bg)
+        imgui.PushStyleColor(imgui.Col.Border, acc)
+        imgui.PushStyleColor(imgui.Col.Text, active_theme.notif_text)
+        
         imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 8.0)
+        imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 1.0)
         imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(15, 12))
         
         local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoFocusOnAppearing + imgui.WindowFlags.NoInputs
         if imgui.Begin("##NotifyWindow", nil, flags) then
             if activeNotification then
-                imgui.TextColored(imgui.ImVec4(acc.x, acc.y, acc.z, 1.0), u8"Новое сообщение: " .. u8(activeNotification.name))
+                imgui.TextColored(acc, u8"Новое сообщение: " .. u8(activeNotification.name))
                 
                 imgui.PushTextWrapPos(350)
                 imgui.Text(u8(activeNotification.text))
@@ -823,12 +989,12 @@ local notifyFrame = imgui.OnFrame(
                 local hintWidth = imgui.CalcTextSize(hintText).x
                 local windowWidth = imgui.GetWindowWidth()
                 imgui.SetCursorPosX((windowWidth - hintWidth) / 2)
-                imgui.TextColored(imgui.ImVec4(0.6, 0.6, 0.6, 1.0), hintText)
+                imgui.TextColored(imgui.ImVec4(active_theme.notif_text.x * 0.7, active_theme.notif_text.y * 0.7, active_theme.notif_text.z * 0.7, 1.0), hintText)
             end
             imgui.End()
         end
-        imgui.PopStyleVar(2)
-        imgui.PopStyleColor(15)
+        imgui.PopStyleVar(3)
+        imgui.PopStyleColor(18)
     end
 )
 notifyFrame.HideCursor = true 
@@ -867,29 +1033,30 @@ local unreadIndicatorFrame = imgui.OnFrame(
 
         local borderColor = imgui.ImVec4(0.0, 0.0, 0.0, 0.0)
         local textToShow = ""
+        local current_theme_idx = globalSettings.theme
+        local active_theme = themes[current_theme_idx] or themes[1]
 
         if tempSysNotifText and os.clock() < tempSysNotifTimer then
             textToShow = tempSysNotifText
             if tempSysNotifType == 1 then
-                borderColor = imgui.ImVec4(0.20, 0.80, 0.20, 0.80)
+                borderColor = active_theme.sys_ok
             elseif tempSysNotifType == 2 then
-                borderColor = imgui.ImVec4(0.80, 0.20, 0.20, 0.80)
+                borderColor = active_theme.sys_err
             elseif tempSysNotifType == 3 then
-                borderColor = imgui.ImVec4(0.20, 0.50, 0.80, 0.80)
+                borderColor = active_theme.sys_info
             else
-                borderColor = imgui.ImVec4(0.50, 0.50, 0.50, 0.80)
+                borderColor = active_theme.them
             end
         else
             textToShow = u8"У вас есть непрочитанные сообщения (открыть: /p)"
-            local current_theme_idx = globalSettings.theme
-            local acc = themes[current_theme_idx] and themes[current_theme_idx].me or imgui.ImVec4(0.18, 0.35, 0.58, 1.0)
-            borderColor = imgui.ImVec4(acc.x, acc.y, acc.z, 0.80)
+            borderColor = active_theme.warn
         end
 
         imgui.SetNextWindowPos(imgui.ImVec2(posX, posY), imgui.Cond.Always, imgui.ImVec2(pivotX, pivotY))
         
-        imgui.PushStyleColor(imgui.Col.WindowBg, imgui.ImVec4(0.10, 0.10, 0.11, 0.95))
+        imgui.PushStyleColor(imgui.Col.WindowBg, active_theme.notif_bg)
         imgui.PushStyleColor(imgui.Col.Border, borderColor)
+        imgui.PushStyleColor(imgui.Col.Text, active_theme.notif_text)
         
         imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 6.0)
         imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 1.0)
@@ -897,11 +1064,11 @@ local unreadIndicatorFrame = imgui.OnFrame(
         
         local flags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoFocusOnAppearing + imgui.WindowFlags.NoInputs
         if imgui.Begin("##SysIndicator", nil, flags) then
-            imgui.TextColored(imgui.ImVec4(0.9, 0.9, 0.9, 1.0), textToShow)
+            imgui.Text(textToShow)
             imgui.End()
         end
         imgui.PopStyleVar(3)
-        imgui.PopStyleColor(2)
+        imgui.PopStyleColor(3)
     end
 )
 unreadIndicatorFrame.HideCursor = true
@@ -919,6 +1086,11 @@ local newFrame = imgui.OnFrame(
         local active_theme = themes[current_theme_idx] or themes[1]
         
         ApplyTheme(current_theme_idx, 0.95)
+        
+        imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 6.0)
+        imgui.PushStyleVarFloat(imgui.StyleVar.ChildRounding, 6.0)
+        imgui.PushStyleVarFloat(imgui.StyleVar.PopupRounding, 6.0)
+        imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 8.0)
         
         if imgui.Begin(u8"Мессенджер", windowState, imgui.WindowFlags.NoCollapse) then
 
@@ -991,7 +1163,7 @@ local newFrame = imgui.OnFrame(
                         profile.history[contactToDelete] = nil
                         profile.unread[contactToDelete] = nil
                         if activeContact == contactToDelete then activeContact = nil end
-                        save_json(dataFile, phoneData)
+                        save_all_data()
                     end
                     contactToDelete = nil
                     imgui.CloseCurrentPopup()
@@ -1053,7 +1225,7 @@ local newFrame = imgui.OnFrame(
                     profile = phoneData[myNick]
                     activeContact = nil
                     needSortContacts = true
-                    save_json(dataFile, phoneData)
+                    save_all_data()
                 end
                 
                 imgui.Spacing()
@@ -1064,7 +1236,7 @@ local newFrame = imgui.OnFrame(
                     for i, theme in ipairs(themes) do
                         if imgui.Selectable(u8(theme.name), current_theme_idx == i) then
                             globalSettings.theme = i
-                            save_json(settingsFile, globalSettings)
+                            save_all_data()
                         end
                     end
                     imgui.EndCombo()
@@ -1077,7 +1249,7 @@ local newFrame = imgui.OnFrame(
                     for i, posName in ipairs(notifPositions) do
                         if imgui.Selectable(posName, current_pos_idx == i) then
                             globalSettings.notifPos = i
-                            save_json(settingsFile, globalSettings)
+                            save_all_data()
                         end
                     end
                     imgui.EndCombo()
@@ -1091,25 +1263,25 @@ local newFrame = imgui.OnFrame(
                 settingScreenNotif[0] = globalSettings.useScreenNotifications
                 if imgui.Checkbox(u8"Всплывающие уведомления (и скрытие SMS из чата)", settingScreenNotif) then
                     globalSettings.useScreenNotifications = settingScreenNotif[0]
-                    save_json(settingsFile, globalSettings)
+                    save_all_data()
                 end
                 
                 settingHideJunk[0] = globalSettings.hideSmsJunk
                 if imgui.Checkbox(u8"Отключение серверного шлака телефона", settingHideJunk) then
                     globalSettings.hideSmsJunk = settingHideJunk[0]
-                    save_json(settingsFile, globalSettings)
+                    save_all_data()
                 end
                 
                 settingLogBank[0] = globalSettings.logBank
                 if imgui.Checkbox(u8"Сохранять выписки из банка (PayDay) в отдельный диалог", settingLogBank) then
                     globalSettings.logBank = settingLogBank[0]
-                    save_json(settingsFile, globalSettings)
+                    save_all_data()
                 end
 
                 settingAutoUpdate[0] = globalSettings.autoUpdate
                 if imgui.Checkbox(u8"Автообновление скрипта", settingAutoUpdate) then
                     globalSettings.autoUpdate = settingAutoUpdate[0]
-                    save_json(settingsFile, globalSettings)
+                    save_all_data()
                 end
                 
                 imgui.Spacing()
@@ -1127,16 +1299,18 @@ local newFrame = imgui.OnFrame(
             imgui.Columns(2, "PhoneColumns", false)
             imgui.SetColumnWidth(0, 280) 
 
-            local topHeadY = imgui.GetCursorPosY()
+            local leftAvailW = imgui.GetContentRegionAvail().x
+
+            imgui.AlignTextToFramePadding()
             imgui.Text(u8"Контакты:")
             
             local cleanBtnText = u8"Сброс лимита"
             local cleanBtnWidth = imgui.CalcTextSize(cleanBtnText).x + 16
             local settingsBtnText = u8"Настройки"
             local settingsBtnWidth = imgui.CalcTextSize(settingsBtnText).x + 16
+            local spaceX = imgui.GetStyle().ItemSpacing.x
             
-            imgui.SetCursorPos(imgui.ImVec2(imgui.GetColumnWidth() - cleanBtnWidth - settingsBtnWidth - 12, topHeadY - 2))
-            
+            imgui.SameLine(leftAvailW - cleanBtnWidth - settingsBtnWidth - spaceX)
             if imgui.Button(cleanBtnText) then
                 windowState[0] = false 
                 autoCleaning = true
@@ -1204,38 +1378,43 @@ local newFrame = imgui.OnFrame(
             end
             if imgui.IsItemHovered() then imgui.SetTooltip(u8"Автоматически очистить серверный лимит сообщений") end
             
-            imgui.SameLine(imgui.GetColumnWidth() - settingsBtnWidth - 4)
+            imgui.SameLine(0, spaceX)
             if imgui.Button(settingsBtnText) then
                 imgui.OpenPopup("SettingsModal")
             end
 
             imgui.Spacing()
             
-            imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 8.0)
-            local leftColWidth = imgui.GetColumnWidth()
-            local inputWidth = (leftColWidth - 50) / 2 
+            local btnPlusW = 30
+            local numW = 80
+            local nameW = leftAvailW - numW - btnPlusW - spaceX * 2
             
-            imgui.PushItemWidth(inputWidth)
+            imgui.PushItemWidth(nameW)
             local enter1 = imgui.InputTextWithHint("##NameInput", u8"Имя", inputName, 256, imgui.InputTextFlags.EnterReturnsTrue)
-            imgui.SameLine(0, 4)
+            imgui.PopItemWidth()
+            
+            imgui.SameLine(0, spaceX)
+            imgui.PushItemWidth(numW)
             local enter2 = imgui.InputTextWithHint("##NumberInput", u8"Номер", inputNumber, 256, imgui.InputTextFlags.EnterReturnsTrue)
             imgui.PopItemWidth()
             
-            imgui.SameLine(0, 4)
-            if imgui.Button("+", imgui.ImVec2(30, 0)) or enter1 or enter2 then
+            imgui.SameLine(0, spaceX)
+            if imgui.Button("+", imgui.ImVec2(btnPlusW, 0)) or enter1 or enter2 then
                 local name = u8:decode(ffi.string(inputName))
                 local number = ffi.string(inputNumber)
                 if number:match("^[%d%_a-zA-Z]+$") then
                     profile.contacts[number] = name
-                    save_json(dataFile, phoneData)
+                    save_all_data()
                     inputName[0] = 0
                     inputNumber[0] = 0
                 end
             end
-            imgui.PopStyleVar() 
             
             imgui.Spacing()
-            imgui.Separator()
+            imgui.PushItemWidth(-1)
+            imgui.InputTextWithHint("##SearchContactList", u8"Поиск контактов...", inputSearchContact, 256)
+            imgui.PopItemWidth()
+            imgui.Spacing()
 
             if needSortContacts then
                 cachedSortedContacts = {}
@@ -1249,88 +1428,160 @@ local newFrame = imgui.OnFrame(
                 table.sort(cachedSortedContacts, function(a, b) return a.last_ts > b.last_ts end)
                 needSortContacts = false
             end
-
+            
             imgui.BeginChild("ContactsList", imgui.ImVec2(0, 0), true)
+            
+            local sContactText = cp1251_lower(u8:decode(ffi.string(inputSearchContact)))
+            
             for _, c in ipairs(cachedSortedContacts) do
                 local num = c.num
                 local name = c.name
                 
-                imgui.PushIDStr("contact_" .. num)
-                
-                local is_selected = (activeContact == num)
-                local is_unread = profile.unread[num]
-                
-                local displayName = ""
-                if num == "Bank_System" then
-                    displayName = u8"Банк"
-                elseif num == "System_News" then
-                    displayName = u8"Уведомления"
-                else
-                    displayName = (name == "" and "#" .. num or u8(name) .. " (" .. num .. ")")
-                end
-                
-                if is_unread then
-                    displayName = "   " .. displayName
-                end
-                
-                local cursorPos = imgui.GetCursorScreenPos()
-                
-                if is_unread and not is_selected then
-                    local drawList = imgui.GetWindowDrawList()
-                    local width = imgui.GetContentRegionAvail().x
-                    local height = imgui.GetTextLineHeight() + 4 
+                local skipContact = false
+                if sContactText ~= "" then
+                    local lowerName = cp1251_lower(name)
+                    local lowerNum = cp1251_lower(num)
+                    local localDisplay = ""
+                    if num == "Bank_System" then 
+                        localDisplay = cp1251_lower(u8:decode(u8"Банк"))
+                    elseif num == "System_News" then 
+                        localDisplay = cp1251_lower(u8:decode(u8"Уведомления"))
+                    else 
+                        localDisplay = lowerName == "" and ("#" .. lowerNum) or (lowerName .. " (" .. lowerNum .. ")")
+                    end
                     
-                    drawList:AddRectFilled(
-                        cursorPos, 
-                        imgui.ImVec2(cursorPos.x + width, cursorPos.y + height), 
-                        imgui.GetColorU32Vec4(imgui.ImVec4(0.85, 0.30, 0.30, 0.25))
-                    )
-                    drawList:AddRectFilled(
-                        cursorPos, 
-                        imgui.ImVec2(cursorPos.x + 3, cursorPos.y + height), 
-                        imgui.GetColorU32Vec4(imgui.ImVec4(0.90, 0.20, 0.20, 1.0))
-                    )
-                end
-                
-                if imgui.Selectable(displayName .. "##sel_" .. num, is_selected) then
-                    activeContact = num
-                    scrollToBottom = true
-                    requestFocus = true
-                    if is_unread then
-                        profile.unread[num] = nil
-                        save_json(dataFile, phoneData)
+                    if not localDisplay:find(sContactText, 1, true) then
+                        skipContact = true
                     end
                 end
                 
-                if imgui.BeginPopupContextItem("ContactPopup_" .. num) then
-                    if num == "Bank_System" or num == "System_News" then
-                        if imgui.Selectable(u8"Очистить историю") then
-                            profile.history[num] = nil
-                            profile.contacts[num] = nil
+                if not skipContact then
+                    imgui.PushIDStr("contact_" .. num)
+                    
+                    local is_selected = (activeContact == num)
+                    local is_unread = profile.unread[num]
+                    
+                    local displayName = ""
+                    if num == "Bank_System" then
+                        displayName = u8"Банк"
+                    elseif num == "System_News" then
+                        displayName = u8"Уведомления"
+                    else
+                        displayName = (name == "" and "#" .. num or u8(name) .. " (" .. num .. ")")
+                    end
+                    
+                    if is_unread then
+                        displayName = " " .. displayName
+                    end
+                    
+                    local cursorPos = imgui.GetCursorScreenPos()
+                    local avail_w = imgui.GetContentRegionAvail().x
+                    local item_h = imgui.GetTextLineHeight() * 2 + 14
+                    
+                    local p_min = cursorPos
+                    local p_max = imgui.ImVec2(cursorPos.x + avail_w, cursorPos.y + item_h)
+                    
+                    local is_clicked = imgui.InvisibleButton("btn_" .. num, imgui.ImVec2(avail_w, item_h))
+                    local is_hovered = imgui.IsItemHovered()
+                    
+                    if is_clicked then
+                        if activeContact ~= num then
+                            activeContact = num
+                            showMessageSearch = false
+                            inputSearchMessage[0] = 0
+                        end
+                        scrollToBottom = true
+                        requestFocus = true
+                        if is_unread then
                             profile.unread[num] = nil
-                            if activeContact == num then
-                                activeContact = nil
+                            save_all_data()
+                        end
+                    end
+                    
+                    if imgui.BeginPopupContextItem("ContactPopup_" .. num) then
+                        if num == "Bank_System" or num == "System_News" then
+                            if imgui.Selectable(u8"Очистить историю") then
+                                profile.history[num] = nil
+                                profile.contacts[num] = nil
+                                profile.unread[num] = nil
+                                if activeContact == num then
+                                    activeContact = nil
+                                end
+                                save_all_data()
                             end
-                            save_json(dataFile, phoneData)
+                        else
+                            if imgui.Selectable(u8"Изменить") then
+                                ffi.copy(inputNumber, num)
+                                ffi.copy(inputName, u8(name))
+                            end
+                            if imgui.Selectable(u8"Позвонить") then
+                                sampSendChat("/call " .. num)
+                            end
+                            imgui.Separator()
+                            if imgui.Selectable(u8"Удалить контакт") then
+                                contactToDelete = num
+                                requestDeletePopup = true
+                            end
+                        end
+                        imgui.EndPopup()
+                    end
+                    
+                    local dl = imgui.GetWindowDrawList()
+                    local bg_color = imgui.ImVec4(0, 0, 0, 0)
+                    
+                    if is_selected then
+                        bg_color = active_theme.me
+                    elseif is_hovered then
+                        bg_color = imgui.ImVec4(active_theme.me.x, active_theme.me.y, active_theme.me.z, 0.6)
+                    elseif is_unread then
+                        bg_color = imgui.ImVec4(active_theme.warn.x, active_theme.warn.y, active_theme.warn.z, 0.25)
+                    else
+                        bg_color = imgui.ImVec4(active_theme.them.x, active_theme.them.y, active_theme.them.z, 0.4)
+                    end
+                    
+                    dl:AddRectFilled(p_min, p_max, imgui.GetColorU32Vec4(bg_color), 8.0)
+                    
+                    if is_unread and not is_selected then
+                        dl:AddRectFilled(p_min, imgui.ImVec2(p_min.x + 4, p_max.y), imgui.GetColorU32Vec4(active_theme.warn), 8.0)
+                    end
+                    
+                    local time_str = ""
+                    local snippet = ""
+                    if profile.history[num] and #profile.history[num] > 0 then
+                        local last_msg = profile.history[num][#profile.history[num]]
+                        if last_msg.timestamp and last_msg.timestamp > 0 then
+                            local current_date = os.date("%d.%m.%Y")
+                            local msg_date = os.date("%d.%m.%Y", last_msg.timestamp)
+                            if current_date == msg_date then
+                                time_str = os.date("%H:%M", last_msg.timestamp)
+                            else
+                                time_str = msg_date
+                            end
+                        end
+                        if num == "Bank_System" then
+                            snippet = u8"Вам пришла выписка из банка"
+                        else
+                            local prefix = (last_msg.sender == "me") and u8"Вы: " or ""
+                            snippet = prefix .. u8(last_msg.msg):gsub("\n", " ")
                         end
                     else
-                        if imgui.Selectable(u8"Изменить") then
-                            ffi.copy(inputNumber, num)
-                            ffi.copy(inputName, u8(name))
-                        end
-                        if imgui.Selectable(u8"Позвонить") then
-                            sampSendChat("/call " .. num)
-                        end
-                        imgui.Separator()
-                        if imgui.Selectable(u8"Удалить контакт") then
-                            contactToDelete = num
-                            requestDeletePopup = true
-                        end
+                        snippet = u8"Нет сообщений"
                     end
-                    imgui.EndPopup()
+                    
+                    local name_color = imgui.ImVec4(1, 1, 1, 1)
+                    dl:AddText(imgui.ImVec2(p_min.x + 10, p_min.y + 6), imgui.GetColorU32Vec4(name_color), displayName)
+                    
+                    local time_w = imgui.CalcTextSize(time_str).x
+                    dl:AddText(imgui.ImVec2(p_max.x - time_w - 10, p_min.y + 6), imgui.GetColorU32Vec4(imgui.ImVec4(0.6, 0.6, 0.6, 1.0)), time_str)
+                    
+                    local snippet_max_w = avail_w - 20
+                    local trunc_snippet = truncateToLastWord(snippet, snippet_max_w)
+                    dl:AddText(imgui.ImVec2(p_min.x + 10, p_min.y + 6 + imgui.GetTextLineHeight() + 2), imgui.GetColorU32Vec4(imgui.ImVec4(0.65, 0.65, 0.65, 1.0)), trunc_snippet)
+                    
+                    imgui.SetCursorPosY(imgui.GetCursorPosY() + 4)
+                    
+                    imgui.PopID()
                 end
-                
-                imgui.PopID()
             end
             imgui.EndChild()
 
@@ -1340,7 +1591,7 @@ local newFrame = imgui.OnFrame(
                 
                 if profile.unread[activeContact] then
                     profile.unread[activeContact] = nil
-                    save_json(dataFile, phoneData)
+                    save_all_data()
                 end
 
                 local contactName = ""
@@ -1355,13 +1606,29 @@ local newFrame = imgui.OnFrame(
                 
                 local isSystemChat = (activeContact == "Bank_System" or activeContact == "System_News")
                 
+                local rightAvailW = imgui.GetContentRegionAvail().x
+                
                 imgui.AlignTextToFramePadding()
                 imgui.Text(u8"Диалог: " .. contactName)
                 
                 if not isSystemChat then
                     local geoBtnText = u8"Геопозиция"
                     local geoBtnWidth = imgui.CalcTextSize(geoBtnText).x + 16
-                    imgui.SameLine(imgui.GetColumnWidth() - geoBtnWidth - 10)
+                    local searchBtnText = u8"Поиск"
+                    local searchBtnWidth = imgui.CalcTextSize(searchBtnText).x + 16
+                    local spaceX = imgui.GetStyle().ItemSpacing.x
+                    
+                    imgui.SameLine(rightAvailW - searchBtnWidth - geoBtnWidth - spaceX)
+                    if imgui.Button(searchBtnText) then
+                        showMessageSearch = not showMessageSearch
+                        if showMessageSearch then 
+                            requestFocusSearch = true 
+                        else 
+                            inputSearchMessage[0] = 0 
+                        end
+                    end
+                    
+                    imgui.SameLine(0, spaceX)
                     if imgui.Button(geoBtnText) then
                         targetGeoNumber = tostring(activeContact):match("%d+")
                         if targetGeoNumber then
@@ -1432,15 +1699,32 @@ local newFrame = imgui.OnFrame(
                             showSystemNotification(u8"Ошибка: неверный номер телефона.", 2)
                         end
                     end
+                else
+                    local searchBtnText = u8"Поиск"
+                    local searchBtnWidth = imgui.CalcTextSize(searchBtnText).x + 16
+                    
+                    imgui.SameLine(rightAvailW - searchBtnWidth)
+                    if imgui.Button(searchBtnText) then
+                        showMessageSearch = not showMessageSearch
+                        if showMessageSearch then 
+                            requestFocusSearch = true 
+                        else 
+                            inputSearchMessage[0] = 0 
+                        end
+                    end
                 end
                 
-                local p = imgui.GetCursorScreenPos()
-                local w = imgui.GetColumnWidth()
-                imgui.GetWindowDrawList():AddLine(
-                    imgui.ImVec2(p.x, p.y + 2), 
-                    imgui.ImVec2(p.x + w - 15, p.y + 2), 
-                    imgui.GetColorU32Vec4(imgui.ImVec4(0.4, 0.4, 0.4, 1.0))
-                )
+                if showMessageSearch then
+                    imgui.Spacing()
+                    imgui.PushItemWidth(-1)
+                    if requestFocusSearch then
+                        imgui.SetKeyboardFocusHere()
+                        requestFocusSearch = false
+                    end
+                    imgui.InputTextWithHint("##SearchMessage", u8"Поиск по сообщениям...", inputSearchMessage, 256)
+                    imgui.PopItemWidth()
+                end
+
                 imgui.Spacing()
 
                 imgui.BeginChild("ChatHistory", imgui.ImVec2(0, -40), true)
@@ -1453,224 +1737,266 @@ local newFrame = imgui.OnFrame(
                     local windowH = imgui.GetWindowHeight()
                     local culling_buffer = 3000
                     
+                    local sMsgText = cp1251_lower(u8:decode(ffi.string(inputSearchMessage)))
+                    local isMsgSearching = showMessageSearch and sMsgText ~= ""
+                    
                     for index, msgData in ipairs(profile.history[activeContact]) do
-                        local text = u8(msgData.msg)
-                        
-                        local urls = {}
-                        local foundUrls = {}
-                        local textToDisplay = text
-                        
-                        for word in text:gmatch("%S+") do
-                            local isUrl = false
-                            if word:match("^https?://[a-zA-Z0-9_%-%.%?%.:/%+=&]+") then
-                                isUrl = true
-                            elseif word:match("^[a-zA-Z0-9%-]+%.[a-zA-Z0-9%-%.]*[a-zA-Z][a-zA-Z]+[a-zA-Z0-9_%-%.%?%.:/%+=&]*$") then
-                                isUrl = true
-                            elseif word:match("^%d+%.%d+%.%d+%.%d+[:%d]*$") then
-                                isUrl = true
+                        local skipMsg = false
+                        if isMsgSearching then
+                            local lowerMsg = cp1251_lower(msgData.msg)
+                            if not lowerMsg:find(sMsgText, 1, true) then
+                                skipMsg = true
                             end
+                        end
+                        
+                        if not skipMsg then
+                            local text = u8(msgData.msg)
                             
-                            if isUrl then
-                                if not foundUrls[word] then
-                                    foundUrls[word] = true
-                                    table.insert(urls, word)
-                                    local safeWord = word:gsub("[%-%^%$%(%)%%%.%[%]%*%+%?]", "%%%1")
-                                    textToDisplay = textToDisplay:gsub(safeWord, "")
+                            local urls = {}
+                            local foundUrls = {}
+                            local textToDisplay = text
+                            
+                            for word in text:gmatch("%S+") do
+                                local isUrl = false
+                                if word:match("^https?://[a-zA-Z0-9_%-%.%?%.:/%+=&]+") then
+                                    isUrl = true
+                                elseif word:match("^[a-zA-Z0-9%-]+%.[a-zA-Z0-9%-%.]*[a-zA-Z][a-zA-Z]+[a-zA-Z0-9_%-%.%?%.:/%+=&]*$") then
+                                    isUrl = true
+                                elseif word:match("^%d+%.%d+%.%d+%.%d+[:%d]*$") then
+                                    isUrl = true
+                                end
+                                
+                                if isUrl then
+                                    if not foundUrls[word] then
+                                        foundUrls[word] = true
+                                        table.insert(urls, word)
+                                        local safeWord = word:gsub("[%-%^%$%(%)%%%.%[%]%*%+%?]", "%%%1")
+                                        textToDisplay = textToDisplay:gsub(safeWord, "")
+                                    end
                                 end
                             end
-                        end
-                        textToDisplay = textToDisplay:gsub(" +", " "):match("^%s*(.-)%s*$") or ""
-                        
-                        local wrap_width = 300 
-                        local current_date_str = get_day_string(msgData.timestamp)
-                        local has_date = (current_date_str ~= last_date_str)
-                        local date_h = has_date and (10 + imgui.GetTextLineHeight()) or 0
-                        
-                        local timeText = "00:00"
-                        if msgData.timestamp and msgData.timestamp > 0 then
-                            timeText = os.date("%H:%M", msgData.timestamp)
-                        end
-                        
-                        local urlsStr = table.concat(urls, "|")
-                        local loadedStr = ""
-                        for _, url in ipairs(urls) do
-                            if imageCache[url] and imageCache[url].status == 2 then
-                                loadedStr = loadedStr .. url .. imageCache[url].w .. "x" .. imageCache[url].h
-                            elseif imageCache[url] and imageCache[url].status == 3 then
-                                loadedStr = loadedStr .. url .. "err"
+                            textToDisplay = textToDisplay:gsub(" +", " "):match("^%s*(.-)%s*$") or ""
+                            
+                            local wrap_width = 300 
+                            local current_date_str = get_day_string(msgData.timestamp)
+                            local has_date = (current_date_str ~= last_date_str)
+                            local date_h = has_date and (10 + imgui.GetTextLineHeight()) or 0
+                            
+                            local timeText = "00:00"
+                            if msgData.timestamp and msgData.timestamp > 0 then
+                                timeText = os.date("%H:%M", msgData.timestamp)
                             end
-                        end
+                            
+                            local urlsStr = table.concat(urls, "|")
+                            local loadedStr = ""
+                            for _, url in ipairs(urls) do
+                                if imageCache[url] and imageCache[url].status == 2 then
+                                    loadedStr = loadedStr .. url .. imageCache[url].w .. "x" .. imageCache[url].h
+                                elseif imageCache[url] and imageCache[url].status == 3 then
+                                    loadedStr = loadedStr .. url .. "err"
+                                end
+                            end
 
-                        if not msgData.bubbleSize or msgData.urlsStr ~= urlsStr or msgData.loadedStr ~= loadedStr then
-                            local msgTextSize = imgui.ImVec2(0, 0)
-                            if textToDisplay ~= "" then
-                                msgTextSize = imgui.CalcTextSize(textToDisplay, nil, false, wrap_width)
+                            if not msgData.bubbleSize or msgData.urlsStr ~= urlsStr or msgData.loadedStr ~= loadedStr then
+                                local msgTextSize = imgui.ImVec2(0, 0)
+                                if textToDisplay ~= "" then
+                                    msgTextSize = imgui.CalcTextSize(textToDisplay, nil, false, wrap_width)
+                                end
+                                local timeSize = imgui.CalcTextSize(timeText)
+                                local padding = imgui.ImVec2(12, 8)
+                                
+                                local b_width = 0
+                                if textToDisplay ~= "" then
+                                    b_width = msgTextSize.x
+                                end
+                                
+                                local b_height = padding.y * 1.5 + timeSize.y
+                                if textToDisplay ~= "" then
+                                    b_height = b_height + msgTextSize.y + 5
+                                end
+                                
+                                for _, url in ipairs(urls) do
+                                    local isImg = url:lower():match("%.png") or url:lower():match("%.jpe?g") or url:lower():match("%.gif")
+                                    if isImg then
+                                        if imageCache[url] and imageCache[url].status == 2 then
+                                            b_width = math.max(b_width, imageCache[url].w)
+                                            b_height = b_height + imageCache[url].h + 5
+                                        else
+                                            local load_size = imgui.CalcTextSize(u8"Загрузка...")
+                                            b_width = math.max(b_width, load_size.x)
+                                            b_height = b_height + load_size.y + 5
+                                        end
+                                    else
+                                        local linkSize = imgui.CalcTextSize(url, nil, false, wrap_width)
+                                        b_width = math.max(b_width, linkSize.x)
+                                        b_height = b_height + linkSize.y + 5
+                                    end
+                                end
+                                
+                                b_width = math.max(b_width, timeSize.x + 10)
+                                
+                                msgData.bubbleSize = {x = b_width + padding.x * 2, y = b_height}
+                                msgData.timeSize = {x = timeSize.x, y = timeSize.y}
+                                msgData.urls = urls
+                                msgData.urlsStr = urlsStr
+                                msgData.loadedStr = loadedStr
+                                msgData.textToDisplay = textToDisplay
                             end
-                            local timeSize = imgui.CalcTextSize(timeText)
+                            
+                            local bubbleSize = imgui.ImVec2(msgData.bubbleSize.x, msgData.bubbleSize.y)
+                            local timeSize = imgui.ImVec2(msgData.timeSize.x, msgData.timeSize.y)
                             local padding = imgui.ImVec2(12, 8)
                             
-                            local b_width = 0
-                            if textToDisplay ~= "" then
-                                b_width = msgTextSize.x
-                            end
+                            local startY = imgui.GetCursorPosY()
+                            local item_total_h = date_h + bubbleSize.y + 6
                             
-                            local b_height = padding.y * 1.5 + timeSize.y
-                            if textToDisplay ~= "" then
-                                b_height = b_height + msgTextSize.y + 5
-                            end
-                            
-                            for _, url in ipairs(urls) do
-                                local isImg = url:lower():match("%.png") or url:lower():match("%.jpe?g") or url:lower():match("%.gif")
-                                if isImg then
-                                    if imageCache[url] and imageCache[url].status == 2 then
-                                        b_width = math.max(b_width, imageCache[url].w)
-                                        b_height = b_height + imageCache[url].h + 5
-                                    else
-                                        local load_size = imgui.CalcTextSize(u8"Загрузка...")
-                                        b_width = math.max(b_width, load_size.x)
-                                        b_height = b_height + load_size.y + 5
+                            if startY + item_total_h < scrollY - culling_buffer or startY > scrollY + windowH + culling_buffer then
+                                imgui.SetCursorPosY(startY + item_total_h)
+                                if has_date then last_date_str = current_date_str end
+                            else
+                                if has_date then
+                                    imgui.Spacing()
+                                    local tSize = imgui.CalcTextSize(u8(current_date_str)).x
+                                    imgui.SetCursorPosX((imgui.GetWindowWidth() - tSize) / 2)
+                                    imgui.TextDisabled(u8(current_date_str))
+                                    imgui.Spacing()
+                                    last_date_str = current_date_str
+                                end
+                                
+                                local bubble_start_y = imgui.GetCursorPosY()
+                                local windowWidth = imgui.GetWindowWidth()
+                                local cursorX = imgui.GetCursorPosX()
+
+                                if msgData.sender == "me" then
+                                    cursorX = windowWidth - bubbleSize.x - 20
+                                end
+                                
+                                imgui.SetCursorPos(imgui.ImVec2(cursorX, bubble_start_y))
+                                local screenPos = imgui.GetCursorScreenPos()
+
+                                local color = msgData.sender == "me" and active_theme.me or active_theme.them
+                                imgui.GetWindowDrawList():AddRectFilled(
+                                    screenPos,
+                                    imgui.ImVec2(screenPos.x + bubbleSize.x, screenPos.y + bubbleSize.y),
+                                    imgui.GetColorU32Vec4(color), 
+                                    10.0 
+                                )
+
+                                imgui.SetCursorPos(imgui.ImVec2(cursorX, bubble_start_y))
+                                imgui.InvisibleButton("msgbtn_" .. index, bubbleSize)
+                                imgui.SetItemAllowOverlap() 
+
+                                if imgui.IsItemHovered() then
+                                    imgui.SetTooltip(u8"Правый клик — скопировать")
+                                    if imgui.IsMouseClicked(1) then
+                                        imgui.SetClipboardText(text)
                                     end
-                                else
-                                    local linkSize = imgui.CalcTextSize(url, nil, false, wrap_width)
-                                    b_width = math.max(b_width, linkSize.x)
-                                    b_height = b_height + linkSize.y + 5
                                 end
-                            end
-                            
-                            b_width = math.max(b_width, timeSize.x + 10)
-                            
-                            msgData.bubbleSize = {x = b_width + padding.x * 2, y = b_height}
-                            msgData.timeSize = {x = timeSize.x, y = timeSize.y}
-                            msgData.urls = urls
-                            msgData.urlsStr = urlsStr
-                            msgData.loadedStr = loadedStr
-                            msgData.textToDisplay = textToDisplay
-                        end
-                        
-                        local bubbleSize = imgui.ImVec2(msgData.bubbleSize.x, msgData.bubbleSize.y)
-                        local timeSize = imgui.ImVec2(msgData.timeSize.x, msgData.timeSize.y)
-                        local padding = imgui.ImVec2(12, 8)
-                        
-                        local startY = imgui.GetCursorPosY()
-                        local item_total_h = date_h + bubbleSize.y + 6
-                        
-                        if startY + item_total_h < scrollY - culling_buffer or startY > scrollY + windowH + culling_buffer then
-                            imgui.SetCursorPosY(startY + item_total_h)
-                            if has_date then last_date_str = current_date_str end
-                        else
-                            if has_date then
-                                imgui.Spacing()
-                                local tSize = imgui.CalcTextSize(u8(current_date_str)).x
-                                imgui.SetCursorPosX((imgui.GetWindowWidth() - tSize) / 2)
-                                imgui.TextDisabled(u8(current_date_str))
-                                imgui.Spacing()
-                                last_date_str = current_date_str
-                            end
-                            
-                            local bubble_start_y = imgui.GetCursorPosY()
-                            local windowWidth = imgui.GetWindowWidth()
-                            local cursorX = imgui.GetCursorPosX()
 
-                            if msgData.sender == "me" then
-                                cursorX = windowWidth - bubbleSize.x - 20
-                            end
-                            
-                            imgui.SetCursorPos(imgui.ImVec2(cursorX, bubble_start_y))
-                            local screenPos = imgui.GetCursorScreenPos()
+                                local currentOffset = bubble_start_y + padding.y
 
-                            local color = msgData.sender == "me" and active_theme.me or active_theme.them
-                            imgui.GetWindowDrawList():AddRectFilled(
-                                screenPos,
-                                imgui.ImVec2(screenPos.x + bubbleSize.x, screenPos.y + bubbleSize.y),
-                                imgui.GetColorU32Vec4(color), 
-                                10.0 
-                            )
-
-                            imgui.SetCursorPos(imgui.ImVec2(cursorX, bubble_start_y))
-                            imgui.InvisibleButton("msgbtn_" .. index, bubbleSize)
-                            imgui.SetItemAllowOverlap() 
-
-                            if imgui.IsItemHovered() then
-                                imgui.SetTooltip(u8"Правый клик — скопировать")
-                                if imgui.IsMouseClicked(1) then
-                                    imgui.SetClipboardText(text)
-                                end
-                            end
-
-                            local currentOffset = bubble_start_y + padding.y
-
-                            if msgData.textToDisplay ~= "" then
-                                imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
-                                local isGeo = (msgData.textToDisplay == "[Геопозиция]" or msgData.textToDisplay == u8"[Геопозиция]")
-                                if isGeo then
-                                    imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.4, 0.7, 1.0, 1.0))
-                                else
-                                    imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(1.0, 1.0, 1.0, 1.0)) 
-                                end
-                                imgui.PushTextWrapPos(imgui.GetCursorPosX() + wrap_width)
-                                imgui.Text(msgData.textToDisplay)
-                                imgui.PopTextWrapPos()
-                                imgui.PopStyleColor()
-                                currentOffset = currentOffset + imgui.CalcTextSize(msgData.textToDisplay, nil, false, wrap_width).y + 5
-                            end
-
-                            for u_idx, url in ipairs(msgData.urls) do
-                                local isImg = url:lower():match("%.png") or url:lower():match("%.jpe?g") or url:lower():match("%.gif")
-                                if isImg then
+                                if msgData.textToDisplay ~= "" then
                                     imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
-                                    
-                                    if not imageCache[url] then
-                                        imageCache[url] = { status = 1 }
-                                        local cleanUrl = url:match("([^%?]+)") or url
-                                        local ext = cleanUrl:match("%.([^%.]+)$") or "png"
-                                        local tempPath = getWorkingDirectory() .. "\\config\\img_" .. tostring(math.random(100000,999999)) .. "." .. ext
-                                        activeTempFiles[tempPath] = true
-                                        downloadUrlToFile(url, tempPath, function(id, status)
-                                            if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-                                                local rtex = renderLoadTextureFromFile(tempPath)
-                                                if rtex then
-                                                    local tex_w, tex_h = renderGetTextureSize(rtex)
-                                                    renderReleaseTexture(rtex)
-                                                    
-                                                    local tex = imgui.CreateTextureFromFile(tempPath)
-                                                    if tex then
-                                                        local max_dim = 300.0
-                                                        local draw_w, draw_h = tex_w, tex_h
-                                                        if tex_w > max_dim or tex_h > max_dim then
-                                                            local ratio = tex_w / tex_h
-                                                            if tex_w > tex_h then
-                                                                draw_w = max_dim
-                                                                draw_h = max_dim / ratio
-                                                            else
-                                                                draw_h = max_dim
-                                                                draw_w = max_dim * ratio
+                                    local isGeo = (msgData.textToDisplay == "[Геопозиция]" or msgData.textToDisplay == u8"[Геопозиция]")
+                                    if isGeo then
+                                        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.4, 0.7, 1.0, 1.0))
+                                    else
+                                        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(1.0, 1.0, 1.0, 1.0)) 
+                                    end
+                                    imgui.PushTextWrapPos(imgui.GetCursorPosX() + wrap_width)
+                                    imgui.Text(msgData.textToDisplay)
+                                    imgui.PopTextWrapPos()
+                                    imgui.PopStyleColor()
+                                    currentOffset = currentOffset + imgui.CalcTextSize(msgData.textToDisplay, nil, false, wrap_width).y + 5
+                                end
+
+                                for u_idx, url in ipairs(msgData.urls) do
+                                    local isImg = url:lower():match("%.png") or url:lower():match("%.jpe?g") or url:lower():match("%.gif")
+                                    if isImg then
+                                        imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
+                                        
+                                        if not imageCache[url] then
+                                            imageCache[url] = { status = 1 }
+                                            local cleanUrl = url:match("([^%?]+)") or url
+                                            local ext = cleanUrl:match("%.([^%.]+)$") or "png"
+                                            local tempPath = getWorkingDirectory() .. "\\config\\img_" .. tostring(math.random(100000,999999)) .. "." .. ext
+                                            activeTempFiles[tempPath] = true
+                                            downloadUrlToFile(url, tempPath, function(id, status)
+                                                if status == dlstatus.STATUS_ENDDOWNLOADDATA then
+                                                    local rtex = renderLoadTextureFromFile(tempPath)
+                                                    if rtex then
+                                                        local tex_w, tex_h = renderGetTextureSize(rtex)
+                                                        renderReleaseTexture(rtex)
+                                                        
+                                                        local tex = imgui.CreateTextureFromFile(tempPath)
+                                                        if tex then
+                                                            local max_dim = 300.0
+                                                            local draw_w, draw_h = tex_w, tex_h
+                                                            if tex_w > max_dim or tex_h > max_dim then
+                                                                local ratio = tex_w / tex_h
+                                                                if tex_w > tex_h then
+                                                                    draw_w = max_dim
+                                                                    draw_h = max_dim / ratio
+                                                                else
+                                                                    draw_h = max_dim
+                                                                    draw_w = max_dim * ratio
+                                                                end
                                                             end
+                                                            imageCache[url] = { status = 2, tex = tex, w = draw_w, h = draw_h }
+                                                        else
+                                                            imageCache[url] = { status = 3 }
                                                         end
-                                                        imageCache[url] = { status = 2, tex = tex, w = draw_w, h = draw_h }
                                                     else
                                                         imageCache[url] = { status = 3 }
                                                     end
-                                                else
-                                                    imageCache[url] = { status = 3 }
+                                                    pcall(os.remove, tempPath)
+                                                    activeTempFiles[tempPath] = nil
+                                                elseif status == dlstatus.STATUS_EX_ERROR then
+                                                    pcall(os.remove, tempPath)
+                                                    activeTempFiles[tempPath] = nil
                                                 end
-                                                os.remove(tempPath)
-                                                activeTempFiles[tempPath] = nil
-                                            elseif status == dlstatus.STATUS_EX_ERROR then
-                                                os.remove(tempPath)
-                                                activeTempFiles[tempPath] = nil
-                                            end
-                                        end)
-                                    end
-                                    
-                                    if imageCache[url].status == 1 then
-                                        imgui.TextDisabled(u8"Загрузка...")
-                                        currentOffset = currentOffset + imgui.CalcTextSize(u8"Загрузка...").y + 5
-                                    elseif imageCache[url].status == 2 then
-                                        imgui.Image(imageCache[url].tex, imgui.ImVec2(imageCache[url].w, imageCache[url].h))
+                                            end)
+                                        end
                                         
+                                        if imageCache[url].status == 1 then
+                                            imgui.TextDisabled(u8"Загрузка...")
+                                            currentOffset = currentOffset + imgui.CalcTextSize(u8"Загрузка...").y + 5
+                                        elseif imageCache[url].status == 2 then
+                                            imgui.Image(imageCache[url].tex, imgui.ImVec2(imageCache[url].w, imageCache[url].h))
+                                            
+                                            imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
+                                            imgui.InvisibleButton("imgbtn_"..index.."_"..u_idx, imgui.ImVec2(imageCache[url].w, imageCache[url].h))
+                                            imgui.SetItemAllowOverlap()
+                                            if imgui.IsItemHovered() then
+                                                imgui.SetMouseCursor(imgui.MouseCursor.Hand)
+                                                if imgui.IsMouseClicked(0) then
+                                                    linkToOpen = url
+                                                    requestLinkModal = true
+                                                end
+                                            end
+                                            currentOffset = currentOffset + imageCache[url].h + 5
+                                        elseif imageCache[url].status == 3 then
+                                            imgui.TextDisabled(u8"Ошибка загрузки")
+                                            currentOffset = currentOffset + imgui.CalcTextSize(u8"Ошибка загрузки").y + 5
+                                        end
+                                    else
                                         imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
-                                        imgui.InvisibleButton("imgbtn_"..index.."_"..u_idx, imgui.ImVec2(imageCache[url].w, imageCache[url].h))
+                                        local minPos = imgui.GetCursorScreenPos()
+                                        
+                                        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.4, 0.7, 1.0, 1.0))
+                                        imgui.PushTextWrapPos(imgui.GetCursorPosX() + wrap_width)
+                                        imgui.Text(url)
+                                        imgui.PopTextWrapPos()
+                                        imgui.PopStyleColor()
+                                        
+                                        local endPos = imgui.GetItemRectMax()
+                                        imgui.GetWindowDrawList():AddLine(imgui.ImVec2(minPos.x, endPos.y), imgui.ImVec2(endPos.x, endPos.y), imgui.GetColorU32Vec4(imgui.ImVec4(0.4, 0.7, 1.0, 1.0)))
+                                        
+                                        local linkSize = imgui.ImVec2(endPos.x - minPos.x, endPos.y - minPos.y)
+                                        imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
+                                        imgui.InvisibleButton("txtbtn_"..index.."_"..u_idx, linkSize)
                                         imgui.SetItemAllowOverlap()
+                                        
                                         if imgui.IsItemHovered() then
                                             imgui.SetMouseCursor(imgui.MouseCursor.Hand)
                                             if imgui.IsMouseClicked(0) then
@@ -1678,47 +2004,18 @@ local newFrame = imgui.OnFrame(
                                                 requestLinkModal = true
                                             end
                                         end
-                                        currentOffset = currentOffset + imageCache[url].h + 5
-                                    elseif imageCache[url].status == 3 then
-                                        imgui.TextDisabled(u8"Ошибка загрузки")
-                                        currentOffset = currentOffset + imgui.CalcTextSize(u8"Ошибка загрузки").y + 5
+                                        
+                                        currentOffset = currentOffset + linkSize.y + 5
                                     end
-                                else
-                                    imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
-                                    local minPos = imgui.GetCursorScreenPos()
-                                    
-                                    imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.4, 0.7, 1.0, 1.0))
-                                    imgui.PushTextWrapPos(imgui.GetCursorPosX() + wrap_width)
-                                    imgui.Text(url)
-                                    imgui.PopTextWrapPos()
-                                    imgui.PopStyleColor()
-                                    
-                                    local endPos = imgui.GetItemRectMax()
-                                    imgui.GetWindowDrawList():AddLine(imgui.ImVec2(minPos.x, endPos.y), imgui.ImVec2(endPos.x, endPos.y), imgui.GetColorU32Vec4(imgui.ImVec4(0.4, 0.7, 1.0, 1.0)))
-                                    
-                                    local linkSize = imgui.ImVec2(endPos.x - minPos.x, endPos.y - minPos.y)
-                                    imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
-                                    imgui.InvisibleButton("txtbtn_"..index.."_"..u_idx, linkSize)
-                                    imgui.SetItemAllowOverlap()
-                                    
-                                    if imgui.IsItemHovered() then
-                                        imgui.SetMouseCursor(imgui.MouseCursor.Hand)
-                                        if imgui.IsMouseClicked(0) then
-                                            linkToOpen = url
-                                            requestLinkModal = true
-                                        end
-                                    end
-                                    
-                                    currentOffset = currentOffset + linkSize.y + 5
                                 end
+
+                                local time_x = cursorX + bubbleSize.x - timeSize.x - padding.x + 4
+                                local time_y = bubble_start_y + bubbleSize.y - timeSize.y - padding.y / 2
+                                imgui.SetCursorPos(imgui.ImVec2(time_x, time_y))
+                                imgui.TextColored(imgui.ImVec4(0.7, 0.7, 0.7, 0.8), timeText)
+
+                                imgui.SetCursorPosY(bubble_start_y + bubbleSize.y + 6)
                             end
-
-                            local time_x = cursorX + bubbleSize.x - timeSize.x - padding.x + 4
-                            local time_y = bubble_start_y + bubbleSize.y - timeSize.y - padding.y / 2
-                            imgui.SetCursorPos(imgui.ImVec2(time_x, time_y))
-                            imgui.TextColored(imgui.ImVec4(0.7, 0.7, 0.7, 0.8), timeText)
-
-                            imgui.SetCursorPosY(bubble_start_y + bubbleSize.y + 6)
                         end
                     end
                 end
@@ -1738,11 +2035,9 @@ local newFrame = imgui.OnFrame(
                     local offset_y = (40 - text_h) / 2
                     
                     imgui.SetCursorPosY(imgui.GetCursorPosY() + offset_y)
-                    imgui.SetCursorPosX((imgui.GetWindowWidth() - imgui.CalcTextSize(bText).x) / 2)
                     imgui.TextDisabled(bText)
                 else
                     imgui.Spacing()
-                    imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 8.0)
                     local currentPaddingY = imgui.GetStyle().FramePadding.y
                     imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, imgui.ImVec2(10.0, currentPaddingY)) 
                     imgui.PushItemWidth(-80) 
@@ -1757,7 +2052,7 @@ local newFrame = imgui.OnFrame(
                     end
                     
                     imgui.PopItemWidth()
-                    imgui.PopStyleVar(2) 
+                    imgui.PopStyleVar(1) 
                     
                     imgui.SameLine()
                     if imgui.Button(u8"Отправить", imgui.ImVec2(0, 0)) then
@@ -1765,13 +2060,19 @@ local newFrame = imgui.OnFrame(
                     end
                 end
             else
-                imgui.Text(u8"Выберите контакт для начала переписки.")
+                local emptyText = u8"Выберите контакт для начала переписки."
+                local tSize = imgui.CalcTextSize(emptyText)
+                local avail = imgui.GetContentRegionAvail()
+                local cPos = imgui.GetCursorPos()
+                imgui.SetCursorPos(imgui.ImVec2(cPos.x + (avail.x - tSize.x) / 2, cPos.y + (avail.y - tSize.y) / 2))
+                imgui.Text(emptyText)
             end
 
             imgui.Columns(1)
             imgui.End()
         end
         
+        imgui.PopStyleVar(4)
         imgui.PopStyleColor(15) 
     end
 )
