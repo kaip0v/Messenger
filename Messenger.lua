@@ -2130,11 +2130,10 @@ local newFrame = imgui.OnFrame(
                 imgui.AlignTextToFramePadding()
                 imgui.TextColored(imgui.ImVec4(0.6, 0.6, 0.6, 1.0), u8"Размер базы данных: " .. sizeText)
                 
+                imgui.SameLine()
                 local availRight = imgui.GetContentRegionAvail().x
                 if availRight > btnWidth then
-                    imgui.SameLine(imgui.GetCursorPosX() + availRight - btnWidth)
-                else
-                    imgui.SameLine()
+                    imgui.SetCursorPosX(imgui.GetCursorPosX() + availRight - btnWidth)
                 end
                 
                 imgui.SetCursorPosY(currentY)
@@ -2162,11 +2161,10 @@ local newFrame = imgui.OnFrame(
             
             local totalLeftBtnsWidth = cleanBtnWidth + settingsBtnWidth + spaceX
             
+            imgui.SameLine()
             local availLeft = imgui.GetContentRegionAvail().x
             if availLeft > totalLeftBtnsWidth then
-                imgui.SameLine(imgui.GetCursorPosX() + availLeft - totalLeftBtnsWidth)
-            else
-                imgui.SameLine()
+                imgui.SetCursorPosX(imgui.GetCursorPosX() + availLeft - totalLeftBtnsWidth)
             end
             
             if imgui.Button(cleanBtnText) then
@@ -2612,11 +2610,10 @@ local newFrame = imgui.OnFrame(
                     
                     local totalRightBtnsWidth = searchBtnWidth + geoBtnWidth + callHistBtnWidth + (spaceX * 2)
                     
+                    imgui.SameLine()
                     local availRight = imgui.GetContentRegionAvail().x
                     if availRight > totalRightBtnsWidth then
-                        imgui.SameLine(imgui.GetCursorPosX() + availRight - totalRightBtnsWidth)
-                    else
-                        imgui.SameLine()
+                        imgui.SetCursorPosX(imgui.GetCursorPosX() + availRight - totalRightBtnsWidth)
                     end
                     
                     if imgui.Button(callHistBtnText) then
@@ -2712,11 +2709,10 @@ local newFrame = imgui.OnFrame(
                     local framePadX = imgui.GetStyle().FramePadding.x
                     local searchBtnWidth = imgui.CalcTextSize(searchBtnText).x + (framePadX * 2.0)
                     
+                    imgui.SameLine()
                     local availRight = imgui.GetContentRegionAvail().x
                     if availRight > searchBtnWidth then
-                        imgui.SameLine(imgui.GetCursorPosX() + availRight - searchBtnWidth)
-                    else
-                        imgui.SameLine()
+                        imgui.SetCursorPosX(imgui.GetCursorPosX() + availRight - searchBtnWidth)
                     end
                     
                     if imgui.Button(searchBtnText) then
