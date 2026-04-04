@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.4
+local script_version = 1.5
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -58,7 +58,8 @@ local globalSettings = {
     openMod = vkeys.VK_MENU,
     customThemes = {},
     contactSortMode = 1,
-    uiScale = 1.0
+    uiScale = 1.0,
+    hideUnreadOnLogin = false
 }
 
 local newsUrl = "https://raw.githubusercontent.com/kaip0v/Messenger/main/news.txt"
@@ -72,6 +73,8 @@ local activeContact = nil
 
 local lastSmsPhone = nil
 local lastSmsType = nil
+local lastSmsIsUnread = false
+local lastSmsIsDup = false
 
 local cachedSortedContacts = {}
 local needSortContacts = true
@@ -101,7 +104,8 @@ local UI = {
     settingHideJunk = imgui.new.bool(false),
     settingAutoUpdate = imgui.new.bool(false),
     settingDND = imgui.new.bool(false),
-    settingAutoDownload = imgui.new.bool(false),
+    settingAutoDownload = imgui.new.bool(true),
+    settingHideUnread = imgui.new.bool(false),
     showThemeEditor = imgui.new.bool(false),
     forceResize = false
 }
@@ -523,7 +527,14 @@ function checkUpdates()
             if content and content ~= "" then
                 local data = nil
                 local ok, res = pcall(decodeJson, content)
-                if ok and type(res) == "table" then data = res end
+                if ok and type(res) == "table" then
+                    data = res
+                else
+                    pcall(function()
+                        local func = load("return " .. content)
+                        if func then data = func() end
+                    end)
+                end
                 
                 if data and data.version and data.url then
                     if tonumber(data.version) > tonumber(script_version) then
@@ -679,6 +690,9 @@ function main()
                     globalSettings.theme = #themes + 1
                 end
                 save_all_data()
+            end
+            if globalSettings.hideUnreadOnLogin == nil then
+                globalSettings.hideUnreadOnLogin = false
             end
         end
         if masterData.profiles then
@@ -1224,47 +1238,91 @@ function samp.onServerMessage(color, text)
         end
     end
 
-    local sender_str, inc_num, inc_text = text:match("SMS от (.-) %(тел%. (%d+)%): (.*)")
+    local clean_sms_text = plain_text
+    local is_unread = false
+    
+    if clean_sms_text:find("^UNREAD SMS ") then
+        is_unread = true
+        clean_sms_text = clean_sms_text:gsub("^UNREAD ", "")
+    end
+    
+    local inc_str, inc_num, inc_text = clean_sms_text:match("^SMS от (.-) %(тел%. (%d+)%): (.*)")
+    if not inc_num then
+        inc_num, inc_text = clean_sms_text:match("^SMS от #(%d+): (.*)")
+        inc_str = ""
+    end
+    
     if inc_num and inc_text then
-        lastSmsPhone = inc_num
-        lastSmsType = "in"
-        addSmsToHistory(profile, inc_num, "them", inc_text, ts)
-        needSortContacts = true
-        
-        if myNick ~= actualPlayerNick or activeContact ~= inc_num or not UI.windowState[0] then
-            if not profile.muted[inc_num] then
-                profile.unread[inc_num] = true
-                if globalSettings.useScreenNotifications and not globalSettings.dndMode then
-                    local cName = profile.contacts[inc_num] or ""
-                    Sys.activeNotification = {
-                        number = inc_num,
-                        name = (cName == "" and inc_num or cName),
-                        text = inc_text,
-                        time = os.clock()
-                    }
+        local is_dup = false
+        if is_unread and profile.history[inc_num] then
+            local hist = profile.history[inc_num]
+            local search_text = inc_text:gsub("%s*%.%.%.?%s*$", "")
+            for i = #hist, math.max(1, #hist - 30), -1 do
+                if hist[i].msg:find(search_text, 1, true) then
+                    is_dup = true
+                    break
                 end
             end
         end
-        save_all_data()
-        if myNick == actualPlayerNick and activeContact == inc_num then UI.scrollToBottom = true end
         
-        if globalSettings.useScreenNotifications then
+        lastSmsPhone = inc_num
+        lastSmsType = "in"
+        lastSmsIsUnread = is_unread
+        lastSmsIsDup = is_dup
+        
+        if not is_dup then
+            addSmsToHistory(profile, inc_num, "them", inc_text, ts)
+            needSortContacts = true
+            
+            if myNick ~= actualPlayerNick or activeContact ~= inc_num or not UI.windowState[0] then
+                if not profile.muted[inc_num] then
+                    profile.unread[inc_num] = true
+                    if globalSettings.useScreenNotifications and not globalSettings.dndMode then
+                        local cName = profile.contacts[inc_num] or ""
+                        Sys.activeNotification = {
+                            number = inc_num,
+                            name = (cName == "" and inc_num or cName),
+                            text = inc_text,
+                            time = os.clock()
+                        }
+                    end
+                end
+            end
+            save_all_data()
+            if myNick == actualPlayerNick and activeContact == inc_num then UI.scrollToBottom = true end
+        end
+        
+        if is_unread and globalSettings.hideUnreadOnLogin then
+            return false
+        elseif globalSettings.useScreenNotifications then
             return false
         else
             local cName = profile.contacts[inc_num] or ""
             if cName ~= "" then
-                local safe_sender = sender_str:gsub("[%-%^%$%(%)%%%.%[%]%*%+%?]", "%%%1")
-                local new_text = text:gsub("SMS от " .. safe_sender, "SMS от " .. cName)
+                local new_text = ""
+                if inc_str ~= "" then
+                    local safe_sender = inc_str:gsub("[%-%^%$%(%)%%%.%[%]%*%+%?]", "%%%1")
+                    new_text = text:gsub("SMS от " .. safe_sender, "SMS от " .. cName)
+                else
+                    new_text = text:gsub("SMS от #" .. inc_num, "SMS от " .. cName)
+                end
                 return {color, new_text}
             end
             return 
         end
     end
 
-    local out_str, out_num, out_text = text:match("SMS к (.-) %(тел%. (%d+)%): (.*)")
+    local out_str, out_num, out_text = clean_sms_text:match("^SMS к (.-) %(тел%. (%d+)%): (.*)")
+    if not out_num then
+        out_num, out_text = clean_sms_text:match("^SMS к #(%d+): (.*)")
+        out_str = ""
+    end
+    
     if out_num and out_text then
         lastSmsPhone = out_num
         lastSmsType = "out"
+        lastSmsIsUnread = false
+        lastSmsIsDup = false
         addSmsToHistory(profile, out_num, "me", out_text, ts)
         needSortContacts = true
         if myNick == actualPlayerNick and activeContact == out_num then UI.scrollToBottom = true end
@@ -1274,31 +1332,42 @@ function samp.onServerMessage(color, text)
         else
             local cName = profile.contacts[out_num] or ""
             if cName ~= "" then
-                local safe_receiver = out_str:gsub("[%-%^%$%(%)%%%.%[%]%*%+%?]", "%%%1")
-                local new_text = text:gsub("SMS к " .. safe_receiver, "SMS к " .. cName)
+                local new_text = ""
+                if out_str ~= "" then
+                    local safe_receiver = out_str:gsub("[%-%^%$%(%)%%%.%[%]%*%+%?]", "%%%1")
+                    new_text = text:gsub("SMS к " .. safe_receiver, "SMS к " .. cName)
+                else
+                    new_text = text:gsub("SMS к #" .. out_num, "SMS к " .. cName)
+                end
                 return {color, new_text}
             end
             return 
         end
     end
 
-    local continued_text = text:match("^%.%.%.?%s*(.*)")
+    local continued_text = plain_text:match("^%.%.%.?%s*(.*)")
     if continued_text and lastSmsPhone then
-        local targetHist = profile.history[lastSmsPhone]
-        if targetHist and #targetHist > 0 then
-            local prev_msg = targetHist[#targetHist].msg
-            prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
-            targetHist[#targetHist].msg = prev_msg .. " " .. continued_text
-            targetHist[#targetHist].bubbleSize = nil 
-            save_all_data()
-            if myNick == actualPlayerNick and activeContact == lastSmsPhone then UI.scrollToBottom = true end
+        if not lastSmsIsDup then
+            local targetHist = profile.history[lastSmsPhone]
+            if targetHist and #targetHist > 0 then
+                local prev_msg = targetHist[#targetHist].msg
+                prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
+                targetHist[#targetHist].msg = prev_msg .. " " .. continued_text
+                targetHist[#targetHist].bubbleSize = nil 
+                save_all_data()
+                if myNick == actualPlayerNick and activeContact == lastSmsPhone then UI.scrollToBottom = true end
+            end
         end
-        if globalSettings.useScreenNotifications then
+        if lastSmsIsUnread and globalSettings.hideUnreadOnLogin then
+            return false
+        elseif globalSettings.useScreenNotifications then
             return false
         end
         return
     else
         lastSmsPhone = nil
+        lastSmsIsUnread = false
+        lastSmsIsDup = false
     end
 end
 
@@ -1988,6 +2057,13 @@ local newFrame = imgui.OnFrame(
                 imgui.Text(u8"Дополнительные функции:")
                 imgui.Spacing()
                 
+                UI.settingHideUnread[0] = globalSettings.hideUnreadOnLogin or false
+                if imgui.Checkbox(u8"Скрывать непрочитанные при входе", UI.settingHideUnread) then
+                    globalSettings.hideUnreadOnLogin = UI.settingHideUnread[0]
+                    save_all_data()
+                end
+                if imgui.IsItemHovered() then imgui.SetTooltip(u8"Скрывать из чата оффлайн-сообщения (UNREAD SMS), которые приходят при авторизации. Они всё равно будут сохранены в историю.") end
+
                 UI.settingScreenNotif[0] = globalSettings.useScreenNotifications
                 if imgui.Checkbox(u8"Всплывающие уведомления (и скрытие SMS из чата)", UI.settingScreenNotif) then
                     globalSettings.useScreenNotifications = UI.settingScreenNotif[0]
@@ -2054,10 +2130,11 @@ local newFrame = imgui.OnFrame(
                 imgui.AlignTextToFramePadding()
                 imgui.TextColored(imgui.ImVec4(0.6, 0.6, 0.6, 1.0), u8"Размер базы данных: " .. sizeText)
                 
-                imgui.SameLine()
-                local availLeft = imgui.GetContentRegionAvail().x
-                if availLeft > btnWidth then
-                    imgui.SetCursorPosX(imgui.GetCursorPosX() + availLeft - btnWidth)
+                local availRight = imgui.GetContentRegionAvail().x
+                if availRight > btnWidth then
+                    imgui.SameLine(imgui.GetCursorPosX() + availRight - btnWidth)
+                else
+                    imgui.SameLine()
                 end
                 
                 imgui.SetCursorPosY(currentY)
@@ -2085,10 +2162,11 @@ local newFrame = imgui.OnFrame(
             
             local totalLeftBtnsWidth = cleanBtnWidth + settingsBtnWidth + spaceX
             
-            imgui.SameLine()
             local availLeft = imgui.GetContentRegionAvail().x
             if availLeft > totalLeftBtnsWidth then
-                imgui.SetCursorPosX(imgui.GetCursorPosX() + availLeft - totalLeftBtnsWidth)
+                imgui.SameLine(imgui.GetCursorPosX() + availLeft - totalLeftBtnsWidth)
+            else
+                imgui.SameLine()
             end
             
             if imgui.Button(cleanBtnText) then
@@ -2534,10 +2612,11 @@ local newFrame = imgui.OnFrame(
                     
                     local totalRightBtnsWidth = searchBtnWidth + geoBtnWidth + callHistBtnWidth + (spaceX * 2)
                     
-                    imgui.SameLine()
                     local availRight = imgui.GetContentRegionAvail().x
                     if availRight > totalRightBtnsWidth then
-                        imgui.SetCursorPosX(imgui.GetCursorPosX() + availRight - totalRightBtnsWidth)
+                        imgui.SameLine(imgui.GetCursorPosX() + availRight - totalRightBtnsWidth)
+                    else
+                        imgui.SameLine()
                     end
                     
                     if imgui.Button(callHistBtnText) then
@@ -2633,10 +2712,11 @@ local newFrame = imgui.OnFrame(
                     local framePadX = imgui.GetStyle().FramePadding.x
                     local searchBtnWidth = imgui.CalcTextSize(searchBtnText).x + (framePadX * 2.0)
                     
-                    imgui.SameLine()
                     local availRight = imgui.GetContentRegionAvail().x
                     if availRight > searchBtnWidth then
-                        imgui.SetCursorPosX(imgui.GetCursorPosX() + availRight - searchBtnWidth)
+                        imgui.SameLine(imgui.GetCursorPosX() + availRight - searchBtnWidth)
+                    else
+                        imgui.SameLine()
                     end
                     
                     if imgui.Button(searchBtnText) then
@@ -2854,7 +2934,14 @@ local newFrame = imgui.OnFrame(
                                     end
                                     
                                     for _, url in ipairs(urls) do
-                                        local isImg = url:lower():match("%.png") or url:lower():match("%.jpe?g") or url:lower():match("%.gif")
+                                        local isImg = false
+                                        local lUrl = url:lower()
+                                        if lUrl:match("^https?://i%.imgur%.com/") then
+                                            if lUrl:match("%.png$") or lUrl:match("%.jpe?g$") or lUrl:match("%.gif$") then
+                                                isImg = true
+                                            end
+                                        end
+                                        
                                         if isImg then
                                             if imageCache[url] and imageCache[url].status == 2 then
                                                 b_width = math.max(b_width, imageCache[url].w * scale)
@@ -2959,7 +3046,14 @@ local newFrame = imgui.OnFrame(
                                     end
 
                                     for u_idx, url in ipairs(msgData.urls) do
-                                        local isImg = url:lower():match("%.png") or url:lower():match("%.jpe?g") or url:lower():match("%.gif")
+                                        local isImg = false
+                                        local lUrl = url:lower()
+                                        if lUrl:match("^https?://i%.imgur%.com/") then
+                                            if lUrl:match("%.png$") or lUrl:match("%.jpe?g$") or lUrl:match("%.gif$") then
+                                                isImg = true
+                                            end
+                                        end
+                                        
                                         if isImg then
                                             imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
                                             
