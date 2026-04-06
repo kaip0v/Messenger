@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.6
+local script_version = 1.7
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -40,8 +40,10 @@ local oldSettingsFile = getWorkingDirectory() .. '\\config\\messenger_settings.j
 
 local phoneData = {}
 local imageCache = {}
+local imageCacheKeys = {}
 local activeTempFiles = {}
 local onlinePlayers = {}
+local onlinePlayersById = {}
 
 local globalSettings = {
     theme = 1,
@@ -73,7 +75,6 @@ local lastSeenNick = "Default"
 local activeContact = nil
 
 local lastSmsPhone = nil
-local lastSmsType = nil
 local lastSmsIsUnread = false
 local lastSmsIsDup = false
 
@@ -494,6 +495,15 @@ local function downloadImageToCache(url)
                         
                         local tex = imgui.CreateTextureFromFile(tempPath)
                         if tex then
+                            table.insert(imageCacheKeys, url)
+                            if #imageCacheKeys > 15 then
+                                local oldUrl = table.remove(imageCacheKeys, 1)
+                                if imageCache[oldUrl] and imageCache[oldUrl].tex then
+                                    imageCache[oldUrl].tex:Release() 
+                                    imageCache[oldUrl] = nil
+                                end
+                            end
+
                             local max_dim = 300.0
                             local draw_w, draw_h = tex_w, tex_h
                             if tex_w > max_dim or tex_h > max_dim then
@@ -600,7 +610,7 @@ function checkUpdates()
                                         end
                                         
                                         addSmsToHistory(profile, sys_num, "them", text_to_save, os.time())
-                                        profile.unread[sys_num] = true
+                                        for _, p in pairs(phoneData) do p.unread[sys_num] = true end
                                         save_all_data()
                                     end
 
@@ -719,6 +729,21 @@ addEventHandler('onWindowMessage', function(msg, wparam, lparam)
     end
 end)
 
+function samp.onPlayerJoin(id, color, is_npc, nickname)
+    onlinePlayersById[id] = nickname
+    onlinePlayers[nickname] = true
+    if globalSettings.contactSortMode == 3 then needSortContacts = true end
+end
+
+function samp.onPlayerQuit(id, reason)
+    local nick = onlinePlayersById[id]
+    if nick then
+        onlinePlayers[nick] = nil
+    end
+    onlinePlayersById[id] = nil
+    if globalSettings.contactSortMode == 3 then needSortContacts = true end
+end
+
 function main()
     if not isSampLoaded() or not isSampfuncsLoaded() then return end
     while not isSampAvailable() do wait(100) end
@@ -791,11 +816,20 @@ function main()
     if result then
         local tempNick = sampGetPlayerNickname(myId)
         lastSeenNick = tempNick
-        if tempNick:find("_") then
+        if tempNick:find("_") and not tempNick:match("^Mask_%d+$") then
             myNick = tempNick
             actualPlayerNick = tempNick
         end
     end
+    
+    local master_news_hist = nil
+    for _, pData in pairs(phoneData) do
+        if pData.history and pData.history["System_News"] then
+            master_news_hist = pData.history["System_News"]
+            break
+        end
+    end
+    if not master_news_hist then master_news_hist = {} end
     
     for pName, pData in pairs(phoneData) do
         if not pData.unread then pData.unread = {} end
@@ -805,6 +839,9 @@ function main()
         if not pData.muted then pData.muted = {} end
         if not pData.drafts then pData.drafts = {} end
         if not pData.calls then pData.calls = {} end
+        
+        pData.history["System_News"] = master_news_hist
+        pData.contacts["System_News"] = "Уведомления"
         
         pData.numbers = nil
         pData.activeNumber = nil
@@ -821,6 +858,8 @@ function main()
     
     if myNick ~= "Default" and myNick:find("_") and not phoneData[myNick] then
         phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
+        phoneData[myNick].history["System_News"] = master_news_hist
+        phoneData[myNick].contacts["System_News"] = "Уведомления"
         save_all_data()
     end
     
@@ -858,7 +897,7 @@ function main()
                                 addSmsToHistory(profile, sys_num, "them", text_cp1251, os.time())
 
                                 if activeContact ~= sys_num or not UI.windowState[0] then
-                                    profile.unread[sys_num] = true
+                                    for _, p in pairs(phoneData) do p.unread[sys_num] = true end
                                     if globalSettings.useScreenNotifications and not globalSettings.dndMode then
                                         Sys.activeNotification = {
                                             number = sys_num,
@@ -882,29 +921,21 @@ function main()
         end
     end)
 
+    local max_id = sampGetMaxPlayerId(false)
+    for i = 0, max_id do
+        if sampIsPlayerConnected(i) then
+            local nick = sampGetPlayerNickname(i)
+            if nick then
+                onlinePlayersById[i] = nick
+                onlinePlayers[nick] = true
+            end
+        end
+    end
+
     local lastNickCheck = 0
-    local lastOnlineCheck = 0
 
     while true do
         wait(0)
-        
-        if os.clock() - lastOnlineCheck > 3.0 then
-            lastOnlineCheck = os.clock()
-            local tempOnline = {}
-            local max_id = sampGetMaxPlayerId(false)
-            for i = 0, max_id do
-                if sampIsPlayerConnected(i) then
-                    local nick = sampGetPlayerNickname(i)
-                    if nick then
-                        tempOnline[nick] = true
-                    end
-                end
-            end
-            onlinePlayers = tempOnline
-            if globalSettings.contactSortMode == 3 then
-                needSortContacts = true
-            end
-        end
         
         if os.clock() - lastNickCheck > 1.0 then
             lastNickCheck = os.clock()
@@ -923,6 +954,12 @@ function main()
                             
                             if not phoneData[myNick] then
                                 phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
+                                local m_hist = nil
+                                for _, p in pairs(phoneData) do
+                                    if p.history and p.history["System_News"] then m_hist = p.history["System_News"] break end
+                                end
+                                phoneData[myNick].history["System_News"] = m_hist or {}
+                                phoneData[myNick].contacts["System_News"] = "Уведомления"
                                 save_all_data()
                             end
                         end
@@ -1145,33 +1182,6 @@ function samp.onServerMessage(color, text)
             CallState.number = nil
             CallState.saved = false
             CallState.callIndex = nil
-        elseif plain_text:match("^%.%.%.%s*(.*)") then
-            local cont = plain_text:match("^%.%.%.%s*(.*)")
-            if CallState.saved and CallState.number and CallState.callIndex then
-                local callEntry = profile.calls[CallState.number] and profile.calls[CallState.number][CallState.callIndex]
-                if callEntry and callEntry.messages and #callEntry.messages > 0 then
-                    local prev_msg = callEntry.messages[#callEntry.messages].msg
-                    prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
-                    callEntry.messages[#callEntry.messages].msg = prev_msg .. " " .. cont
-                    save_all_data()
-                    if myNick == actualPlayerNick and activeContact == CallState.number then UI.scrollToBottom = true end
-                end
-            elseif lastSmsPhone then
-                if not lastSmsIsDup then
-                    local targetHist = profile.history[lastSmsPhone]
-                    if targetHist and #targetHist > 0 then
-                        local prev_msg = targetHist[#targetHist].msg
-                        prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
-                        targetHist[#targetHist].msg = prev_msg .. " " .. cont
-                        targetHist[#targetHist].bubbleSize = nil 
-                        save_all_data()
-                        if myNick == actualPlayerNick and activeContact == lastSmsPhone then UI.scrollToBottom = true end
-                    end
-                end
-                if lastSmsIsUnread and globalSettings.hideUnreadOnLogin then return false end
-                if globalSettings.useScreenNotifications then return false end
-                return
-            end
         else
             local is_call_msg = false
             local sender = "them"
@@ -1320,7 +1330,7 @@ function samp.onServerMessage(color, text)
         if is_unread and profile.history[inc_num] then
             local hist = profile.history[inc_num]
             local search_text = inc_text:gsub("%s*%.%.%.?%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
-            for i = #hist, math.max(1, #hist - 30), -1 do
+            for i = #hist, math.max(1, #hist - 100), -1 do
                 local h_text = hist[i].msg:gsub("^%s+", ""):gsub("%s+$", "")
                 if h_text:sub(1, #search_text) == search_text then
                     is_dup = true
@@ -1330,7 +1340,6 @@ function samp.onServerMessage(color, text)
         end
         
         lastSmsPhone = inc_num
-        lastSmsType = "in"
         lastSmsIsUnread = is_unread
         lastSmsIsDup = is_dup
         
@@ -1376,7 +1385,6 @@ function samp.onServerMessage(color, text)
     
     if out_num and out_text then
         lastSmsPhone = out_num
-        lastSmsType = "out"
         lastSmsIsUnread = false
         lastSmsIsDup = false
         addSmsToHistory(profile, out_num, "me", out_text, ts)
@@ -1401,22 +1409,33 @@ function samp.onServerMessage(color, text)
     end
 
     local continued_text = plain_text:match("^%.%.%.?%s*(.*)")
-    if continued_text and lastSmsPhone then
-        if not lastSmsIsDup then
-            local targetHist = profile.history[lastSmsPhone]
-            if targetHist and #targetHist > 0 then
-                local prev_msg = targetHist[#targetHist].msg
+    if continued_text then
+        if lastSmsPhone then
+            if not lastSmsIsDup then
+                local targetHist = profile.history[lastSmsPhone]
+                if targetHist and #targetHist > 0 then
+                    local prev_msg = targetHist[#targetHist].msg
+                    prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
+                    targetHist[#targetHist].msg = prev_msg .. " " .. continued_text
+                    targetHist[#targetHist].bubbleSize = nil 
+                    save_all_data()
+                    if myNick == actualPlayerNick and activeContact == lastSmsPhone then UI.scrollToBottom = true end
+                end
+            end
+            if lastSmsIsUnread and globalSettings.hideUnreadOnLogin then return false
+            elseif globalSettings.useScreenNotifications then return false end
+            return
+        elseif CallState.active and CallState.saved and CallState.number and CallState.callIndex then
+            local callEntry = profile.calls[CallState.number] and profile.calls[CallState.number][CallState.callIndex]
+            if callEntry and callEntry.messages and #callEntry.messages > 0 then
+                local prev_msg = callEntry.messages[#callEntry.messages].msg
                 prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
-                targetHist[#targetHist].msg = prev_msg .. " " .. continued_text
-                targetHist[#targetHist].bubbleSize = nil 
+                callEntry.messages[#callEntry.messages].msg = prev_msg .. " " .. continued_text
                 save_all_data()
-                if myNick == actualPlayerNick and activeContact == lastSmsPhone then UI.scrollToBottom = true end
+                if myNick == actualPlayerNick and activeContact == CallState.number then UI.scrollToBottom = true end
             end
         end
-        if lastSmsIsUnread and globalSettings.hideUnreadOnLogin then return false
-        elseif globalSettings.useScreenNotifications then return false end
-        return
-    elseif not plain_text:match("^%s*[%|%-]") and not CallState.active then
+    elseif not plain_text:match("^%s*[%|%-]") then
         lastSmsPhone = nil
         lastSmsIsUnread = false
         lastSmsIsDup = false
@@ -1580,10 +1599,10 @@ local newFrame = imgui.OnFrame(
         imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 8.0 * scale)
         
         if UI.showThemeEditor[0] then
-            imgui.SetNextWindowSize(imgui.ImVec2(550 * scale, 450 * scale), sizeCond)
+            imgui.SetNextWindowSize(imgui.ImVec2(600 * scale, 450 * scale), sizeCond)
             if imgui.Begin(u8"Редактор кастомной темы", UI.showThemeEditor) then
                 imgui.Columns(2, "ThemeCols", false)
-                imgui.SetColumnWidth(0, 220 * scale)
+                imgui.SetColumnWidth(0, 240 * scale)
                 
                 for i, v in ipairs(ThemeEditor.colorNames) do
                     if imgui.Selectable(v[2], ThemeEditor.selectedIdx == i) then
@@ -1604,10 +1623,10 @@ local newFrame = imgui.OnFrame(
                     imgui.ColorEditFlags.AlphaPreview)
                 
                 imgui.Spacing()
-                imgui.Separator()
                 imgui.Spacing()
                 
-                local btnW = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x * 3) / 4
+                local availWidth = imgui.GetContentRegionAvail().x
+                local btnW = (availWidth - imgui.GetStyle().ItemSpacing.x) / 2
                 
                 local function sa(dest, src, dx, dy, dz, dw)
                     if src and #src == 4 then
@@ -1619,42 +1638,30 @@ local newFrame = imgui.OnFrame(
 
                 if imgui.Button(u8"Сброс", imgui.ImVec2(btnW, 0)) then
                     local cur = themes[1]
-                    sa(ThemeEditor.temp.me, {cur.me.x, cur.me.y, cur.me.z, cur.me.w}, 0.18, 0.35, 0.58, 1.0)
-                    sa(ThemeEditor.temp.them, {cur.them.x, cur.them.y, cur.them.z, cur.them.w}, 0.25, 0.25, 0.25, 1.0)
-                    sa(ThemeEditor.temp.warn, {cur.warn.x, cur.warn.y, cur.warn.z, cur.warn.w}, 0.20, 0.60, 0.90, 1.0)
-                    sa(ThemeEditor.temp.notif_bg, {cur.notif_bg.x, cur.notif_bg.y, cur.notif_bg.z, cur.notif_bg.w}, 0.12, 0.12, 0.12, 0.95)
-                    sa(ThemeEditor.temp.notif_text, {cur.notif_text.x, cur.notif_text.y, cur.notif_text.z, cur.notif_text.w}, 0.9, 0.9, 0.9, 1.0)
-                    sa(ThemeEditor.temp.sys_ok, {cur.sys_ok.x, cur.sys_ok.y, cur.sys_ok.z, cur.sys_ok.w}, 0.20, 0.80, 0.20, 0.80)
-                    sa(ThemeEditor.temp.sys_err, {cur.sys_err.x, cur.sys_err.y, cur.sys_err.z, cur.sys_err.w}, 0.80, 0.20, 0.20, 0.80)
-                    sa(ThemeEditor.temp.sys_info, {cur.sys_info.x, cur.sys_info.y, cur.sys_info.z, cur.sys_info.w}, 0.20, 0.60, 0.90, 0.80)
-                    sa(ThemeEditor.temp.online, nil, 0.2, 0.8, 0.2, 1.0)
-                    sa(ThemeEditor.temp.muted, nil, 0.6, 0.6, 0.6, 1.0)
-                    sa(ThemeEditor.temp.draft, nil, 0.8, 0.4, 0.4, 1.0)
-                    sa(ThemeEditor.temp.call_me, nil, 0.4, 0.7, 1.0, 1.0)
-                    sa(ThemeEditor.temp.call_them, nil, 1.0, 1.0, 1.0, 1.0)
-                    sa(ThemeEditor.temp.call_time, nil, 0.5, 0.5, 0.5, 1.0)
-                    sa(ThemeEditor.temp.checkmark, {cur.me.x, cur.me.y, cur.me.z, cur.me.w}, 0.18, 0.35, 0.58, 1.0)
+                    for _, v in ipairs(ThemeEditor.colorNames) do
+                        local k = v[1]
+                        local cv = cur[k]
+                        if cv then
+                            ThemeEditor.temp[k][0], ThemeEditor.temp[k][1], ThemeEditor.temp[k][2], ThemeEditor.temp[k][3] = cv.x, cv.y, cv.z, cv.w
+                        else
+                            ThemeEditor.temp[k][0], ThemeEditor.temp[k][1], ThemeEditor.temp[k][2], ThemeEditor.temp[k][3] = cur.me.x, cur.me.y, cur.me.z, cur.me.w
+                        end
+                    end
+                    ThemeEditor.temp.online[0], ThemeEditor.temp.online[1], ThemeEditor.temp.online[2], ThemeEditor.temp.online[3] = 0.2, 0.8, 0.2, 1.0
+                    ThemeEditor.temp.muted[0], ThemeEditor.temp.muted[1], ThemeEditor.temp.muted[2], ThemeEditor.temp.muted[3] = 0.6, 0.6, 0.6, 1.0
+                    ThemeEditor.temp.draft[0], ThemeEditor.temp.draft[1], ThemeEditor.temp.draft[2], ThemeEditor.temp.draft[3] = 0.8, 0.4, 0.4, 1.0
+                    ThemeEditor.temp.call_me[0], ThemeEditor.temp.call_me[1], ThemeEditor.temp.call_me[2], ThemeEditor.temp.call_me[3] = 0.4, 0.7, 1.0, 1.0
+                    ThemeEditor.temp.call_them[0], ThemeEditor.temp.call_them[1], ThemeEditor.temp.call_them[2], ThemeEditor.temp.call_them[3] = 1.0, 1.0, 1.0, 1.0
+                    ThemeEditor.temp.call_time[0], ThemeEditor.temp.call_time[1], ThemeEditor.temp.call_time[2], ThemeEditor.temp.call_time[3] = 0.5, 0.5, 0.5, 1.0
                 end
                 
                 imgui.SameLine()
                 if imgui.Button(u8"Сохранить", imgui.ImVec2(btnW, 0)) then
-                    local newT = {
-                        me = {ThemeEditor.temp.me[0], ThemeEditor.temp.me[1], ThemeEditor.temp.me[2], ThemeEditor.temp.me[3]},
-                        them = {ThemeEditor.temp.them[0], ThemeEditor.temp.them[1], ThemeEditor.temp.them[2], ThemeEditor.temp.them[3]},
-                        warn = {ThemeEditor.temp.warn[0], ThemeEditor.temp.warn[1], ThemeEditor.temp.warn[2], ThemeEditor.temp.warn[3]},
-                        notif_bg = {ThemeEditor.temp.notif_bg[0], ThemeEditor.temp.notif_bg[1], ThemeEditor.temp.notif_bg[2], ThemeEditor.temp.notif_bg[3]},
-                        notif_text = {ThemeEditor.temp.notif_text[0], ThemeEditor.temp.notif_text[1], ThemeEditor.temp.notif_text[2], ThemeEditor.temp.notif_text[3]},
-                        sys_ok = {ThemeEditor.temp.sys_ok[0], ThemeEditor.temp.sys_ok[1], ThemeEditor.temp.sys_ok[2], ThemeEditor.temp.sys_ok[3]},
-                        sys_err = {ThemeEditor.temp.sys_err[0], ThemeEditor.temp.sys_err[1], ThemeEditor.temp.sys_err[2], ThemeEditor.temp.sys_err[3]},
-                        sys_info = {ThemeEditor.temp.sys_info[0], ThemeEditor.temp.sys_info[1], ThemeEditor.temp.sys_info[2], ThemeEditor.temp.sys_info[3]},
-                        online = {ThemeEditor.temp.online[0], ThemeEditor.temp.online[1], ThemeEditor.temp.online[2], ThemeEditor.temp.online[3]},
-                        muted = {ThemeEditor.temp.muted[0], ThemeEditor.temp.muted[1], ThemeEditor.temp.muted[2], ThemeEditor.temp.muted[3]},
-                        draft = {ThemeEditor.temp.draft[0], ThemeEditor.temp.draft[1], ThemeEditor.temp.draft[2], ThemeEditor.temp.draft[3]},
-                        call_me = {ThemeEditor.temp.call_me[0], ThemeEditor.temp.call_me[1], ThemeEditor.temp.call_me[2], ThemeEditor.temp.call_me[3]},
-                        call_them = {ThemeEditor.temp.call_them[0], ThemeEditor.temp.call_them[1], ThemeEditor.temp.call_them[2], ThemeEditor.temp.call_them[3]},
-                        call_time = {ThemeEditor.temp.call_time[0], ThemeEditor.temp.call_time[1], ThemeEditor.temp.call_time[2], ThemeEditor.temp.call_time[3]},
-                        checkmark = {ThemeEditor.temp.checkmark[0], ThemeEditor.temp.checkmark[1], ThemeEditor.temp.checkmark[2], ThemeEditor.temp.checkmark[3]}
-                    }
+                    local newT = {}
+                    for _, v in ipairs(ThemeEditor.colorNames) do
+                        local k = v[1]
+                        newT[k] = {ThemeEditor.temp[k][0], ThemeEditor.temp[k][1], ThemeEditor.temp[k][2], ThemeEditor.temp[k][3]}
+                    end
                     
                     globalSettings.customThemes = globalSettings.customThemes or {}
                     if globalSettings.theme > #themes then
@@ -1668,7 +1675,6 @@ local newFrame = imgui.OnFrame(
                     save_all_data()
                 end
                 
-                imgui.SameLine()
                 if imgui.Button(u8"Экспорт", imgui.ImVec2(btnW, 0)) then
                     local exp = {}
                     for k, v in pairs(ThemeEditor.temp) do
@@ -1906,14 +1912,22 @@ local newFrame = imgui.OnFrame(
                     phoneData[myNick] = nil
                     
                     if myNick == actualNick and actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
-                        phoneData[actualNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
-                    else
-                        if actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
-                            myNick = actualNick
-                            if not phoneData[myNick] then
-                                phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
-                            end
-                        else
+						phoneData[actualNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
+						local m_hist = nil
+						for nick, p in pairs(phoneData) do if nick ~= actualNick and p.history["System_News"] then m_hist = p.history["System_News"] break end end
+						phoneData[actualNick].history["System_News"] = m_hist or {}
+						phoneData[actualNick].contacts["System_News"] = "Уведомления"
+					else
+						if actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
+							myNick = actualNick
+							if not phoneData[myNick] then
+								phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
+								local m_hist = nil
+								for nick, p in pairs(phoneData) do if nick ~= myNick and p.history["System_News"] then m_hist = p.history["System_News"] break end end
+								phoneData[myNick].history["System_News"] = m_hist or {}
+								phoneData[myNick].contacts["System_News"] = "Уведомления"
+							end
+						else
                             local local_any = next(phoneData)
                             if local_any then myNick = local_any else myNick = "Default" end
                         end
@@ -2456,10 +2470,15 @@ local newFrame = imgui.OnFrame(
                     if imgui.BeginPopupContextItem("ContactPopup_" .. num) then
                         if num == "System_News" then
                             if imgui.Selectable(u8"Очистить историю") then
-                                profile.history[num] = nil
-                                profile.unread[num] = nil
-                                if profile.muted then profile.muted[num] = nil end
-                                if profile.drafts then profile.drafts[num] = nil end
+                                local nhist = profile.history[num]
+                                if nhist then
+                                    for k in pairs(nhist) do nhist[k] = nil end
+                                end
+                                for _, p in pairs(phoneData) do
+                                    if p.unread then p.unread[num] = nil end
+                                    if p.muted then p.muted[num] = nil end
+                                    if p.drafts then p.drafts[num] = nil end
+                                end
                                 if activeContact == num then
                                     activeContact = nil
                                 end
@@ -2813,11 +2832,18 @@ local newFrame = imgui.OnFrame(
                                 local callData = cCalls[i]
                                 local dateStr = os.date("%d.%m.%Y %H:%M:%S", callData.timestamp)
                                 
+                                local calc_duration = 0
+                                if callData.duration and callData.duration > 0 then
+                                    calc_duration = callData.duration
+                                elseif callData.messages and #callData.messages > 0 then
+                                    calc_duration = callData.messages[#callData.messages].timestamp - callData.messages[1].timestamp
+                                end
+                                
                                 local durationStr = ""
-                                if callData.duration then
-                                    local h = math.floor(callData.duration / 3600)
-                                    local m = math.floor((callData.duration % 3600) / 60)
-                                    local s = callData.duration % 60
+                                if calc_duration > 0 then
+                                    local h = math.floor(calc_duration / 3600)
+                                    local m = math.floor((calc_duration % 3600) / 60)
+                                    local s = calc_duration % 60
                                     if h > 0 then
                                         durationStr = string.format(" (%d ч. %d мин. %d сек.)", h, m, s)
                                     elseif m > 0 then
@@ -3361,6 +3387,10 @@ local newFrame = imgui.OnFrame(
         if UI.viewingImage then
             imgui.SetNextWindowPos(imgui.ImVec2(0, 0), imgui.Cond.Always)
             imgui.SetNextWindowSize(imgui.ImVec2(resX, resY), imgui.Cond.Always)
+            
+            imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 0.0)
+            imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(0, 0))
+            
             imgui.PushStyleColor(imgui.Col.WindowBg, imgui.ImVec4(0, 0, 0, 0.85))
             
             if imgui.Begin("FullscreenImage", nil, imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoSavedSettings) then
@@ -3394,7 +3424,9 @@ local newFrame = imgui.OnFrame(
                 end
             end
             imgui.End()
+            
             imgui.PopStyleColor()
+            imgui.PopStyleVar(2)
         end
         
         imgui.PopStyleVar(4)
