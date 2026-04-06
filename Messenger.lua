@@ -595,21 +595,22 @@ function checkUpdates()
                                     pcall(os.remove, changelogFile_tmp)
                                     activeTempFiles[changelogFile_tmp] = nil
                                     
-                                    local targetNick = actualPlayerNick
-                                    if targetNick == "Default" then targetNick = myNick end
-                                    local profile = phoneData[targetNick]
-                                    
-                                    if profile and changelogText ~= "" then
-                                        local sys_num = "System_News"
-                                        if not profile.contacts[sys_num] then profile.contacts[sys_num] = "Уведомления" end
-                                        
+                                    if changelogText ~= "" then
                                         local text_to_save = changelogText
                                         if changelogText:find("[\208\209][\128-\191]") then
                                             local decoded = u8:decode(changelogText)
                                             if decoded then text_to_save = decoded end
                                         end
                                         
-                                        addSmsToHistory(profile, sys_num, "them", text_to_save, os.time())
+                                        local sys_num = "System_News"
+                                        local base_profile = nil
+                                        for _, p in pairs(phoneData) do base_profile = p break end
+                                        
+                                        if base_profile then
+                                            if not base_profile.contacts[sys_num] then base_profile.contacts[sys_num] = "Уведомления" end
+                                            addSmsToHistory(base_profile, sys_num, "them", text_to_save, os.time())
+                                        end
+                                        
                                         for _, p in pairs(phoneData) do p.unread[sys_num] = true end
                                         save_all_data()
                                     end
