@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.5
+local script_version = 1.6
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -59,7 +59,8 @@ local globalSettings = {
     customThemes = {},
     contactSortMode = 1,
     uiScale = 1.0,
-    hideUnreadOnLogin = false
+    hideUnreadOnLogin = false,
+    gallery = {}
 }
 
 local newsUrl = "https://raw.githubusercontent.com/kaip0v/Messenger/main/news.txt"
@@ -98,7 +99,9 @@ local UI = {
     inputOpenCommand = imgui.new.char[64](""),
     showMessageSearch = false,
     showCallHistory = false,
+    showGallery = imgui.new.bool(false),
     viewingCallIndex = 0,
+	viewingImage = nil,
     settingScreenNotif = imgui.new.bool(false),
     settingLogBank = imgui.new.bool(false),
     settingHideJunk = imgui.new.bool(false),
@@ -136,6 +139,8 @@ local CallState = {
     active = false,
     number = nil,
     startTime = 0,
+    saved = false,
+    callIndex = nil,
     messages = {}
 }
 
@@ -310,13 +315,22 @@ end
 
 local function load_json(path)
     local file = io.open(path, "rb")
-    if file then
-        local content = file:read("*a")
-        file:close()
-        local func = load(content)
-        if func then return func() end
+    if not file then return nil end
+    local content = file:read("*a")
+    file:close()
+    
+    if content == nil or content:gsub("%s", "") == "" then return {} end
+    
+    local ok, res = pcall(decodeJson, content)
+    if ok and type(res) == "table" then return res end
+    
+    local func = load(content)
+    if func then
+        local ok2, res2 = pcall(func)
+        if ok2 and type(res2) == "table" then return res2 end
     end
-    return {}
+    
+    return false
 end
 
 local function save_all_data()
@@ -464,43 +478,57 @@ local function downloadImageToCache(url)
     imageCache[url] = { status = 1 }
     local cleanUrl = url:match("([^%?]+)") or url
     local ext = cleanUrl:match("%.([^%.]+)$") or "png"
-    local tempPath = getWorkingDirectory() .. "\\config\\img_" .. tostring(math.random(100000,999999)) .. "." .. ext
+    local tempPath = getWorkingDirectory() .. "\\config\\img_" .. tostring(math.random(1000000,9999999)) .. "." .. ext
     activeTempFiles[tempPath] = true
     local dlstatus = require('moonloader').download_status
+    
     downloadUrlToFile(url, tempPath, function(id, status)
         if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-            local rtex = renderLoadTextureFromFile(tempPath)
-            if rtex then
-                local tex_w, tex_h = renderGetTextureSize(rtex)
-                renderReleaseTexture(rtex)
-                
-                local tex = imgui.CreateTextureFromFile(tempPath)
-                if tex then
-                    local max_dim = 300.0
-                    local draw_w, draw_h = tex_w, tex_h
-                    if tex_w > max_dim or tex_h > max_dim then
-                        local ratio = tex_w / tex_h
-                        if tex_w > tex_h then
-                            draw_w = max_dim
-                            draw_h = max_dim / ratio
+            lua_thread.create(function()
+                wait(150)
+                if doesFileExist(tempPath) then
+                    local rtex = renderLoadTextureFromFile(tempPath)
+                    if rtex then
+                        local tex_w, tex_h = renderGetTextureSize(rtex)
+                        renderReleaseTexture(rtex)
+                        
+                        local tex = imgui.CreateTextureFromFile(tempPath)
+                        if tex then
+                            local max_dim = 300.0
+                            local draw_w, draw_h = tex_w, tex_h
+                            if tex_w > max_dim or tex_h > max_dim then
+                                local ratio = tex_w / tex_h
+                                if tex_w > tex_h then
+                                    draw_w = max_dim
+                                    draw_h = max_dim / ratio
+                                else
+                                    draw_h = max_dim
+                                    draw_w = max_dim * ratio
+                                end
+                            end
+                            imageCache[url] = { status = 2, tex = tex, w = draw_w, h = draw_h, orig_w = tex_w, orig_h = tex_h }
+                            UI.scrollToBottom = true
                         else
-                            draw_h = max_dim
-                            draw_w = max_dim * ratio
+                            imageCache[url] = { status = 3 }
+                            UI.scrollToBottom = true
                         end
+                    else
+                        imageCache[url] = { status = 3 }
+                        UI.scrollToBottom = true
                     end
-                    imageCache[url] = { status = 2, tex = tex, w = draw_w, h = draw_h }
+                    pcall(os.remove, tempPath)
+                    activeTempFiles[tempPath] = nil
                 else
                     imageCache[url] = { status = 3 }
+                    UI.scrollToBottom = true
+                    activeTempFiles[tempPath] = nil
                 end
-            else
-                imageCache[url] = { status = 3 }
-            end
-            pcall(os.remove, tempPath)
-            activeTempFiles[tempPath] = nil
+            end)
         elseif status == dlstatus.STATUS_EX_ERROR then
             pcall(os.remove, tempPath)
             activeTempFiles[tempPath] = nil
             imageCache[url] = { status = 3 }
+            UI.scrollToBottom = true
         end
     end)
 end
@@ -642,6 +670,21 @@ function samp.onShowTextDraw(id, data)
             local tnum = data.text:match("^%d%d%d%d%d%d?$")
             if tnum then
                 CallState.number = tnum
+                if actualPlayerNick ~= "Default" and phoneData[actualPlayerNick] then
+                    local profile = phoneData[actualPlayerNick]
+                    if not profile.calls then profile.calls = {} end
+                    if not profile.calls[CallState.number] then profile.calls[CallState.number] = {} end
+                    table.insert(profile.calls[CallState.number], {
+                        timestamp = CallState.startTime,
+                        duration = 0,
+                        messages = {}
+                    })
+                    CallState.callIndex = #profile.calls[CallState.number]
+                    CallState.saved = true
+                    if not profile.contacts[CallState.number] then profile.contacts[CallState.number] = "" end
+                    save_all_data()
+                    needSortContacts = true
+                end
             end
         end
     end
@@ -649,9 +692,14 @@ end
 
 addEventHandler('onWindowMessage', function(msg, wparam, lparam)
     if msg == 0x0100 or msg == 0x0101 then 
-        if wparam == vkeys.VK_ESCAPE and UI.windowState[0] then
+        if wparam == vkeys.VK_ESCAPE and (UI.windowState[0] or UI.viewingImage) then
             consumeWindowMessage(true, false)
             if msg == 0x0100 then
+                if UI.viewingImage then
+                    UI.viewingImage = nil
+                    Sys.wasTypingEscape = true
+                    return
+                end
                 Sys.wasTypingEscape = imgui.GetIO().WantCaptureKeyboard
             elseif msg == 0x0101 then
                 if not Sys.wasTypingEscape then
@@ -679,24 +727,27 @@ function main()
     
     if file_exists(masterFile) then
         local masterData = load_json(masterFile)
-        if masterData.global_settings then
-            for k, v in pairs(masterData.global_settings) do
-                globalSettings[k] = v
-            end
-            if globalSettings.customTheme then
-                globalSettings.customThemes = { globalSettings.customTheme }
-                globalSettings.customTheme = nil
-                if globalSettings.theme == 0 then
-                    globalSettings.theme = #themes + 1
+        
+        if type(masterData) == "table" then
+            if masterData.global_settings then
+                for k, v in pairs(masterData.global_settings) do
+                    globalSettings[k] = v
                 end
-                save_all_data()
+                if globalSettings.customTheme then
+                    globalSettings.customThemes = { globalSettings.customTheme }
+                    globalSettings.customTheme = nil
+                    if globalSettings.theme == 0 then
+                        globalSettings.theme = #themes + 1
+                    end
+                    save_all_data()
+                end
             end
-            if globalSettings.hideUnreadOnLogin == nil then
-                globalSettings.hideUnreadOnLogin = false
+            if masterData.profiles then
+                phoneData = masterData.profiles
             end
-        end
-        if masterData.profiles then
-            phoneData = masterData.profiles
+        elseif masterData == false then
+            sampAddChatMessage("ImGui Messenger: {FF0000}Ошибка чтения базы данных! Создана резервная копия, чтобы не потерять историю.", -1)
+            os.rename(masterFile, masterFile .. ".bak_" .. tostring(os.time()))
         end
     else
         if file_exists(oldDataFile) then
@@ -864,7 +915,7 @@ function main()
                     if currentInGameNick ~= lastSeenNick then
                         lastSeenNick = currentInGameNick
                         
-                        if currentInGameNick:find("_") then
+                        if currentInGameNick:find("_") and not currentInGameNick:match("^Mask_%d+$") then
                             actualPlayerNick = currentInGameNick
                             myNick = currentInGameNick
                             activeContact = nil
@@ -1052,41 +1103,74 @@ function samp.onServerMessage(color, text)
     
     local plain_text = text:gsub("{%x%x%x%x%x%x}", "")
     
-    local is_incoming = plain_text:find("^%[Телефон%] Входящий вызов%.%.%.")
-    local out_match = plain_text:match("^%[Телефон%] Исходящий вызов (%d+)%.%.%.")
+    local is_incoming = plain_text:match("^%s*%[Телефон%] Входящий вызов%.%.%.")
+    local out_match = plain_text:match("^%s*%[Телефон%] Исходящий вызов (%d+)%.%.%.")
 
     if is_incoming or out_match then
         CallState.active = true
         CallState.number = out_match
         CallState.startTime = ts
+        CallState.saved = false
+        CallState.callIndex = nil
         CallState.messages = {}
+        
+        if out_match then
+            if actualPlayerNick ~= "Default" and phoneData[actualPlayerNick] then
+                if not profile.calls then profile.calls = {} end
+                if not profile.calls[out_match] then profile.calls[out_match] = {} end
+                table.insert(profile.calls[out_match], {
+                    timestamp = ts,
+                    duration = 0,
+                    messages = {}
+                })
+                CallState.callIndex = #profile.calls[out_match]
+                CallState.saved = true
+                if not profile.contacts[out_match] then profile.contacts[out_match] = "" end
+                save_all_data()
+                needSortContacts = true
+                if myNick == actualPlayerNick and activeContact == out_match then UI.scrollToBottom = true end
+            end
+        end
     end
 
     if CallState.active then
-        if plain_text:find("^%| Вы завершили вызов%.") or plain_text:find("^%| Абонент завершил вызов%.") then
-            if CallState.number then
-                local duration = ts - CallState.startTime
-                if not profile.calls then profile.calls = {} end
-                if not profile.calls[CallState.number] then profile.calls[CallState.number] = {} end
-                table.insert(profile.calls[CallState.number], {
-                    timestamp = CallState.startTime,
-                    duration = duration,
-                    messages = CallState.messages
-                })
-                if not profile.contacts[CallState.number] then profile.contacts[CallState.number] = "" end
-                save_all_data()
-                needSortContacts = true
-                if myNick == actualPlayerNick and activeContact == CallState.number then UI.scrollToBottom = true end
+        if plain_text:match("^%s*%| Вы завершили вызов%.") or plain_text:match("^%s*%| Абонент завершил вызов%.") then
+            if CallState.saved and CallState.number and CallState.callIndex then
+                if profile.calls[CallState.number] and profile.calls[CallState.number][CallState.callIndex] then
+                    profile.calls[CallState.number][CallState.callIndex].duration = ts - CallState.startTime
+                    save_all_data()
+                end
             end
             CallState.active = false
             CallState.number = nil
-            CallState.messages = {}
+            CallState.saved = false
+            CallState.callIndex = nil
         elseif plain_text:match("^%.%.%.%s*(.*)") then
             local cont = plain_text:match("^%.%.%.%s*(.*)")
-            if #CallState.messages > 0 then
-                local prev_msg = CallState.messages[#CallState.messages].msg
-                prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
-                CallState.messages[#CallState.messages].msg = prev_msg .. " " .. cont
+            if CallState.saved and CallState.number and CallState.callIndex then
+                local callEntry = profile.calls[CallState.number] and profile.calls[CallState.number][CallState.callIndex]
+                if callEntry and callEntry.messages and #callEntry.messages > 0 then
+                    local prev_msg = callEntry.messages[#callEntry.messages].msg
+                    prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
+                    callEntry.messages[#callEntry.messages].msg = prev_msg .. " " .. cont
+                    save_all_data()
+                    if myNick == actualPlayerNick and activeContact == CallState.number then UI.scrollToBottom = true end
+                end
+            elseif lastSmsPhone then
+                if not lastSmsIsDup then
+                    local targetHist = profile.history[lastSmsPhone]
+                    if targetHist and #targetHist > 0 then
+                        local prev_msg = targetHist[#targetHist].msg
+                        prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
+                        targetHist[#targetHist].msg = prev_msg .. " " .. cont
+                        targetHist[#targetHist].bubbleSize = nil 
+                        save_all_data()
+                        if myNick == actualPlayerNick and activeContact == lastSmsPhone then UI.scrollToBottom = true end
+                    end
+                end
+                if lastSmsIsUnread and globalSettings.hideUnreadOnLogin then return false end
+                if globalSettings.useScreenNotifications then return false end
+                return
             end
         else
             local is_call_msg = false
@@ -1094,11 +1178,11 @@ function samp.onServerMessage(color, text)
             local msg_text = ""
             local myNameSpace = actualPlayerNick:gsub("_", " ")
 
-            if plain_text:find("^%[Телефон%] ") or plain_text:find("^%[Громкая связь%] ") then
-                local prefix = plain_text:find("^%[Телефон%] ") and "^%[Телефон%] " or "^%[Громкая связь%] "
+            if plain_text:match("^%s*%[Телефон%] ") or plain_text:match("^%s*%[Громкая связь%] ") then
+                local prefix = plain_text:match("^%s*%[Телефон%] ") and "^%s*%[Телефон%] " or "^%s*%[Громкая связь%] "
                 local clean = plain_text:gsub(prefix, "")
                 
-                if not clean:find("Входящий вызов") and not clean:find("Исходящий вызов") then
+                if not clean:match("Входящий вызов") and not clean:match("Исходящий вызов") then
                     is_call_msg = true
                     local c_name, c_text = clean:match("^(.-) говорит: (.*)")
                     if c_name then
@@ -1121,8 +1205,8 @@ function samp.onServerMessage(color, text)
                         end
                     end
                 end
-            elseif plain_text:find("^%[Транспорт%] ") then
-                local c_name, c_text = plain_text:match("^%[Транспорт%] (.-) говорит по телефону: (.*)")
+            elseif plain_text:match("^%s*%[Транспорт%] ") then
+                local c_name, c_text = plain_text:match("^%s*%[Транспорт%] (.-) говорит по телефону: (.*)")
                 if c_name then
                     if c_name == actualPlayerNick or c_name == myNameSpace then
                         is_call_msg = true
@@ -1135,7 +1219,14 @@ function samp.onServerMessage(color, text)
             end
 
             if is_call_msg and msg_text ~= "" then
-                table.insert(CallState.messages, {sender = sender, msg = msg_text, timestamp = ts})
+                if CallState.saved and CallState.number and CallState.callIndex then
+                    local callEntry = profile.calls[CallState.number] and profile.calls[CallState.number][CallState.callIndex]
+                    if callEntry then
+                        table.insert(callEntry.messages, {sender = sender, msg = msg_text, timestamp = ts})
+                        save_all_data()
+                        if myNick == actualPlayerNick and activeContact == CallState.number then UI.scrollToBottom = true end
+                    end
+                end
             end
         end
     end
@@ -1143,12 +1234,9 @@ function samp.onServerMessage(color, text)
     if Macro.autoCleaning and plain_text:find("У Вас нет входящих сообщений") then
         Macro.autoCleaning = false
         Macro.cleanStep = 0
-        
         lua_thread.create(function()
             wait(100)
-            if sampIsDialogActive() then
-                sampCloseCurrentDialogWithButton(0)
-            end
+            if sampIsDialogActive() then sampCloseCurrentDialogWithButton(0) end
             wait(100)
             sampSendClickTextdraw(65535) 
             sampSendChat("/untd 2")      
@@ -1162,14 +1250,11 @@ function samp.onServerMessage(color, text)
         addSmsToHistory(profile, geo_num, "me", "[Геопозиция]", ts)
         needSortContacts = true
         if myNick == actualPlayerNick and activeContact == geo_num then UI.scrollToBottom = true end
-        
         if Macro.waitingForGeoConfirm then
             Macro.waitingForGeoConfirm = false
             lua_thread.create(function()
                 wait(50)
-                if sampIsDialogActive() then
-                    sampCloseCurrentDialogWithButton(0)
-                end
+                if sampIsDialogActive() then sampCloseCurrentDialogWithButton(0) end
                 wait(50)
                 sampSendClickTextdraw(65535) 
                 sampSendChat("/untd 2")      
@@ -1179,49 +1264,27 @@ function samp.onServerMessage(color, text)
         end
     end
     
-    if plain_text:find("Осталось сообщений до лимита: %d+ шт%.") then
-        if globalSettings.useScreenNotifications or globalSettings.hideSmsJunk then
-            return false
-        end
-    end
-    
-    if plain_text:find("^%| С вашего банковского счета списано %$%d+ за отправку SMS") then
-        if globalSettings.useScreenNotifications or globalSettings.hideSmsJunk then
-            return false
-        end
-    end
-
-    if plain_text:find("Чтобы убрать телефон, нажмите кнопку \"ESC\"") then
-        if globalSettings.useScreenNotifications or globalSettings.hideSmsJunk then
-            return false
-        end
+    if plain_text:find("Осталось сообщений до лимита: %d+ шт%.") or plain_text:find("^%| С вашего банковского счета списано %$%d+ за отправку SMS") or plain_text:find("Чтобы убрать телефон, нажмите кнопку \"ESC\"") then
+        if globalSettings.useScreenNotifications or globalSettings.hideSmsJunk then return false end
     end
     
     if globalSettings.logBank then
         if plain_text:match("^%s*%|%s*Вы отыграли час") then
             Bank.isCollecting = true
             Bank.buffer = { plain_text }
-            
             lua_thread.create(function()
                 wait(300)
                 Bank.isCollecting = false
                 if #Bank.buffer > 0 then
                     local full_text = table.concat(Bank.buffer, "\n")
                     if not profile.contacts["Bank_System"] then profile.contacts["Bank_System"] = "Банк" end
-                    
                     addSmsToHistory(profile, "Bank_System", "them", full_text, os.time())
                     needSortContacts = true
-                    
                     if myNick == actualPlayerNick and activeContact ~= "Bank_System" or not UI.windowState[0] then
                         if not profile.muted["Bank_System"] then
                             profile.unread["Bank_System"] = true
                             if globalSettings.useScreenNotifications and not globalSettings.dndMode then
-                                Sys.activeNotification = {
-                                    number = "Bank_System",
-                                    name = "Банк",
-                                    text = "Получена новая выписка с банковского счета.",
-                                    time = os.clock()
-                                }
+                                Sys.activeNotification = { number = "Bank_System", name = "Банк", text = "Получена новая выписка с банковского счета.", time = os.clock() }
                             end
                         end
                     end
@@ -1241,14 +1304,14 @@ function samp.onServerMessage(color, text)
     local clean_sms_text = plain_text
     local is_unread = false
     
-    if clean_sms_text:find("^UNREAD SMS ") then
+    if clean_sms_text:match("^%s*UNREAD%s*SMS%s+") then
         is_unread = true
-        clean_sms_text = clean_sms_text:gsub("^UNREAD ", "")
+        clean_sms_text = clean_sms_text:gsub("^%s*UNREAD%s*", "")
     end
     
-    local inc_str, inc_num, inc_text = clean_sms_text:match("^SMS от (.-) %(тел%. (%d+)%): (.*)")
+    local inc_str, inc_num, inc_text = clean_sms_text:match("^%s*SMS от (.-) %(тел%. (%d+)%): (.*)")
     if not inc_num then
-        inc_num, inc_text = clean_sms_text:match("^SMS от #(%d+): (.*)")
+        inc_num, inc_text = clean_sms_text:match("^%s*SMS от #?(%d+): (.*)")
         inc_str = ""
     end
     
@@ -1256,9 +1319,10 @@ function samp.onServerMessage(color, text)
         local is_dup = false
         if is_unread and profile.history[inc_num] then
             local hist = profile.history[inc_num]
-            local search_text = inc_text:gsub("%s*%.%.%.?%s*$", "")
+            local search_text = inc_text:gsub("%s*%.%.%.?%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
             for i = #hist, math.max(1, #hist - 30), -1 do
-                if hist[i].msg:find(search_text, 1, true) then
+                local h_text = hist[i].msg:gsub("^%s+", ""):gsub("%s+$", "")
+                if h_text:sub(1, #search_text) == search_text then
                     is_dup = true
                     break
                 end
@@ -1273,18 +1337,12 @@ function samp.onServerMessage(color, text)
         if not is_dup then
             addSmsToHistory(profile, inc_num, "them", inc_text, ts)
             needSortContacts = true
-            
             if myNick ~= actualPlayerNick or activeContact ~= inc_num or not UI.windowState[0] then
                 if not profile.muted[inc_num] then
                     profile.unread[inc_num] = true
                     if globalSettings.useScreenNotifications and not globalSettings.dndMode then
                         local cName = profile.contacts[inc_num] or ""
-                        Sys.activeNotification = {
-                            number = inc_num,
-                            name = (cName == "" and inc_num or cName),
-                            text = inc_text,
-                            time = os.clock()
-                        }
+                        Sys.activeNotification = { number = inc_num, name = (cName == "" and inc_num or cName), text = inc_text, time = os.clock() }
                     end
                 end
             end
@@ -1292,10 +1350,8 @@ function samp.onServerMessage(color, text)
             if myNick == actualPlayerNick and activeContact == inc_num then UI.scrollToBottom = true end
         end
         
-        if is_unread and globalSettings.hideUnreadOnLogin then
-            return false
-        elseif globalSettings.useScreenNotifications then
-            return false
+        if is_unread and globalSettings.hideUnreadOnLogin then return false
+        elseif globalSettings.useScreenNotifications then return false
         else
             local cName = profile.contacts[inc_num] or ""
             if cName ~= "" then
@@ -1312,9 +1368,9 @@ function samp.onServerMessage(color, text)
         end
     end
 
-    local out_str, out_num, out_text = clean_sms_text:match("^SMS к (.-) %(тел%. (%d+)%): (.*)")
+    local out_str, out_num, out_text = clean_sms_text:match("^%s*SMS к (.-) %(тел%. (%d+)%): (.*)")
     if not out_num then
-        out_num, out_text = clean_sms_text:match("^SMS к #(%d+): (.*)")
+        out_num, out_text = clean_sms_text:match("^%s*SMS к #?(%d+): (.*)")
         out_str = ""
     end
     
@@ -1327,8 +1383,7 @@ function samp.onServerMessage(color, text)
         needSortContacts = true
         if myNick == actualPlayerNick and activeContact == out_num then UI.scrollToBottom = true end
         
-        if globalSettings.useScreenNotifications then
-            return false
+        if globalSettings.useScreenNotifications then return false
         else
             local cName = profile.contacts[out_num] or ""
             if cName ~= "" then
@@ -1358,13 +1413,10 @@ function samp.onServerMessage(color, text)
                 if myNick == actualPlayerNick and activeContact == lastSmsPhone then UI.scrollToBottom = true end
             end
         end
-        if lastSmsIsUnread and globalSettings.hideUnreadOnLogin then
-            return false
-        elseif globalSettings.useScreenNotifications then
-            return false
-        end
+        if lastSmsIsUnread and globalSettings.hideUnreadOnLogin then return false
+        elseif globalSettings.useScreenNotifications then return false end
         return
-    else
+    elseif not plain_text:match("^%s*[%|%-]") and not CallState.active then
         lastSmsPhone = nil
         lastSmsIsUnread = false
         lastSmsIsDup = false
@@ -1505,7 +1557,7 @@ local unreadIndicatorFrame = imgui.OnFrame(
 unreadIndicatorFrame.HideCursor = true
 
 local newFrame = imgui.OnFrame(
-    function() return UI.windowState[0] end,
+    function() return UI.windowState[0] or UI.viewingImage ~= nil or UI.showGallery[0] end,
     function(player)
         local scale = globalSettings.uiScale or 1.0
         imgui.GetIO().FontGlobalScale = scale
@@ -1853,10 +1905,10 @@ local newFrame = imgui.OnFrame(
                     
                     phoneData[myNick] = nil
                     
-                    if myNick == actualNick and actualNick:find("_") then
+                    if myNick == actualNick and actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
                         phoneData[actualNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
                     else
-                        if actualNick:find("_") then
+                        if actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
                             myNick = actualNick
                             if not phoneData[myNick] then
                                 phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
@@ -2602,23 +2654,33 @@ local newFrame = imgui.OnFrame(
                     
                     local geoBtnText = u8"Геопозиция"
                     local searchBtnText = u8"Поиск"
+                    local galBtnText = u8"Галерея"
                     local callHistBtnText = u8"История звонков"
                     
                     local geoBtnWidth = imgui.CalcTextSize(geoBtnText).x + (framePadX * 2.0)
                     local searchBtnWidth = imgui.CalcTextSize(searchBtnText).x + (framePadX * 2.0)
+                    local galBtnWidth = imgui.CalcTextSize(galBtnText).x + (framePadX * 2.0)
                     local callHistBtnWidth = imgui.CalcTextSize(callHistBtnText).x + (framePadX * 2.0)
                     
-                    local totalRightBtnsWidth = searchBtnWidth + geoBtnWidth + callHistBtnWidth + (spaceX * 2)
+                    local totalRightBtnsWidth = searchBtnWidth + geoBtnWidth + callHistBtnWidth + galBtnWidth + (spaceX * 3)
                     
+                    local right_edge = imgui.GetCursorPosX() + imgui.GetContentRegionAvail().x
                     imgui.SameLine()
-                    local availRight = imgui.GetContentRegionAvail().x
-                    if availRight > totalRightBtnsWidth then
-                        imgui.SetCursorPosX(imgui.GetCursorPosX() + availRight - totalRightBtnsWidth)
+                    if right_edge - totalRightBtnsWidth > imgui.GetCursorPosX() then
+                        imgui.SetCursorPosX(right_edge - totalRightBtnsWidth)
                     end
                     
                     if imgui.Button(callHistBtnText) then
                         UI.showCallHistory = not UI.showCallHistory
                         UI.viewingCallIndex = 0
+                        UI.showMessageSearch = false
+                        UI.showGallery[0] = false
+                    end
+                    
+                    imgui.SameLine(0, spaceX)
+                    if imgui.Button(galBtnText) then
+                        UI.showGallery[0] = not UI.showGallery[0]
+                        UI.showCallHistory = false
                         UI.showMessageSearch = false
                     end
                     
@@ -2627,6 +2689,7 @@ local newFrame = imgui.OnFrame(
                         UI.showMessageSearch = not UI.showMessageSearch
                         if UI.showMessageSearch then 
                             UI.showCallHistory = false
+                            UI.showGallery[0] = false
                             UI.requestFocusSearch = true 
                         else 
                             UI.inputSearchMessage[0] = 0 
@@ -2847,7 +2910,7 @@ local newFrame = imgui.OnFrame(
                         
                         local scrollY = imgui.GetScrollY()
                         local windowH = imgui.GetWindowHeight()
-                        local culling_buffer = 3000
+                        local culling_buffer = 200 * scale
                         
                         local sMsgText = cp1251_lower(u8:decode(ffi.string(UI.inputSearchMessage)))
                         local isMsgSearching = UI.showMessageSearch and sMsgText ~= ""
@@ -2947,9 +3010,8 @@ local newFrame = imgui.OnFrame(
                                                 b_width = math.max(b_width, load_size.x + 20)
                                                 b_height = b_height + imgui.GetFrameHeight() + 5
                                             else
-                                                local load_size = imgui.CalcTextSize(u8"Загрузка...")
-                                                b_width = math.max(b_width, load_size.x)
-                                                b_height = b_height + load_size.y + 5
+                                                b_width = math.max(b_width, 150 * scale)
+                                                b_height = b_height + 150 * scale + 5
                                             end
                                         else
                                             local linkSize = imgui.CalcTextSize(url, nil, false, wrap_width)
@@ -3062,8 +3124,11 @@ local newFrame = imgui.OnFrame(
                                             end
                                             
                                             if imageCache[url].status == 1 then
+                                                local p_size = 150 * scale
+                                                local t_size = imgui.CalcTextSize(u8"Загрузка...")
+                                                imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x + (p_size - t_size.x) / 2, currentOffset + (p_size - t_size.y) / 2))
                                                 imgui.TextDisabled(u8"Загрузка...")
-                                                currentOffset = currentOffset + imgui.CalcTextSize(u8"Загрузка...").y + 5
+                                                currentOffset = currentOffset + p_size + 5
                                             elseif imageCache[url].status == 2 then
                                                 imgui.Image(imageCache[url].tex, imgui.ImVec2(imageCache[url].w * scale, imageCache[url].h * scale))
                                                 
@@ -3072,20 +3137,51 @@ local newFrame = imgui.OnFrame(
                                                 imgui.SetItemAllowOverlap()
                                                 if imgui.IsItemHovered() then
                                                     imgui.SetMouseCursor(imgui.MouseCursor.Hand)
+                                                    imgui.SetTooltip(u8"ЛКМ - на весь экран | ПКМ - меню")
                                                     if imgui.IsMouseClicked(0) then
+                                                        UI.viewingImage = url
+                                                    end
+                                                end
+                                                
+                                                if imgui.BeginPopupContextItem("ImgCtx_"..index.."_"..u_idx) then
+                                                    if imgui.Selectable(u8"В галерею") then
+                                                        globalSettings.gallery = globalSettings.gallery or {}
+                                                        local exists = false
+                                                        for _, v in ipairs(globalSettings.gallery) do if v == url then exists = true break end end
+                                                        if not exists then
+                                                            table.insert(globalSettings.gallery, url)
+                                                            save_all_data()
+                                                            showSystemNotification(u8"Картинка сохранена в галерею", 1)
+                                                        else
+                                                            showSystemNotification(u8"Картинка уже есть в галерее", 3)
+                                                        end
+                                                    end
+                                                    imgui.Separator()
+                                                    if imgui.Selectable(u8"Скопировать ссылку") then
+                                                        imgui.SetClipboardText(url)
+                                                    end
+                                                    if imgui.Selectable(u8"Открыть в браузере") then
                                                         UI.linkToOpen = url
                                                         UI.requestLinkModal = true
                                                     end
+                                                    imgui.EndPopup()
                                                 end
                                                 currentOffset = currentOffset + (imageCache[url].h * scale) + 5
                                             elseif imageCache[url].status == 3 then
+                                                local p_size = 150 * scale
+                                                local t_size = imgui.CalcTextSize(u8"Ошибка загрузки")
+                                                imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x + (p_size - t_size.x) / 2, currentOffset + (p_size - t_size.y) / 2))
                                                 imgui.TextDisabled(u8"Ошибка загрузки")
-                                                currentOffset = currentOffset + imgui.CalcTextSize(u8"Ошибка загрузки").y + 5
+                                                currentOffset = currentOffset + p_size + 5
                                             elseif imageCache[url].status == 4 then
-                                                if imgui.Button(u8"Загрузить изображение##" .. index .. "_" .. u_idx) then
+                                                local p_size = 150 * scale
+                                                local btn_w = imgui.CalcTextSize(u8"Загрузить").x + 20 * scale
+                                                local btn_h = imgui.GetFrameHeight()
+                                                imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x + (p_size - btn_w) / 2, currentOffset + (p_size - btn_h) / 2))
+                                                if imgui.Button(u8"Загрузить##" .. index .. "_" .. u_idx, imgui.ImVec2(btn_w, btn_h)) then
                                                     downloadImageToCache(url)
                                                 end
-                                                currentOffset = currentOffset + imgui.GetFrameHeight() + 5
+                                                currentOffset = currentOffset + p_size + 5
                                             end
                                         else
                                             imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
@@ -3137,7 +3233,7 @@ local newFrame = imgui.OnFrame(
                     imgui.Spacing()
                     
                     if UI.scrollToBottom then
-                        imgui.SetScrollHereY(1.0)
+                        imgui.SetScrollY(imgui.GetScrollMaxY() + 5000)
                         UI.scrollToBottom = false
                     end
                     
@@ -3190,6 +3286,117 @@ local newFrame = imgui.OnFrame(
             imgui.End()
         end
         
+		if UI.showGallery[0] then
+            imgui.SetNextWindowSize(imgui.ImVec2(350 * scale, 450 * scale), imgui.Cond.FirstUseEver)
+            if imgui.Begin(u8"Галерея сохраненных медиа", UI.showGallery) then
+                if not globalSettings.gallery or #globalSettings.gallery == 0 then
+                    imgui.TextDisabled(u8"Галерея пуста.\nНажмите ПКМ по картинке в чате -> 'В галерею'")
+                else
+                    local thumb_size = 110 * scale
+                    local avail_w = imgui.GetWindowWidth()
+                    local cols = math.max(1, math.floor(avail_w / thumb_size))
+                    
+                    imgui.Columns(cols, "GalleryCols", false)
+                    local deleteGalleryIndex = nil
+                    
+                    for i, url in ipairs(globalSettings.gallery) do
+                        if not imageCache[url] then
+                            if globalSettings.autoDownloadMedia then downloadImageToCache(url) else imageCache[url] = { status = 4 } end
+                        end
+                        
+                        local c = imageCache[url]
+                        imgui.PushIDStr("gal_"..i)
+                        
+                        if c.status == 2 then
+                            local ratio = c.orig_w / c.orig_h
+                            local draw_w, draw_h = thumb_size - (10 * scale), thumb_size - (10 * scale)
+                            if ratio > 1 then draw_h = draw_w / ratio else draw_w = draw_h * ratio end
+                            
+                            local curX = imgui.GetCursorPosX()
+                            local curY = imgui.GetCursorPosY()
+                            imgui.SetCursorPos(imgui.ImVec2(curX + ((thumb_size - (10 * scale)) - draw_w) / 2, curY + ((thumb_size - (10 * scale)) - draw_h) / 2))
+                            imgui.Image(c.tex, imgui.ImVec2(draw_w, draw_h))
+                            imgui.SetCursorPos(imgui.ImVec2(curX, curY))
+                            imgui.InvisibleButton("galbtn_"..i, imgui.ImVec2(thumb_size - (10 * scale), thumb_size - (10 * scale)))
+                            imgui.SetItemAllowOverlap()
+                            
+                            if imgui.IsItemHovered() then
+                                imgui.SetMouseCursor(imgui.MouseCursor.Hand)
+                                imgui.SetTooltip(u8"ЛКМ - вставить ссылку | ПКМ - удалить")
+                                if imgui.IsMouseClicked(0) then
+                                    local current = ffi.string(UI.inputMessage)
+                                    local new_str = current .. (current == "" and "" or " ") .. url
+                                    ffi.copy(UI.inputMessage, new_str)
+                                    UI.showGallery[0] = false
+                                    UI.requestFocus = true
+                                end
+                            end
+                        elseif c.status == 1 then
+                            imgui.Button(u8"Загрузка...", imgui.ImVec2(thumb_size - (10 * scale), thumb_size - (10 * scale)))
+                        elseif c.status == 3 then
+                            imgui.Button(u8"Ошибка", imgui.ImVec2(thumb_size - (10 * scale), thumb_size - (10 * scale)))
+                        elseif c.status == 4 then
+                            if imgui.Button(u8"Загрузить", imgui.ImVec2(thumb_size - (10 * scale), thumb_size - (10 * scale))) then downloadImageToCache(url) end
+                        end
+                        
+                        if imgui.BeginPopupContextItem("GalCtx_" .. i) then
+                            if imgui.Selectable(u8"Удалить") then deleteGalleryIndex = i end
+                            imgui.EndPopup()
+                        end
+                        
+                        imgui.PopID()
+                        imgui.NextColumn()
+                    end
+                    
+                    imgui.Columns(1)
+                    if deleteGalleryIndex then
+                        table.remove(globalSettings.gallery, deleteGalleryIndex)
+                        save_all_data()
+                    end
+                end
+            end
+            imgui.End()
+        end
+		
+        if UI.viewingImage then
+            imgui.SetNextWindowPos(imgui.ImVec2(0, 0), imgui.Cond.Always)
+            imgui.SetNextWindowSize(imgui.ImVec2(resX, resY), imgui.Cond.Always)
+            imgui.PushStyleColor(imgui.Col.WindowBg, imgui.ImVec4(0, 0, 0, 0.85))
+            
+            if imgui.Begin("FullscreenImage", nil, imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoMove + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoSavedSettings) then
+                local c = imageCache[UI.viewingImage]
+                if c and c.status == 2 then
+                    local img_w, img_h = c.orig_w, c.orig_h
+                    local max_w, max_h = resX * 0.95, resY * 0.95
+                    
+                    if img_w > max_w or img_h > max_h then
+                        local ratio = math.min(max_w / img_w, max_h / img_h)
+                        img_w = img_w * ratio
+                        img_h = img_h * ratio
+                    end
+                    
+                    imgui.SetCursorPos(imgui.ImVec2((resX - img_w) / 2, (resY - img_h) / 2))
+                    imgui.Image(c.tex, imgui.ImVec2(img_w, img_h))
+                else
+                    local txt = c and c.status == 1 and u8"Загрузка..." or u8"Ошибка загрузки"
+                    local tw = imgui.CalcTextSize(txt).x
+                    imgui.SetCursorPos(imgui.ImVec2((resX - tw) / 2, resY / 2))
+                    imgui.Text(txt)
+                end
+                
+                local hintText = u8"Кликните в любом месте или нажмите ESC, чтобы закрыть"
+                local hW = imgui.CalcTextSize(hintText).x
+                imgui.SetCursorPos(imgui.ImVec2((resX - hW) / 2, resY - 30 * scale))
+                imgui.TextColored(imgui.ImVec4(1, 1, 1, 0.5), hintText)
+                
+                if imgui.IsWindowHovered() and imgui.IsMouseClicked(0) then
+                    UI.viewingImage = nil
+                end
+            end
+            imgui.End()
+            imgui.PopStyleColor()
+        end
+        
         imgui.PopStyleVar(4)
         imgui.PopStyleColor(20) 
         if UI.forceResize then UI.forceResize = false end
@@ -3206,5 +3413,20 @@ function sendMessage(number)
         end
         UI.scrollToBottom = true
         UI.requestFocus = true
+        
+        for word in text:gmatch("%S+") do
+            local lWord = word:lower()
+            if lWord:match("^https?://i%.imgur%.com/") and (lWord:match("%.png$") or lWord:match("%.jpe?g$") or lWord:match("%.gif$")) then
+                globalSettings.gallery = globalSettings.gallery or {}
+                local exists = false
+                for _, v in ipairs(globalSettings.gallery) do
+                    if v == word then exists = true break end
+                end
+                if not exists then
+                    table.insert(globalSettings.gallery, word)
+                    save_all_data()
+                end
+            end
+        end
     end
 end
