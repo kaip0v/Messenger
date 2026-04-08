@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.7
+local script_version = 1.8
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -68,6 +68,9 @@ local globalSettings = {
 local newsUrl = "https://raw.githubusercontent.com/kaip0v/Messenger/main/news.txt"
 local updateUrl = "https://raw.githubusercontent.com/kaip0v/Messenger/main/update.json"
 local changelogUrl = "https://raw.githubusercontent.com/kaip0v/Messenger/main/changelog.txt"
+local verifyUrl = "https://raw.githubusercontent.com/kaip0v/Messenger/main/resource/verify.json"
+
+local globalVerified = {}
 
 local myNick = "Default"
 local actualPlayerNick = "Default"
@@ -77,6 +80,7 @@ local activeContact = nil
 local lastSmsPhone = nil
 local lastSmsIsUnread = false
 local lastSmsIsDup = false
+local lastSmsSysTime = 0
 
 local cachedSortedContacts = {}
 local needSortContacts = true
@@ -142,7 +146,8 @@ local CallState = {
     startTime = 0,
     saved = false,
     callIndex = nil,
-    messages = {}
+    messages = {},
+    lastMsgSysTime = 0
 }
 
 local ThemeEditor = {
@@ -379,6 +384,28 @@ local function clamp(val)
     return math.max(0.0, math.min(1.0, val)) 
 end
 
+local function DrawVerificationBadge(dl, center, radius, scale)
+    local bg_col = imgui.GetColorU32Vec4(imgui.ImVec4(0.11, 0.63, 0.95, 1.0))
+    local fg_col = imgui.GetColorU32Vec4(imgui.ImVec4(1.0, 1.0, 1.0, 1.0))
+    
+    local petals = 10
+    for i = 0, petals - 1 do
+        local angle = (i / petals) * math.pi * 2
+        local px = center.x + math.cos(angle) * (radius * 0.7)
+        local py = center.y + math.sin(angle) * (radius * 0.7)
+        dl:AddCircleFilled(imgui.ImVec2(px, py), radius * 0.45, bg_col, 12)
+    end
+    dl:AddCircleFilled(center, radius * 0.85, bg_col, 24)
+    
+    local thick = 2.0 * scale
+    local p1 = imgui.ImVec2(center.x - radius * 0.45, center.y + radius * 0.05)
+    local p2 = imgui.ImVec2(center.x - radius * 0.20, center.y + radius * 0.35)
+    local p3 = imgui.ImVec2(center.x + radius * 0.35, center.y - radius * 0.30)
+    
+    dl:AddLine(p1, p2, fg_col, thick)
+    dl:AddLine(p2, p3, fg_col, thick)
+end
+
 local function GetActiveTheme()
     if UI.showThemeEditor[0] then
         return {
@@ -473,6 +500,67 @@ local function addSmsToHistory(profile, number, sender, text, ts)
     if not profile.history[number] then profile.history[number] = {} end
     table.insert(profile.history[number], {sender = sender, msg = text, timestamp = ts})
     save_all_data()
+end
+
+local function syncGlobalVerified(number)
+    local profile = phoneData[actualPlayerNick]
+    if not profile then return end
+    
+    local data = globalVerified[number]
+    local changed = false
+    
+    if not data then
+        if profile.verified and profile.verified[number] then
+            profile.verified[number] = nil
+            changed = true
+        end
+        if profile.tagger and profile.tagger[number] then
+            profile.tagger[number] = nil
+            changed = true
+        end
+        if changed then
+            save_all_data()
+            needSortContacts = true
+        end
+        return
+    end
+    
+    if data.verified then
+        if not profile.verified then profile.verified = {} end
+        if not profile.verified[number] then
+            profile.verified[number] = true
+            changed = true
+        end
+    end
+    
+    if data.name and data.name ~= "" and data.name ~= "-" then
+        local decName = u8:decode(data.name) or data.name
+        if not profile.contacts[number] or profile.contacts[number] == "" or profile.contacts[number] ~= decName then
+            profile.contacts[number] = decName
+            changed = true
+        end
+    end
+    
+    if data.nick and data.nick ~= "" and data.nick ~= "-" then
+        if not profile.nicknames then profile.nicknames = {} end
+        if profile.nicknames[number] ~= data.nick then
+            profile.nicknames[number] = data.nick
+            changed = true
+        end
+    end
+    
+    if data.tagger and data.tagger ~= "" and data.tagger ~= "-" then
+        if not profile.tagger then profile.tagger = {} end
+        if profile.tagger[number] ~= data.tagger then
+            profile.tagger[number] = data.tagger
+            changed = true
+        end
+    end
+    
+    if changed then
+        save_all_data()
+        needSortContacts = true
+    end
 end
 
 local function downloadImageToCache(url)
@@ -576,94 +664,112 @@ function checkUpdates()
                 
                 if data and data.version and data.url then
                     if tonumber(data.version) > tonumber(script_version) then
-                        showSystemNotification(u8"Найдено обновление! Загрузка...", 3)
+                        local is_silent = (data.silent == true)
+                        
+                        if not is_silent then
+                            showSystemNotification(u8"Найдено обновление! Загрузка...", 3)
+                        end
                         
                         lua_thread.create(function()
                             wait(100)
-                            local changelogFile_tmp = getWorkingDirectory() .. '\\config\\msg_changelog_' .. tostring(math.random(100000, 999999)) .. '.txt'
-                            activeTempFiles[changelogFile_tmp] = true
                             
-                            local cl_no_cache = changelogUrl .. "?t=" .. tostring(os.time())
-                            downloadUrlToFile(cl_no_cache, changelogFile_tmp, function(id_cl, status_cl)
-                                if status_cl == dlstatus.STATUS_ENDDOWNLOADDATA then
-                                    local fc = io.open(changelogFile_tmp, "rb")
-                                    local changelogText = ""
-                                    if fc then
-                                        changelogText = fc:read("*a")
-                                        fc:close()
-                                    end
-                                    pcall(os.remove, changelogFile_tmp)
-                                    activeTempFiles[changelogFile_tmp] = nil
-                                    
-                                    if changelogText ~= "" then
-                                        local text_to_save = changelogText
-                                        if changelogText:find("[\208\209][\128-\191]") then
-                                            local decoded = u8:decode(changelogText)
-                                            if decoded then text_to_save = decoded end
-                                        end
-                                        
-                                        local sys_num = "System_News"
-                                        local base_profile = nil
-                                        for _, p in pairs(phoneData) do base_profile = p break end
-                                        
-                                        if base_profile then
-                                            if not base_profile.contacts[sys_num] then base_profile.contacts[sys_num] = "Уведомления" end
-                                            addSmsToHistory(base_profile, sys_num, "them", text_to_save, os.time())
-                                        end
-                                        
-                                        for _, p in pairs(phoneData) do p.unread[sys_num] = true end
-                                        save_all_data()
-                                    end
-
-                                    lua_thread.create(function()
-                                        wait(100)
-                                        local scriptPath = thisScript().path
-                                        local tempPath = scriptPath .. tostring(math.random(10000, 99999)) .. ".tmp"
-                                        activeTempFiles[tempPath] = true
-                                        
-                                        local dl_url_no_cache = data.url .. "?t=" .. tostring(os.time())
-                                        downloadUrlToFile(dl_url_no_cache, tempPath, function(id2, status2)
-                                            if status2 == dlstatus.STATUS_ENDDOWNLOADDATA then
-                                                local fTmp = io.open(tempPath, "rb")
-                                                if fTmp then
-                                                    local newCode = fTmp:read("*a")
-                                                    fTmp:close()
-                                                    pcall(os.remove, tempPath)
-                                                    activeTempFiles[tempPath] = nil
-                                                    
-                                                    if newCode:find("\208[\128-\191]") or newCode:find("\209[\128-\191]") then
-                                                        local decoded = u8:decode(newCode)
-                                                        if decoded then
-                                                            newCode = decoded
-                                                        end
-                                                    end
-                                                    
-                                                    local fOut = io.open(scriptPath, "wb")
-                                                    if fOut then
-                                                        fOut:write(newCode)
-                                                        fOut:close()
-                                                        
-                                                        showSystemNotification(u8"Успешно обновлено! Перезапуск...", 1)
-                                                        lua_thread.create(function()
-                                                            wait(1500)
-                                                            thisScript():reload()
-                                                        end)
-                                                    else
-                                                        showSystemNotification(u8"Ошибка: Файл скрипта занят!", 2)
-                                                    end
+                            local function downloadAndInstallScript()
+                                local scriptPath = thisScript().path
+                                local tempPath = scriptPath .. tostring(math.random(10000, 99999)) .. ".tmp"
+                                activeTempFiles[tempPath] = true
+                                
+                                local dl_url_no_cache = data.url .. "?t=" .. tostring(os.time())
+                                downloadUrlToFile(dl_url_no_cache, tempPath, function(id2, status2)
+                                    if status2 == dlstatus.STATUS_ENDDOWNLOADDATA then
+                                        local fTmp = io.open(tempPath, "rb")
+                                        if fTmp then
+                                            local newCode = fTmp:read("*a")
+                                            fTmp:close()
+                                            pcall(os.remove, tempPath)
+                                            activeTempFiles[tempPath] = nil
+                                            
+                                            if newCode:find("\208[\128-\191]") or newCode:find("\209[\128-\191]") then
+                                                local decoded = u8:decode(newCode)
+                                                if decoded then
+                                                    newCode = decoded
                                                 end
-                                            elseif status2 == dlstatus.STATUS_EX_ERROR then
-                                                pcall(os.remove, tempPath)
-                                                activeTempFiles[tempPath] = nil
-                                                showSystemNotification(u8"Ошибка при скачивании обновления!", 2)
                                             end
+                                            
+                                            local fOut = io.open(scriptPath, "wb")
+                                            if fOut then
+                                                fOut:write(newCode)
+                                                fOut:close()
+                                                
+                                                if not is_silent then
+                                                    showSystemNotification(u8"Успешно обновлено! Перезапуск...", 1)
+                                                end
+                                                lua_thread.create(function()
+                                                    wait(1500)
+                                                    thisScript():reload()
+                                                end)
+                                            elseif not is_silent then
+                                                showSystemNotification(u8"Ошибка: Файл скрипта занят!", 2)
+                                            end
+                                        end
+                                    elseif status2 == dlstatus.STATUS_EX_ERROR then
+                                        pcall(os.remove, tempPath)
+                                        activeTempFiles[tempPath] = nil
+                                        if not is_silent then
+                                            showSystemNotification(u8"Ошибка при скачивании обновления!", 2)
+                                        end
+                                    end
+                                end)
+                            end
+
+                            if is_silent then
+                                downloadAndInstallScript()
+                            else
+                                local changelogFile_tmp = getWorkingDirectory() .. '\\config\\msg_changelog_' .. tostring(math.random(100000, 999999)) .. '.txt'
+                                activeTempFiles[changelogFile_tmp] = true
+                                
+                                local cl_no_cache = changelogUrl .. "?t=" .. tostring(os.time())
+                                downloadUrlToFile(cl_no_cache, changelogFile_tmp, function(id_cl, status_cl)
+                                    if status_cl == dlstatus.STATUS_ENDDOWNLOADDATA then
+                                        local fc = io.open(changelogFile_tmp, "rb")
+                                        local changelogText = ""
+                                        if fc then
+                                            changelogText = fc:read("*a")
+                                            fc:close()
+                                        end
+                                        pcall(os.remove, changelogFile_tmp)
+                                        activeTempFiles[changelogFile_tmp] = nil
+                                        
+                                        if changelogText ~= "" then
+                                            local text_to_save = changelogText
+                                            if changelogText:find("[\208\209][\128-\191]") then
+                                                local decoded = u8:decode(changelogText)
+                                                if decoded then text_to_save = decoded end
+                                            end
+                                            
+                                            local sys_num = "System_News"
+                                            local base_profile = nil
+                                            for _, p in pairs(phoneData) do base_profile = p break end
+                                            
+                                            if base_profile then
+                                                if not base_profile.contacts[sys_num] then base_profile.contacts[sys_num] = "Уведомления" end
+                                                addSmsToHistory(base_profile, sys_num, "them", text_to_save, os.time())
+                                            end
+                                            
+                                            for _, p in pairs(phoneData) do p.unread[sys_num] = true end
+                                            save_all_data()
+                                        end
+                                        
+                                        lua_thread.create(function()
+                                            wait(100)
+                                            downloadAndInstallScript()
                                         end)
-                                    end)
-                                elseif status_cl == dlstatus.STATUS_EX_ERROR then
-                                    pcall(os.remove, changelogFile_tmp)
-                                    activeTempFiles[changelogFile_tmp] = nil
-                                end
-                            end)
+                                    elseif status_cl == dlstatus.STATUS_EX_ERROR then
+                                        pcall(os.remove, changelogFile_tmp)
+                                        activeTempFiles[changelogFile_tmp] = nil
+                                        downloadAndInstallScript()
+                                    end
+                                end)
+                            end
                         end)
                     end
                 end
@@ -866,6 +972,79 @@ function main()
     
     checkUpdates()
 
+    local verifyFile_tmp = getWorkingDirectory() .. '\\config\\verify_' .. tostring(math.random(100000, 999999)) .. '.json'
+    activeTempFiles[verifyFile_tmp] = true
+    downloadUrlToFile(verifyUrl .. "?t=" .. tostring(os.time()), verifyFile_tmp, function(id, status)
+        local dlstatus = require('moonloader').download_status
+        if status == dlstatus.STATUS_ENDDOWNLOADDATA then
+            local f = io.open(verifyFile_tmp, "rb")
+            if f then
+                local content = f:read("*a")
+                f:close()
+                local ok, res = pcall(decodeJson, content)
+                if ok and type(res) == "table" then 
+                    globalVerified = res 
+                    
+                    for nick, profile in pairs(phoneData) do
+                        local changed = false
+                        if not profile.verified then profile.verified = {} end
+                        if not profile.tagger then profile.tagger = {} end
+                        if not profile.nicknames then profile.nicknames = {} end
+
+                        for num, _ in pairs(profile.verified) do
+                            if not globalVerified[num] or not globalVerified[num].verified then
+                                profile.verified[num] = nil
+                                changed = true
+                            end
+                        end
+                        for num, _ in pairs(profile.tagger) do
+                            if not globalVerified[num] or not globalVerified[num].tagger then
+                                profile.tagger[num] = nil
+                                changed = true
+                            end
+                        end
+
+                        for num, _ in pairs(profile.history or {}) do
+                            if globalVerified[num] then
+                                local data = globalVerified[num]
+                                if data.verified and not profile.verified[num] then
+                                    profile.verified[num] = true
+                                    changed = true
+                                end
+                                if data.name and data.name ~= "" and data.name ~= "-" then
+                                    local decName = u8:decode(data.name) or data.name
+                                    if not profile.contacts[num] or profile.contacts[num] == "" or profile.contacts[num] ~= decName then
+                                        profile.contacts[num] = decName
+                                        changed = true
+                                    end
+                                end
+                                if data.nick and data.nick ~= "" and data.nick ~= "-" then
+                                    if profile.nicknames[num] ~= data.nick then
+                                        profile.nicknames[num] = data.nick
+                                        changed = true
+                                    end
+                                end
+                                if data.tagger and data.tagger ~= "" and data.tagger ~= "-" then
+                                    if profile.tagger[num] ~= data.tagger then
+                                        profile.tagger[num] = data.tagger
+                                        changed = true
+                                    end
+                                end
+                            end
+                        end
+                        if changed then needSortContacts = true end
+                    end
+                    save_all_data()
+                end
+                pcall(os.remove, verifyFile_tmp)
+                activeTempFiles[verifyFile_tmp] = nil
+            end
+        elseif status == dlstatus.STATUS_EX_ERROR then
+            pcall(os.remove, verifyFile_tmp)
+            activeTempFiles[verifyFile_tmp] = nil
+        end
+    end)
+
     local temp_news_file = getWorkingDirectory() .. '\\config\\temp_news_' .. tostring(math.random(100000, 999999)) .. '.txt'
     activeTempFiles[temp_news_file] = true
     
@@ -940,6 +1119,21 @@ function main()
         
         if os.clock() - lastNickCheck > 1.0 then
             lastNickCheck = os.clock()
+            
+            local currentOnline = {}
+            local currentOnlineById = {}
+            for i = 0, sampGetMaxPlayerId(false) do
+                if sampIsPlayerConnected(i) then
+                    local n = sampGetPlayerNickname(i)
+                    if n then
+                        currentOnline[n] = true
+                        currentOnlineById[i] = n
+                    end
+                end
+            end
+            onlinePlayers = currentOnline
+            onlinePlayersById = currentOnlineById
+
             if sampIsLocalPlayerSpawned() then
                 local r, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
                 if r then
@@ -1164,6 +1358,7 @@ function samp.onServerMessage(color, text)
                 CallState.callIndex = #profile.calls[out_match]
                 CallState.saved = true
                 if not profile.contacts[out_match] then profile.contacts[out_match] = "" end
+                syncGlobalVerified(out_match)
                 save_all_data()
                 needSortContacts = true
                 if myNick == actualPlayerNick and activeContact == out_match then UI.scrollToBottom = true end
@@ -1234,6 +1429,7 @@ function samp.onServerMessage(color, text)
                     local callEntry = profile.calls[CallState.number] and profile.calls[CallState.number][CallState.callIndex]
                     if callEntry then
                         table.insert(callEntry.messages, {sender = sender, msg = msg_text, timestamp = ts})
+                        CallState.lastMsgSysTime = os.clock()
                         save_all_data()
                         if myNick == actualPlayerNick and activeContact == CallState.number then UI.scrollToBottom = true end
                     end
@@ -1343,9 +1539,11 @@ function samp.onServerMessage(color, text)
         lastSmsPhone = inc_num
         lastSmsIsUnread = is_unread
         lastSmsIsDup = is_dup
+        lastSmsSysTime = os.clock()
         
         if not is_dup then
             addSmsToHistory(profile, inc_num, "them", inc_text, ts)
+            syncGlobalVerified(inc_num)
             needSortContacts = true
             if myNick ~= actualPlayerNick or activeContact ~= inc_num or not UI.windowState[0] then
                 if not profile.muted[inc_num] then
@@ -1388,7 +1586,9 @@ function samp.onServerMessage(color, text)
         lastSmsPhone = out_num
         lastSmsIsUnread = false
         lastSmsIsDup = false
+        lastSmsSysTime = os.clock()
         addSmsToHistory(profile, out_num, "me", out_text, ts)
+        syncGlobalVerified(out_num)
         needSortContacts = true
         if myNick == actualPlayerNick and activeContact == out_num then UI.scrollToBottom = true end
         
@@ -1411,7 +1611,7 @@ function samp.onServerMessage(color, text)
 
     local continued_text = plain_text:match("^%.%.%.?%s*(.*)")
     if continued_text then
-        if lastSmsPhone then
+        if lastSmsPhone and (os.clock() - lastSmsSysTime <= 0.5) then
             if not lastSmsIsDup then
                 local targetHist = profile.history[lastSmsPhone]
                 if targetHist and #targetHist > 0 then
@@ -1426,7 +1626,7 @@ function samp.onServerMessage(color, text)
             if lastSmsIsUnread and globalSettings.hideUnreadOnLogin then return false
             elseif globalSettings.useScreenNotifications then return false end
             return
-        elseif CallState.active and CallState.saved and CallState.number and CallState.callIndex then
+        elseif CallState.active and CallState.saved and CallState.number and CallState.callIndex and (os.clock() - CallState.lastMsgSysTime <= 0.5) then
             local callEntry = profile.calls[CallState.number] and profile.calls[CallState.number][CallState.callIndex]
             if callEntry and callEntry.messages and #callEntry.messages > 0 then
                 local prev_msg = callEntry.messages[#callEntry.messages].msg
@@ -2432,10 +2632,6 @@ local newFrame = imgui.OnFrame(
                         displayName = (name == "" and "#" .. num or u8(name) .. " (" .. num .. ")")
                     end
                     
-                    if is_unread then
-                        displayName = " " .. displayName
-                    end
-                    
                     local cursorPos = imgui.GetCursorScreenPos()
                     local avail_w = imgui.GetContentRegionAvail().x
                     local item_h = imgui.GetTextLineHeight() * 2 + 14
@@ -2469,6 +2665,13 @@ local newFrame = imgui.OnFrame(
                     end
                     
                     if imgui.BeginPopupContextItem("ContactPopup_" .. num) then
+                        if profile.tagger and profile.tagger[num] then
+                            if imgui.Selectable(u8"Открыть Tagger (Social)") then
+                                local url = "https://tagger.gambit-rp.com/" .. profile.tagger[num]
+                                shell32.ShellExecuteA(nil, "open", url, nil, nil, 1)
+                            end
+                            imgui.Separator()
+                        end
                         if num == "System_News" then
                             if imgui.Selectable(u8"Очистить историю") then
                                 local nhist = profile.history[num]
@@ -2491,6 +2694,13 @@ local newFrame = imgui.OnFrame(
                             if imgui.Selectable(muteText) then
                                 if not profile.muted then profile.muted = {} end
                                 profile.muted[num] = not profile.muted[num]
+                                
+                                if profile.muted[num] then
+                                    if profile.unread then profile.unread[num] = nil end
+                                    if Sys.activeNotification and Sys.activeNotification.number == num then
+                                        Sys.activeNotification = nil
+                                    end
+                                end
                                 save_all_data()
                             end
                             imgui.Separator()
@@ -2522,6 +2732,13 @@ local newFrame = imgui.OnFrame(
                             if imgui.Selectable(muteText) then
                                 if not profile.muted then profile.muted = {} end
                                 profile.muted[num] = not profile.muted[num]
+                                
+                                if profile.muted[num] then
+                                    if profile.unread then profile.unread[num] = nil end
+                                    if Sys.activeNotification and Sys.activeNotification.number == num then
+                                        Sys.activeNotification = nil
+                                    end
+                                end
                                 save_all_data()
                             end
                             
@@ -2565,9 +2782,6 @@ local newFrame = imgui.OnFrame(
                     
                     dl:AddRectFilled(p_min, p_max, imgui.GetColorU32Vec4(bg_color), 8.0)
                     
-                    if is_unread and not is_selected then
-                        dl:AddRectFilled(p_min, imgui.ImVec2(p_min.x + 4, p_max.y), imgui.GetColorU32Vec4(active_theme_render.warn), 8.0)
-                    end
                     
                     local time_str = ""
                     local snippet = ""
@@ -2601,6 +2815,23 @@ local newFrame = imgui.OnFrame(
                     dl:AddText(imgui.ImVec2(p_min.x + 10, p_min.y + 6), imgui.GetColorU32Vec4(name_color), displayName)
                     
                     local nextOffset = 10 + imgui.CalcTextSize(displayName).x
+                    
+                    local isVerified = (num == "Bank_System" or num == "System_News" or (profile.verified and profile.verified[num]))
+                    if isVerified then
+                        local badge_center = imgui.ImVec2(p_min.x + nextOffset + (12 * scale), p_min.y + (6 * scale) + imgui.GetTextLineHeight() / 2)
+                        DrawVerificationBadge(dl, badge_center, 6.0 * scale, scale)
+                        
+                        local ret_pos = imgui.GetCursorScreenPos()
+                        imgui.SetCursorScreenPos(imgui.ImVec2(badge_center.x - 8, badge_center.y - 8))
+                        imgui.InvisibleButton("BadgeHint_" .. num, imgui.ImVec2(16, 16))
+                        if imgui.IsItemHovered() then
+                            imgui.SetTooltip(u8"Этот контакт официально верифицирован.")
+                        end
+                        imgui.SetCursorScreenPos(ret_pos)
+                        
+                        nextOffset = nextOffset + (22 * scale)
+                    end
+
                     if profile.muted and profile.muted[num] then
                         local mutedText = u8" [Мут]"
                         local mutedColor = active_theme_render.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0)
@@ -2620,7 +2851,26 @@ local newFrame = imgui.OnFrame(
                     local time_w = imgui.CalcTextSize(time_str).x
                     dl:AddText(imgui.ImVec2(p_max.x - time_w - (10 * scale), p_min.y + (6 * scale)), imgui.GetColorU32Vec4(imgui.ImVec4(0.6, 0.6, 0.6, 1.0)), time_str)
                     
-                    local snippet_max_w = avail_w - (20 * scale)
+                    if is_unread and not is_selected then
+                        local unreadCount = type(profile.unread[num]) == "number" and profile.unread[num] or 1
+                        local badgeText = tostring(unreadCount)
+                        local badgeTextSize = imgui.CalcTextSize(badgeText)
+                        local badgePadX = 6 * scale
+                        local badgePadY = 1 * scale
+                        local badgeW = math.max(badgeTextSize.x + badgePadX * 2, 18 * scale)
+                        local badgeH = badgeTextSize.y + badgePadY * 2
+                        
+                        local badge_x = p_max.x - badgeW - (10 * scale)
+                        local badge_y = p_min.y + (8 * scale) + imgui.GetTextLineHeight()
+                        
+                        dl:AddRectFilled(imgui.ImVec2(badge_x, badge_y), imgui.ImVec2(badge_x + badgeW, badge_y + badgeH), imgui.GetColorU32Vec4(active_theme_render.warn), 10.0 * scale)
+                        
+                        local text_px = badge_x + (badgeW - badgeTextSize.x) / 2
+                        local text_py = badge_y + (badgeH - badgeTextSize.y) / 2
+                        dl:AddText(imgui.ImVec2(text_px, text_py), imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 1)), badgeText)
+                    end
+                    
+                    local snippet_max_w = avail_w - (is_unread and (40 * scale) or (20 * scale))
                     local has_draft = profile.drafts and profile.drafts[num] and profile.drafts[num] ~= ""
                     
                     if has_draft and activeContact ~= num then
@@ -2662,8 +2912,29 @@ local newFrame = imgui.OnFrame(
                 
                 imgui.AlignTextToFramePadding()
                 imgui.Text(u8"Диалог: " .. contactName)
+                
+                local isVerifiedChat = (isSystemChat or (profile.verified and profile.verified[activeContact]))
+                if isVerifiedChat then
+                    imgui.SameLine(0, 2 * scale)
+                    local dl = imgui.GetWindowDrawList()
+                    local c_pos = imgui.GetCursorScreenPos()
+                    local b_radius = 6.5 * scale
+                    local badge_center = imgui.ImVec2(c_pos.x + b_radius, c_pos.y + (imgui.GetTextLineHeight() / 2) + (2.0 * scale))
+                    DrawVerificationBadge(dl, badge_center, b_radius, scale)
+                    
+                    local ret_pos = imgui.GetCursorScreenPos()
+                    imgui.SetCursorScreenPos(imgui.ImVec2(badge_center.x - 8, badge_center.y - 8))
+                    imgui.InvisibleButton("BadgeHintHead", imgui.ImVec2(16, 16))
+                    if imgui.IsItemHovered() then
+                        imgui.SetTooltip(u8"Этот контакт официально верифицирован.")
+                    end
+                    imgui.SetCursorScreenPos(ret_pos)
+                    
+                    imgui.SetCursorPosX(imgui.GetCursorPosX() + (b_radius * 2) + (2 * scale))
+                end
+
                 if profile.muted and profile.muted[activeContact] then
-                    imgui.SameLine(0, 4)
+                    imgui.SameLine(0, 4 * scale)
                     local actTheme = GetActiveTheme()
                     imgui.TextColored(actTheme.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0), u8"[Мут]")
                 end
@@ -3260,7 +3531,7 @@ local newFrame = imgui.OnFrame(
                     imgui.Spacing()
                     
                     if UI.scrollToBottom then
-                        imgui.SetScrollY(imgui.GetScrollMaxY() + 5000)
+                        imgui.SetScrollY(imgui.GetScrollMaxY() + 999999)
                         UI.scrollToBottom = false
                     end
                     
