@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.8
+local script_version = 1.81
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -166,7 +166,9 @@ local ThemeEditor = {
         call_me = imgui.new.float[4](0.4, 0.7, 1.0, 1.0),
         call_them = imgui.new.float[4](1.0, 1.0, 1.0, 1.0),
         call_time = imgui.new.float[4](0.5, 0.5, 0.5, 1.0),
-        checkmark = imgui.new.float[4](0.18, 0.35, 0.58, 1.0)
+        checkmark = imgui.new.float[4](0.18, 0.35, 0.58, 1.0),
+        badge_text = imgui.new.float[4](1.0, 1.0, 1.0, 1.0),
+        bubble_muted = imgui.new.float[4](0.5, 0.5, 0.5, 1.0)
     },
     colorNames = {
         {"me", u8"Акцент (Мои SMS, Кнопки)"},
@@ -183,10 +185,74 @@ local ThemeEditor = {
         {"call_me", u8"Звонок: Мой текст"},
         {"call_them", u8"Звонок: Собеседник"},
         {"call_time", u8"Звонок: Время"},
-        {"checkmark", u8"Цвет галочек (Настройки)"}
+        {"checkmark", u8"Цвет галочек (Настройки)"},
+        {"badge_text", u8"Текст в бейджах (Новые SMS)"},
+        {"bubble_muted", u8"Фон SMS в муте (Серый)"}
     },
     selectedIdx = 1
 }
+
+local function GetActiveTheme()
+    if UI.showThemeEditor[0] then
+        return {
+            me = imgui.ImVec4(ThemeEditor.temp.me[0], ThemeEditor.temp.me[1], ThemeEditor.temp.me[2], ThemeEditor.temp.me[3]),
+            them = imgui.ImVec4(ThemeEditor.temp.them[0], ThemeEditor.temp.them[1], ThemeEditor.temp.them[2], ThemeEditor.temp.them[3]),
+            warn = imgui.ImVec4(ThemeEditor.temp.warn[0], ThemeEditor.temp.warn[1], ThemeEditor.temp.warn[2], ThemeEditor.temp.warn[3]),
+            notif_bg = imgui.ImVec4(ThemeEditor.temp.notif_bg[0], ThemeEditor.temp.notif_bg[1], ThemeEditor.temp.notif_bg[2], ThemeEditor.temp.notif_bg[3]),
+            notif_text = imgui.ImVec4(ThemeEditor.temp.notif_text[0], ThemeEditor.temp.notif_text[1], ThemeEditor.temp.notif_text[2], ThemeEditor.temp.notif_text[3]),
+            sys_ok = imgui.ImVec4(ThemeEditor.temp.sys_ok[0], ThemeEditor.temp.sys_ok[1], ThemeEditor.temp.sys_ok[2], ThemeEditor.temp.sys_ok[3]),
+            sys_err = imgui.ImVec4(ThemeEditor.temp.sys_err[0], ThemeEditor.temp.sys_err[1], ThemeEditor.temp.sys_err[2], ThemeEditor.temp.sys_err[3]),
+            sys_info = imgui.ImVec4(ThemeEditor.temp.sys_info[0], ThemeEditor.temp.sys_info[1], ThemeEditor.temp.sys_info[2], ThemeEditor.temp.sys_info[3]),
+            online = imgui.ImVec4(ThemeEditor.temp.online[0], ThemeEditor.temp.online[1], ThemeEditor.temp.online[2], ThemeEditor.temp.online[3]),
+            muted = imgui.ImVec4(ThemeEditor.temp.muted[0], ThemeEditor.temp.muted[1], ThemeEditor.temp.muted[2], ThemeEditor.temp.muted[3]),
+            draft = imgui.ImVec4(ThemeEditor.temp.draft[0], ThemeEditor.temp.draft[1], ThemeEditor.temp.draft[2], ThemeEditor.temp.draft[3]),
+            call_me = imgui.ImVec4(ThemeEditor.temp.call_me[0], ThemeEditor.temp.call_me[1], ThemeEditor.temp.call_me[2], ThemeEditor.temp.call_me[3]),
+            call_them = imgui.ImVec4(ThemeEditor.temp.call_them[0], ThemeEditor.temp.call_them[1], ThemeEditor.temp.call_them[2], ThemeEditor.temp.call_them[3]),
+            call_time = imgui.ImVec4(ThemeEditor.temp.call_time[0], ThemeEditor.temp.call_time[1], ThemeEditor.temp.call_time[2], ThemeEditor.temp.call_time[3]),
+            checkmark = imgui.ImVec4(ThemeEditor.temp.checkmark[0], ThemeEditor.temp.checkmark[1], ThemeEditor.temp.checkmark[2], ThemeEditor.temp.checkmark[3]),
+            badge_text = imgui.ImVec4(ThemeEditor.temp.badge_text[0], ThemeEditor.temp.badge_text[1], ThemeEditor.temp.badge_text[2], ThemeEditor.temp.badge_text[3]),
+            bubble_muted = imgui.ImVec4(ThemeEditor.temp.bubble_muted[0], ThemeEditor.temp.bubble_muted[1], ThemeEditor.temp.bubble_muted[2], ThemeEditor.temp.bubble_muted[3]),
+            name = "Live Preview"
+        }
+    else
+        if globalSettings.theme > #themes and globalSettings.customThemes and globalSettings.customThemes[globalSettings.theme - #themes] then
+            local ct = globalSettings.customThemes[globalSettings.theme - #themes]
+            local function sv(a, d) return (a and type(a) == "table" and #a>=4) and imgui.ImVec4(a[1],a[2],a[3],a[4]) or d end
+            return {
+                me = sv(ct.me, imgui.ImVec4(0.18, 0.35, 0.58, 1.0)),
+                them = sv(ct.them, imgui.ImVec4(0.25, 0.25, 0.25, 1.0)),
+                warn = sv(ct.warn, imgui.ImVec4(0.20, 0.60, 0.90, 1.0)),
+                notif_bg = sv(ct.notif_bg, imgui.ImVec4(0.12, 0.12, 0.12, 0.95)),
+                notif_text = sv(ct.notif_text, imgui.ImVec4(0.9, 0.9, 0.9, 1.0)),
+                sys_ok = sv(ct.sys_ok, imgui.ImVec4(0.20, 0.80, 0.20, 0.80)),
+                sys_err = sv(ct.sys_err, imgui.ImVec4(0.80, 0.20, 0.20, 0.80)),
+                sys_info = sv(ct.sys_info, imgui.ImVec4(0.20, 0.60, 0.90, 0.80)),
+                online = sv(ct.online, imgui.ImVec4(0.2, 0.8, 0.2, 1.0)),
+                muted = sv(ct.muted, imgui.ImVec4(0.6, 0.6, 0.6, 1.0)),
+                draft = sv(ct.draft, imgui.ImVec4(0.8, 0.4, 0.4, 1.0)),
+                call_me = sv(ct.call_me, imgui.ImVec4(0.4, 0.7, 1.0, 1.0)),
+                call_them = sv(ct.call_them, imgui.ImVec4(1.0, 1.0, 1.0, 1.0)),
+                call_time = sv(ct.call_time, imgui.ImVec4(0.5, 0.5, 0.5, 1.0)),
+                checkmark = sv(ct.checkmark, ct.me and imgui.ImVec4(ct.me[1],ct.me[2],ct.me[3],ct.me[4]) or imgui.ImVec4(0.18, 0.35, 0.58, 1.0)),
+                badge_text = sv(ct.badge_text, imgui.ImVec4(1.0, 1.0, 1.0, 1.0)),
+                bubble_muted = sv(ct.bubble_muted, imgui.ImVec4(0.5, 0.5, 0.5, 1.0)),
+                name = "Пользовательская тема #" .. (globalSettings.theme - #themes)
+            }
+        else
+            local t = themes[globalSettings.theme] or themes[1]
+            t.online = t.online or imgui.ImVec4(0.2, 0.8, 0.2, 1.0)
+            t.muted = t.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0)
+            t.draft = t.draft or imgui.ImVec4(0.8, 0.4, 0.4, 1.0)
+            t.call_me = t.call_me or imgui.ImVec4(0.4, 0.7, 1.0, 1.0)
+            t.call_them = t.call_them or imgui.ImVec4(1.0, 1.0, 1.0, 1.0)
+            t.call_time = t.call_time or imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
+            t.checkmark = t.checkmark or t.me
+            t.badge_text = t.badge_text or imgui.ImVec4(1.0, 1.0, 1.0, 1.0)
+            t.bubble_muted = t.bubble_muted or imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
+            return t
+        end
+    end
+end
 
 local availableKeys = {}
 for i = 65, 90 do
@@ -221,17 +287,27 @@ local themes = {
     { name = "Изумрудный", me = imgui.ImVec4(0.15, 0.45, 0.25, 1.0), them = imgui.ImVec4(0.20, 0.25, 0.20, 1.0), warn = imgui.ImVec4(0.20, 0.70, 0.30, 1.0), notif_bg = imgui.ImVec4(0.08, 0.15, 0.10, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0), sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.20, 0.70, 0.30, 0.80) },
     { name = "Малиновый закат", me = imgui.ImVec4(0.50, 0.20, 0.35, 1.0), them = imgui.ImVec4(0.25, 0.15, 0.20, 1.0), warn = imgui.ImVec4(0.80, 0.30, 0.50, 1.0), notif_bg = imgui.ImVec4(0.15, 0.08, 0.12, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0), sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.80, 0.30, 0.50, 0.80) },
     { name = "Осенний лес", me = imgui.ImVec4(0.65, 0.33, 0.05, 1.0), them = imgui.ImVec4(0.25, 0.32, 0.22, 1.0), warn = imgui.ImVec4(0.90, 0.50, 0.10, 1.0), notif_bg = imgui.ImVec4(0.15, 0.12, 0.08, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0), sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.90, 0.50, 0.10, 0.80) },
-    { name = "Океанская бездна", me = imgui.ImVec4(0.05, 0.30, 0.45, 1.0), them = imgui.ImVec4(0.05, 0.15, 0.25, 1.0), warn = imgui.ImVec4(0.10, 0.60, 0.80, 1.0), notif_bg = imgui.ImVec4(0.04, 0.08, 0.15, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0), sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.10, 0.60, 0.80, 0.80) }
+    { name = "Океанская бездна", me = imgui.ImVec4(0.05, 0.30, 0.45, 1.0), them = imgui.ImVec4(0.05, 0.15, 0.25, 1.0), warn = imgui.ImVec4(0.10, 0.60, 0.80, 1.0), notif_bg = imgui.ImVec4(0.04, 0.08, 0.15, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0), sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.10, 0.60, 0.80, 0.80) },
+    { name = "Townly светлая", me = imgui.ImVec4(0.12, 0.53, 0.90, 1.0), them = imgui.ImVec4(0.96, 0.97, 0.98, 1.0), warn = imgui.ImVec4(0.94, 0.30, 0.30, 1.0), notif_bg = imgui.ImVec4(0.10, 0.12, 0.15, 0.95), notif_text = imgui.ImVec4(0.95, 0.95, 0.95, 1.0), sys_ok = imgui.ImVec4(0.15, 0.75, 0.35, 0.80), sys_err = imgui.ImVec4(0.94, 0.30, 0.30, 0.80), sys_info = imgui.ImVec4(0.12, 0.53, 0.90, 0.80) },
+    { name = "Townly тёмная", me = imgui.ImVec4(0.35, 0.65, 0.95, 1.0), them = imgui.ImVec4(0.11, 0.13, 0.16, 1.0), warn = imgui.ImVec4(0.95, 0.40, 0.40, 1.0), notif_bg = imgui.ImVec4(0.18, 0.22, 0.27, 0.95), notif_text = imgui.ImVec4(0.95, 0.95, 0.95, 1.0), sys_ok = imgui.ImVec4(0.20, 0.85, 0.40, 0.80), sys_err = imgui.ImVec4(0.95, 0.40, 0.40, 0.80), sys_info = imgui.ImVec4(0.35, 0.65, 0.95, 0.80) }
 }
 
 for _, t in ipairs(themes) do
-    t.online = imgui.ImVec4(0.2, 0.8, 0.2, 1.0)
-    t.muted = imgui.ImVec4(0.6, 0.6, 0.6, 1.0)
-    t.draft = imgui.ImVec4(0.8, 0.4, 0.4, 1.0)
-    t.call_me = imgui.ImVec4(0.4, 0.7, 1.0, 1.0)
-    t.call_them = imgui.ImVec4(1.0, 1.0, 1.0, 1.0)
-    t.call_time = imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
-    t.checkmark = t.me
+    t.online = t.online or imgui.ImVec4(0.2, 0.8, 0.2, 1.0)
+    t.muted = t.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0)
+    t.draft = t.draft or imgui.ImVec4(0.8, 0.4, 0.4, 1.0)
+    t.call_me = t.call_me or imgui.ImVec4(0.4, 0.7, 1.0, 1.0)
+    t.call_them = t.call_them or imgui.ImVec4(1.0, 1.0, 1.0, 1.0)
+    t.call_time = t.call_time or imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
+    t.checkmark = t.checkmark or t.me
+    t.badge_text = t.badge_text or imgui.ImVec4(1.0, 1.0, 1.0, 1.0)
+    
+    local is_light = (t.them.x + t.them.y + t.them.z) > 1.5
+    if is_light then
+        t.bubble_muted = t.bubble_muted or imgui.ImVec4(math.max(0, t.them.x - 0.15), math.max(0, t.them.y - 0.15), math.max(0, t.them.z - 0.15), 1.0)
+    else
+        t.bubble_muted = t.bubble_muted or imgui.ImVec4(math.min(1, t.them.x + 0.15), math.min(1, t.them.y + 0.15), math.min(1, t.them.z + 0.15), 1.0)
+    end
 end
 
 local notifPositions = {
@@ -1488,8 +1564,8 @@ function samp.onServerMessage(color, text)
                     addSmsToHistory(profile, "Bank_System", "them", full_text, os.time())
                     needSortContacts = true
                     if myNick == actualPlayerNick and activeContact ~= "Bank_System" or not UI.windowState[0] then
+                        profile.unread["Bank_System"] = (type(profile.unread["Bank_System"]) == "number" and profile.unread["Bank_System"] or 0) + 1
                         if not profile.muted["Bank_System"] then
-                            profile.unread["Bank_System"] = true
                             if globalSettings.useScreenNotifications and not globalSettings.dndMode then
                                 Sys.activeNotification = { number = "Bank_System", name = "Банк", text = "Получена новая выписка с банковского счета.", time = os.clock() }
                             end
@@ -1546,8 +1622,8 @@ function samp.onServerMessage(color, text)
             syncGlobalVerified(inc_num)
             needSortContacts = true
             if myNick ~= actualPlayerNick or activeContact ~= inc_num or not UI.windowState[0] then
+                profile.unread[inc_num] = (type(profile.unread[inc_num]) == "number" and profile.unread[inc_num] or 0) + 1
                 if not profile.muted[inc_num] then
-                    profile.unread[inc_num] = true
                     if globalSettings.useScreenNotifications and not globalSettings.dndMode then
                         local cName = profile.contacts[inc_num] or ""
                         Sys.activeNotification = { number = inc_num, name = (cName == "" and inc_num or cName), text = inc_text, time = os.clock() }
@@ -1704,8 +1780,9 @@ local unreadIndicatorFrame = imgui.OnFrame(
         if Sys.tempSysNotifText and os.clock() < Sys.tempSysNotifTimer then return true end
         local profile = phoneData[actualPlayerNick]
         if not profile then return false end
-        for _, is_unread in pairs(profile.unread) do
-            if is_unread then return true end
+        for num, val in pairs(profile.unread) do
+            local is_u = (type(val) == "number" and val > 0) or (type(val) == "boolean" and val)
+            if is_u and not (profile.muted and profile.muted[num]) then return true end
         end
         return false
     end,
@@ -2196,6 +2273,8 @@ local newFrame = imgui.OnFrame(
                         sa(ThemeEditor.temp.call_them, ct.call_them, 1.0, 1.0, 1.0, 1.0)
                         sa(ThemeEditor.temp.call_time, ct.call_time, 0.5, 0.5, 0.5, 1.0)
                         sa(ThemeEditor.temp.checkmark, ct.checkmark, 0.18, 0.35, 0.58, 1.0)
+                        sa(ThemeEditor.temp.badge_text, ct.badge_text, 1.0, 1.0, 1.0, 1.0)
+                        sa(ThemeEditor.temp.bubble_muted, ct.bubble_muted, 0.5, 0.5, 0.5, 1.0)
                     else
                         local cur = themes[globalSettings.theme] or themes[1]
                         sa(ThemeEditor.temp.me, {cur.me.x, cur.me.y, cur.me.z, cur.me.w}, 0.18, 0.35, 0.58, 1.0)
@@ -2214,6 +2293,8 @@ local newFrame = imgui.OnFrame(
                         sa(ThemeEditor.temp.call_them, cur.call_them and {cur.call_them.x, cur.call_them.y, cur.call_them.z, cur.call_them.w} or nil, 1.0, 1.0, 1.0, 1.0)
                         sa(ThemeEditor.temp.call_time, cur.call_time and {cur.call_time.x, cur.call_time.y, cur.call_time.z, cur.call_time.w} or nil, 0.5, 0.5, 0.5, 1.0)
                         sa(ThemeEditor.temp.checkmark, cur.checkmark and {cur.checkmark.x, cur.checkmark.y, cur.checkmark.z, cur.checkmark.w} or nil, cur.me.x, cur.me.y, cur.me.z, cur.me.w)
+                        sa(ThemeEditor.temp.badge_text, cur.badge_text and {cur.badge_text.x, cur.badge_text.y, cur.badge_text.z, cur.badge_text.w} or nil, 1.0, 1.0, 1.0, 1.0)
+                        sa(ThemeEditor.temp.bubble_muted, cur.bubble_muted and {cur.bubble_muted.x, cur.bubble_muted.y, cur.bubble_muted.z, cur.bubble_muted.w} or nil, 0.5, 0.5, 0.5, 1.0)
                     end
                     UI.showThemeEditor[0] = not UI.showThemeEditor[0]
                 end
@@ -2696,7 +2777,6 @@ local newFrame = imgui.OnFrame(
                                 profile.muted[num] = not profile.muted[num]
                                 
                                 if profile.muted[num] then
-                                    if profile.unread then profile.unread[num] = nil end
                                     if Sys.activeNotification and Sys.activeNotification.number == num then
                                         Sys.activeNotification = nil
                                     end
@@ -2734,7 +2814,6 @@ local newFrame = imgui.OnFrame(
                                 profile.muted[num] = not profile.muted[num]
                                 
                                 if profile.muted[num] then
-                                    if profile.unread then profile.unread[num] = nil end
                                     if Sys.activeNotification and Sys.activeNotification.number == num then
                                         Sys.activeNotification = nil
                                     end
@@ -2770,12 +2849,19 @@ local newFrame = imgui.OnFrame(
                     local dl = imgui.GetWindowDrawList()
                     local bg_color = imgui.ImVec4(0, 0, 0, 0)
                     
+                    local is_muted = profile.muted and profile.muted[num]
+                    
                     if is_selected then
                         bg_color = active_theme_render.me
                     elseif is_hovered then
                         bg_color = imgui.ImVec4(active_theme_render.me.x, active_theme_render.me.y, active_theme_render.me.z, 0.6)
                     elseif is_unread then
-                        bg_color = imgui.ImVec4(active_theme_render.warn.x, active_theme_render.warn.y, active_theme_render.warn.z, 0.25)
+                        if is_muted then
+                            local m_col = active_theme_render.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0)
+                            bg_color = imgui.ImVec4(m_col.x, m_col.y, m_col.z, 0.25)
+                        else
+                            bg_color = imgui.ImVec4(active_theme_render.warn.x, active_theme_render.warn.y, active_theme_render.warn.z, 0.25)
+                        end
                     else
                         bg_color = imgui.ImVec4(active_theme_render.them.x, active_theme_render.them.y, active_theme_render.them.z, 0.4)
                     end
@@ -2863,11 +2949,14 @@ local newFrame = imgui.OnFrame(
                         local badge_x = p_max.x - badgeW - (10 * scale)
                         local badge_y = p_min.y + (8 * scale) + imgui.GetTextLineHeight()
                         
-                        dl:AddRectFilled(imgui.ImVec2(badge_x, badge_y), imgui.ImVec2(badge_x + badgeW, badge_y + badgeH), imgui.GetColorU32Vec4(active_theme_render.warn), 10.0 * scale)
+                        local is_muted = profile.muted and profile.muted[num]
+                        local badgeColor = is_muted and active_theme_render.muted or active_theme_render.warn
+                        
+                        dl:AddRectFilled(imgui.ImVec2(badge_x, badge_y), imgui.ImVec2(badge_x + badgeW, badge_y + badgeH), imgui.GetColorU32Vec4(badgeColor), 10.0 * scale)
                         
                         local text_px = badge_x + (badgeW - badgeTextSize.x) / 2
                         local text_py = badge_y + (badgeH - badgeTextSize.y) / 2
-                        dl:AddText(imgui.ImVec2(text_px, text_py), imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 1)), badgeText)
+                        dl:AddText(imgui.ImVec2(text_px, text_py), imgui.GetColorU32Vec4(active_theme_render.badge_text), badgeText)
                     end
                     
                     local snippet_max_w = avail_w - (is_unread and (40 * scale) or (20 * scale))
@@ -3360,6 +3449,15 @@ local newFrame = imgui.OnFrame(
                                     local screenPos = imgui.GetCursorScreenPos()
 
                                     local color = msgData.sender == "me" and active_theme.me or active_theme.them
+                                    
+                                    local unreadCount = type(profile.unread[activeContact]) == "number" and profile.unread[activeContact] or (profile.unread[activeContact] and 1 or 0)
+                                    local isMuted = profile.muted and profile.muted[activeContact]
+                                    
+                                    local isUnreadMsg = (msgData.sender == "them" and unreadCount > 0 and index > (#currentHistory - unreadCount))
+                                    if isUnreadMsg and isMuted then
+                                        color = active_theme.bubble_muted or imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
+                                    end
+
                                     imgui.GetWindowDrawList():AddRectFilled(
                                         screenPos,
                                         imgui.ImVec2(screenPos.x + bubbleSize.x, screenPos.y + bubbleSize.y),
