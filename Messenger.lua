@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.85
+local script_version = 1.86
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -113,6 +113,7 @@ local lastSmsIsUnread = false
 local lastSmsIsDup = false
 local lastSmsSysTime = 0
 local lastSmsGroupId = nil
+local lastSmsIsOutgoingGroup = false
 
 local cachedSortedContacts = {}
 local needSortContacts = true
@@ -1777,6 +1778,7 @@ function samp.onServerMessage(color, text)
             lastSmsSysTime = os.clock()
             lastSmsIsDup = false
             lastSmsIsUnread = false
+            lastSmsIsOutgoingGroup = false
             
             if myNick == actualPlayerNick and activeContact == gId then UI.scrollToBottom = true end
             if not profile.muted[gId] and globalSettings.useScreenNotifications and not globalSettings.dndMode then
@@ -1784,6 +1786,8 @@ function samp.onServerMessage(color, text)
             end
             if globalSettings.useScreenNotifications then return false else return end
         end
+
+        local is_dup = false
 
         local is_dup = false
         if is_unread and profile.history[inc_num] then
@@ -1802,6 +1806,7 @@ function samp.onServerMessage(color, text)
         lastSmsIsUnread = is_unread
         lastSmsIsDup = is_dup
         lastSmsSysTime = os.clock()
+        lastSmsIsOutgoingGroup = false
         
         if not is_dup then
             addSmsToHistory(profile, inc_num, "them", inc_text, ts)
@@ -1855,6 +1860,7 @@ function samp.onServerMessage(color, text)
             lastSmsSysTime = os.clock()
             lastSmsIsDup = false
             lastSmsIsUnread = false
+            lastSmsIsOutgoingGroup = true
             if globalSettings.useScreenNotifications then return false else return end
         end
 
@@ -1863,6 +1869,7 @@ function samp.onServerMessage(color, text)
         lastSmsIsUnread = false
         lastSmsIsDup = false
         lastSmsSysTime = os.clock()
+        lastSmsIsOutgoingGroup = false
         addSmsToHistory(profile, out_num, "me", out_text, ts)
         syncGlobalVerified(out_num)
         needSortContacts = true
@@ -1888,6 +1895,11 @@ function samp.onServerMessage(color, text)
     local continued_text = plain_text:match("^%.%.%.?%s*(.*)")
     if continued_text then
         if lastSmsPhone and (os.clock() - lastSmsSysTime <= 0.5) then
+            if lastSmsIsOutgoingGroup then
+                if globalSettings.useScreenNotifications then return false end
+                return
+            end
+            
             if not lastSmsIsDup then
                 local targetHist = nil
                 if lastSmsGroupId and profile.groups and profile.groups[lastSmsGroupId] then
@@ -3916,7 +3928,7 @@ local newFrame = imgui.OnFrame(
                         end
                         
                         if deleteMsgIndex then
-                            table.remove(profile.history[activeContact], deleteMsgIndex)
+                            table.remove(currentHistory, deleteMsgIndex)
                             save_all_data()
                             needSortContacts = true
                         end
