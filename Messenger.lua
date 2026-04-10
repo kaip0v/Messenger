@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.84
+local script_version = 1.85
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -1069,6 +1069,8 @@ function main()
                 for _, n in ipairs(membersList) do profileMembers[n] = true end
                 
                 profile.groups[gId] = { name = gName, members = profileMembers, history = {} }
+                table.insert(profile.groups[gId].history, {sender = "me", msg = "[Система] Вы создали эту группу", timestamp = os.time()})
+                
                 save_all_data()
                 needSortContacts = true
                 
@@ -1733,6 +1735,7 @@ function samp.onServerMessage(color, text)
                     if not profile.groups then profile.groups = {} end
                     if not profile.groups[gId] then
                         profile.groups[gId] = { name = gName, members = {}, history = {} }
+                        table.insert(profile.groups[gId].history, {sender = "them", msg = "[Система] Вас добавили в группу", timestamp = os.time()})
                     end
                     for n in gNums:gmatch("%d+") do
                         profile.groups[gId].members[n] = true
@@ -1746,6 +1749,17 @@ function samp.onServerMessage(color, text)
                 if gId and profile.groups and profile.groups[gId] then
                     profile.groups[gId].members[inc_num] = nil
                     save_all_data()
+                end
+            elseif cmd == "GRP_DEL" then
+                local gId = payload:match("^(%w+)")
+                if gId and profile.groups and profile.groups[gId] then
+                    profile.groups[gId] = nil
+                    profile.unread[gId] = nil
+                    if profile.muted then profile.muted[gId] = nil end
+                    if profile.drafts then profile.drafts[gId] = nil end
+                    if activeContact == gId then activeContact = nil end
+                    save_all_data()
+                    needSortContacts = true
                 end
             end
             return
@@ -2873,10 +2887,12 @@ local newFrame = imgui.OnFrame(
             imgui.BeginChild("ContactsList", imgui.ImVec2(0, 0), true)
             
             local sContactText = cp1251_lower(u8:decode(ffi.string(UI.inputSearchContact)))
+            local deleteGroupNum = nil
             
             for _, c in ipairs(cachedSortedContacts) do
                 local num = c.num
                 local name = c.name
+                local isGroup = profile.groups and profile.groups[num]
                 
                 local skipContact = false
                 if sContactText ~= "" then
@@ -2887,6 +2903,8 @@ local newFrame = imgui.OnFrame(
                         localDisplay = cp1251_lower(u8:decode(u8"Банк"))
                     elseif num == "System_News" then 
                         localDisplay = cp1251_lower(u8:decode(u8"Уведомления"))
+                    elseif isGroup then
+                        localDisplay = cp1251_lower(u8:decode(u8"[Группа] " .. u8(name)))
                     else 
                         localDisplay = lowerName == "" and ("#" .. lowerNum) or (lowerName .. " (" .. lowerNum .. ")")
                     end
@@ -2908,14 +2926,13 @@ local newFrame = imgui.OnFrame(
                         is_unread = false
                     end
                     
-                    local isGroup = profile.groups and profile.groups[num]
                     local displayName = ""
                     if num == "Bank_System" then
                         displayName = u8"Банк"
                     elseif num == "System_News" then
                         displayName = u8"Уведомления"
                     elseif isGroup then
-                        displayName = u8"[Группа] " .. u8(profile.groups[num].name)
+                        displayName = u8"[Группа] " .. u8(name)
                     else
                         displayName = (name == "" and "#" .. num or u8(name) .. " (" .. num .. ")")
                     end
@@ -2960,7 +2977,6 @@ local newFrame = imgui.OnFrame(
                             end
                             imgui.Separator()
                         end
-                        
                         if num == "System_News" then
                             if imgui.Selectable(u8"Очистить историю") then
                                 local nhist = profile.history[num]
@@ -2972,7 +2988,9 @@ local newFrame = imgui.OnFrame(
                                     if p.muted then p.muted[num] = nil end
                                     if p.drafts then p.drafts[num] = nil end
                                 end
-                                if activeContact == num then activeContact = nil end
+                                if activeContact == num then
+                                    activeContact = nil
+                                end
                                 save_all_data()
                                 needSortContacts = true
                             end
@@ -2981,8 +2999,8 @@ local newFrame = imgui.OnFrame(
                             if imgui.Selectable(muteText) then
                                 if not profile.muted then profile.muted = {} end
                                 profile.muted[num] = not profile.muted[num]
-                                if profile.muted[num] and Sys.activeNotification and Sys.activeNotification.number == num then
-                                    Sys.activeNotification = nil
+                                if profile.muted[num] then
+                                    if Sys.activeNotification and Sys.activeNotification.number == num then Sys.activeNotification = nil end
                                 end
                                 save_all_data()
                             end
@@ -3001,8 +3019,8 @@ local newFrame = imgui.OnFrame(
                             if imgui.Selectable(muteText) then
                                 if not profile.muted then profile.muted = {} end
                                 profile.muted[num] = not profile.muted[num]
-                                if profile.muted[num] and Sys.activeNotification and Sys.activeNotification.number == num then
-                                    Sys.activeNotification = nil
+                                if profile.muted[num] then
+                                    if Sys.activeNotification and Sys.activeNotification.number == num then Sys.activeNotification = nil end
                                 end
                                 save_all_data()
                             end
@@ -3013,17 +3031,8 @@ local newFrame = imgui.OnFrame(
                                 save_all_data()
                                 needSortContacts = true
                             end
-                            if imgui.Selectable(u8"Удалить группу") then
-                                for memNum, _ in pairs(profile.groups[num].members) do
-                                    table.insert(groupSmsQueue, {num = memNum, text = "!GRP_LV|" .. num, groupId = num})
-                                end
-                                profile.groups[num] = nil
-                                profile.unread[num] = nil
-                                if profile.muted then profile.muted[num] = nil end
-                                if profile.drafts then profile.drafts[num] = nil end
-                                if activeContact == num then activeContact = nil end
-                                save_all_data()
-                                needSortContacts = true
+                            if imgui.Selectable(u8"Удалить группу у всех") then
+                                deleteGroupNum = num
                             end
                         else
                             if imgui.Selectable(u8"Изменить") then
@@ -3037,15 +3046,17 @@ local newFrame = imgui.OnFrame(
                                 sampSendChat("/call " .. num)
                                 UI.windowState[0] = false 
                             end
+                            
                             local muteText = profile.muted and profile.muted[num] and u8"Включить уведомления" or u8"Отключить уведомления"
                             if imgui.Selectable(muteText) then
                                 if not profile.muted then profile.muted = {} end
                                 profile.muted[num] = not profile.muted[num]
-                                if profile.muted[num] and Sys.activeNotification and Sys.activeNotification.number == num then
-                                    Sys.activeNotification = nil
+                                if profile.muted[num] then
+                                    if Sys.activeNotification and Sys.activeNotification.number == num then Sys.activeNotification = nil end
                                 end
                                 save_all_data()
                             end
+                            
                             imgui.Separator()
                             if imgui.Selectable(u8"Очистить историю") then
                                 profile.history[num] = nil
@@ -3070,16 +3081,12 @@ local newFrame = imgui.OnFrame(
                     end
                     
                     local active_theme_render = GetActiveTheme()
-                    
                     local dl = imgui.GetWindowDrawList()
                     local bg_color = imgui.ImVec4(0, 0, 0, 0)
-                    
                     local is_muted = profile.muted and profile.muted[num]
                     
-                    if is_selected then
-                        bg_color = active_theme_render.me
-                    elseif is_hovered then
-                        bg_color = imgui.ImVec4(active_theme_render.me.x, active_theme_render.me.y, active_theme_render.me.z, 0.6)
+                    if is_selected then bg_color = active_theme_render.me
+                    elseif is_hovered then bg_color = imgui.ImVec4(active_theme_render.me.x, active_theme_render.me.y, active_theme_render.me.z, 0.6)
                     elseif is_unread then
                         if is_muted then
                             local m_col = active_theme_render.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0)
@@ -3093,7 +3100,6 @@ local newFrame = imgui.OnFrame(
                     
                     dl:AddRectFilled(p_min, p_max, imgui.GetColorU32Vec4(bg_color), 8.0)
                     
-                    
                     local time_str = ""
                     local snippet = ""
                     local hist = isGroup and profile.groups[num].history or (profile.history and profile.history[num])
@@ -3105,8 +3111,7 @@ local newFrame = imgui.OnFrame(
                     if last_sms_ts > 0 or last_call_ts > 0 then
                         if last_sms_ts >= last_call_ts then
                             time_str = formatMessageTime(last_sms_ts)
-                            if num == "Bank_System" then
-                                snippet = u8"Вам пришла выписка из банка"
+                            if num == "Bank_System" then snippet = u8"Вам пришла выписка из банка"
                             elseif num == "System_News" then
                                 local prefix = (hist[#hist].sender == "me") and u8"Вы: " or ""
                                 snippet = prefix .. u8(hist[#hist].msg):gsub("\n", " ")
@@ -3131,15 +3136,6 @@ local newFrame = imgui.OnFrame(
                     if isVerified then
                         local badge_center = imgui.ImVec2(p_min.x + nextOffset + (12 * scale), p_min.y + (6 * scale) + imgui.GetTextLineHeight() / 2)
                         DrawVerificationBadge(dl, badge_center, 6.0 * scale, scale)
-                        
-                        local ret_pos = imgui.GetCursorScreenPos()
-                        imgui.SetCursorScreenPos(imgui.ImVec2(badge_center.x - 8, badge_center.y - 8))
-                        imgui.InvisibleButton("BadgeHint_" .. num, imgui.ImVec2(16, 16))
-                        if imgui.IsItemHovered() then
-                            imgui.SetTooltip(u8"Этот контакт официально верифицирован.")
-                        end
-                        imgui.SetCursorScreenPos(ret_pos)
-                        
                         nextOffset = nextOffset + (22 * scale)
                     end
 
@@ -3174,9 +3170,7 @@ local newFrame = imgui.OnFrame(
                         local badge_x = p_max.x - badgeW - (10 * scale)
                         local badge_y = p_min.y + (8 * scale) + imgui.GetTextLineHeight()
                         
-                        local is_muted = profile.muted and profile.muted[num]
                         local badgeColor = is_muted and active_theme_render.muted or active_theme_render.warn
-                        
                         dl:AddRectFilled(imgui.ImVec2(badge_x, badge_y), imgui.ImVec2(badge_x + badgeW, badge_y + badgeH), imgui.GetColorU32Vec4(badgeColor), 10.0 * scale)
                         
                         local text_px = badge_x + (badgeW - badgeTextSize.x) / 2
@@ -3192,7 +3186,6 @@ local newFrame = imgui.OnFrame(
                         local draftLabelW = imgui.CalcTextSize(draftLabel).x
                         local draftCol = active_theme_render.draft or imgui.ImVec4(0.8, 0.4, 0.4, 1.0)
                         dl:AddText(imgui.ImVec2(p_min.x + 10, p_min.y + 6 + imgui.GetTextLineHeight() + 2), imgui.GetColorU32Vec4(draftCol), draftLabel)
-                        
                         local draftText = u8(profile.drafts[num]):gsub("\n", " ")
                         local trunc_snippet = truncateToLastWord(draftText, snippet_max_w - draftLabelW)
                         dl:AddText(imgui.ImVec2(p_min.x + 10 + draftLabelW, p_min.y + 6 + imgui.GetTextLineHeight() + 2), imgui.GetColorU32Vec4(imgui.ImVec4(0.65, 0.65, 0.65, 1.0)), trunc_snippet)
@@ -3202,10 +3195,23 @@ local newFrame = imgui.OnFrame(
                     end
                     
                     imgui.SetCursorPosY(imgui.GetCursorPosY() + (4 * scale))
-                    
                     imgui.PopID()
                 end
             end
+            
+            if deleteGroupNum then
+                for memNum, _ in pairs(profile.groups[deleteGroupNum].members) do
+                    table.insert(groupSmsQueue, {num = memNum, text = "!GRP_DEL|" .. deleteGroupNum, groupId = deleteGroupNum})
+                end
+                profile.groups[deleteGroupNum] = nil
+                profile.unread[deleteGroupNum] = nil
+                if profile.muted then profile.muted[deleteGroupNum] = nil end
+                if profile.drafts then profile.drafts[deleteGroupNum] = nil end
+                if activeContact == deleteGroupNum then activeContact = nil end
+                save_all_data()
+                needSortContacts = true
+            end
+
             imgui.EndChild()
 
             imgui.NextColumn()
@@ -3213,12 +3219,26 @@ local newFrame = imgui.OnFrame(
             if activeContact then
                 local isGroup = profile.groups and profile.groups[activeContact]
                 local contactName = ""
+                local tooltipText = nil
+                
                 if activeContact == "Bank_System" then
                     contactName = u8"Банк"
                 elseif activeContact == "System_News" then
                     contactName = u8"Уведомления"
                 elseif isGroup then
-                    contactName = u8"[Группа] " .. u8(profile.groups[activeContact].name)
+                    local memCount = 1
+                    local memListStr = u8"Вы\n"
+                    for mNum, _ in pairs(profile.groups[activeContact].members) do
+                        memCount = memCount + 1
+                        local mName = profile.contacts[mNum]
+                        if mName and mName ~= "" then
+                            memListStr = memListStr .. u8(mName) .. " (" .. mNum .. ")\n"
+                        else
+                            memListStr = memListStr .. mNum .. "\n"
+                        end
+                    end
+                    contactName = u8"[Группа] " .. u8(profile.groups[activeContact].name) .. " (" .. memCount .. u8" уч.)"
+                    tooltipText = memListStr
                 else
                     local rawName = profile.contacts[activeContact] or ""
                     contactName = (rawName == "" and "#" .. activeContact or u8(rawName))
@@ -3228,6 +3248,9 @@ local newFrame = imgui.OnFrame(
                 
                 imgui.AlignTextToFramePadding()
                 imgui.Text(u8"Диалог: " .. contactName)
+                if tooltipText and imgui.IsItemHovered() then
+                    imgui.SetTooltip(u8"Участники:\n" .. tooltipText)
+                end
                 
                 local isVerifiedChat = (isSystemChat or (profile.verified and profile.verified[activeContact]))
                 if isVerifiedChat then
