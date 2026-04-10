@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.82
+local script_version = 1.83
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -1033,21 +1033,45 @@ function main()
 	sampRegisterChatCommand("testgroup", function(param)
         local action, rest = param:match("^(%w+)%s*(.*)")
         if not action then
-            sampAddChatMessage("Формат: /testgroup create [номер_друга] [ID_группы] [Имя_группы]", 0xFFCC00)
-            sampAddChatMessage("Формат: /testgroup send [ID_группы] [Текст]", 0xFFCC00)
+            sampAddChatMessage("Формат: /testgroup create [ТвойНомер] [ID] [НомераДрузей_через_запятую] [Имя]", 0xFFCC00)
+            sampAddChatMessage("Формат: /testgroup send [ID] [Текст]", 0xFFCC00)
             return
         end
         
         local profile = phoneData[myNick]
         if action == "create" then
-            local target, gId, gName = rest:match("^(%d+)%s+(%w+)%s+(.*)")
-            if target and gId and gName then
+            local myNum, gId, numsStr, gName = rest:match("^(%d+)%s+(%w+)%s+([%d%,]+)%s+(.*)")
+            if myNum and gId and numsStr and gName then
+                local membersList = {}
+                for n in numsStr:gmatch("%d+") do
+                    table.insert(membersList, n)
+                end
+                
+                if #membersList > 3 then
+                    sampAddChatMessage("Ошибка: максимум 3 друга в группе!", 0xFF0000)
+                    return
+                end
+                
                 if not profile.groups then profile.groups = {} end
-                profile.groups[gId] = { name = gName, members = {[target]=true}, history = {} }
+                local profileMembers = {}
+                for _, n in ipairs(membersList) do profileMembers[n] = true end
+                
+                profile.groups[gId] = { name = gName, members = profileMembers, history = {} }
                 save_all_data()
                 needSortContacts = true
-                sampSendChat("/sms " .. target .. " !GRP_INV|" .. gId .. "|" .. target .. "|" .. gName)
-                sampAddChatMessage("Группа создана! Приглашение отправлено.", 0x00FF00)
+                
+                for i, targetNum in ipairs(membersList) do
+                    local payloadMembers = {myNum}
+                    for j, otherNum in ipairs(membersList) do
+                        if i ~= j then table.insert(payloadMembers, otherNum) end
+                    end
+                    local payloadStr = table.concat(payloadMembers, ",")
+                    table.insert(groupSmsQueue, {num = targetNum, text = "!GRP_INV|" .. gId .. "|" .. payloadStr .. "|" .. gName, groupId = gId})
+                end
+                
+                sampAddChatMessage("Группа '"..gName.."' создана! Инвайты отправляются в очередь.", 0x00FF00)
+            else
+                sampAddChatMessage("Ошибка! Пример: /testgroup create 9999 A1B2 1111,2222 Банда", 0xFF0000)
             end
         elseif action == "send" then
             local gId, text = rest:match("^(%w+)%s+(.*)")
@@ -1059,6 +1083,8 @@ function main()
                     table.insert(groupSmsQueue, {num = memNum, text = "#" .. gId .. " " .. text, groupId = gId})
                 end
                 sampAddChatMessage("Сообщение добавлено в очередь рассылки!", 0x00FF00)
+            else
+                sampAddChatMessage("Группа не найдена или ошибка ввода.", 0xFF0000)
             end
         end
     end)
@@ -1697,10 +1723,9 @@ function samp.onServerMessage(color, text)
                         profile.groups[gId] = { name = gName, members = {}, history = {} }
                     end
                     for n in gNums:gmatch("%d+") do
-                        if n ~= myNick and n ~= actualPlayerNick then
-                            profile.groups[gId].members[n] = true
-                        end
+                        profile.groups[gId].members[n] = true
                     end
+                    profile.groups[gId].members[inc_num] = true
                     save_all_data()
                     needSortContacts = true
                 end
@@ -1710,6 +1735,19 @@ function samp.onServerMessage(color, text)
                     profile.groups[gId].members[inc_num] = nil
                     save_all_data()
                 end
+            end
+            return
+        end
+
+        local gId, real_text = inc_text:match("^#(%w+) (.*)")
+        if gId and profile.groups and profile.groups[gId] then
+            table.insert(profile.groups[gId].history, {sender = inc_num, msg = real_text, timestamp = ts})
+            profile.unread[gId] = (type(profile.unread[gId]) == "number" and profile.unread[gId] or 0) + 1
+            save_all_data()
+            needSortContacts = true
+            if myNick == actualPlayerNick and activeContact == gId then UI.scrollToBottom = true end
+            if not profile.muted[gId] and globalSettings.useScreenNotifications and not globalSettings.dndMode then
+                Sys.activeNotification = { number = gId, name = profile.groups[gId].name, text = real_text, time = os.clock() }
             end
             return
         end
@@ -2754,17 +2792,21 @@ local newFrame = imgui.OnFrame(
                 end
                 if profile.history and profile.history["Bank_System"] then uniqueNumbers["Bank_System"] = true end
                 if profile.history and profile.history["System_News"] then uniqueNumbers["System_News"] = true end
+                if profile.groups then
+                    for gId, _ in pairs(profile.groups) do uniqueNumbers[gId] = true end
+                end
                 
                 for num, _ in pairs(uniqueNumbers) do
-                    local name = profile.contacts[num] or ""
+                    local isGroup = profile.groups and profile.groups[num]
+                    local name = isGroup and profile.groups[num].name or (profile.contacts[num] or "")
                     local hasName = (name ~= "")
-                    local hist = profile.history and profile.history[num]
+                    local hist = isGroup and profile.groups[num].history or (profile.history and profile.history[num])
                     local hasHistory = (hist and #hist > 0)
                     local calls = profile.calls and profile.calls[num]
                     local hasCalls = (calls and #calls > 0)
                     local isSystem = (num == "Bank_System" or num == "System_News")
                     
-                    if hasName or hasHistory or hasCalls or isSystem then
+                    if hasName or hasHistory or hasCalls or isSystem or isGroup then
                         local last_ts = 0
                         if hasHistory then
                             last_ts = hist[#hist].timestamp or 0
@@ -2839,11 +2881,14 @@ local newFrame = imgui.OnFrame(
                         is_unread = false
                     end
                     
+                    local isGroup = profile.groups and profile.groups[num]
                     local displayName = ""
                     if num == "Bank_System" then
                         displayName = u8"Банк"
                     elseif num == "System_News" then
                         displayName = u8"Уведомления"
+                    elseif isGroup then
+                        displayName = u8"[Группа] " .. u8(profile.groups[num].name)
                     else
                         displayName = (name == "" and "#" .. num or u8(name) .. " (" .. num .. ")")
                     end
@@ -3006,7 +3051,7 @@ local newFrame = imgui.OnFrame(
                     
                     local time_str = ""
                     local snippet = ""
-                    local hist = profile.history and profile.history[num]
+                    local hist = isGroup and profile.groups[num].history or (profile.history and profile.history[num])
                     local calls = profile.calls and profile.calls[num]
                     
                     local last_sms_ts = (hist and #hist > 0) and hist[#hist].timestamp or 0
@@ -3121,12 +3166,14 @@ local newFrame = imgui.OnFrame(
             imgui.NextColumn()
 
             if activeContact then
-                
+                local isGroup = profile.groups and profile.groups[activeContact]
                 local contactName = ""
                 if activeContact == "Bank_System" then
                     contactName = u8"Банк"
                 elseif activeContact == "System_News" then
                     contactName = u8"Уведомления"
+                elseif isGroup then
+                    contactName = u8"[Группа] " .. u8(profile.groups[activeContact].name)
                 else
                     local rawName = profile.contacts[activeContact] or ""
                     contactName = (rawName == "" and "#" .. activeContact or u8(rawName))
@@ -3428,7 +3475,7 @@ local newFrame = imgui.OnFrame(
                 else
                     imgui.BeginChild("ChatHistory", imgui.ImVec2(0, -40 * scale), true)
                     
-                    local currentHistory = profile.history[activeContact]
+                    local currentHistory = isGroup and profile.groups[activeContact].history or profile.history[activeContact]
                     local deleteMsgIndex = nil
                     
                     if currentHistory then
@@ -3457,6 +3504,14 @@ local newFrame = imgui.OnFrame(
                                 local urls = {}
                                 local foundUrls = {}
                                 local textToDisplay = text
+                                
+                                if isGroup and msgData.sender ~= "me" then
+                                    local sName = profile.contacts[msgData.sender]
+                                    sName = (sName and sName ~= "") and sName or msgData.sender
+                                    local isVer = profile.verified and profile.verified[msgData.sender]
+                                    local prefix = u8(tostring(sName)) .. (isVer and u8" [V]" or "") .. ": "
+                                    textToDisplay = prefix .. textToDisplay
+                                end
                                 
                                 for word in text:gmatch("%S+") do
                                     local isUrl = false
@@ -3948,10 +4003,23 @@ local newFrame = imgui.OnFrame(
 function sendMessage(number)
     local text = u8:decode(ffi.string(UI.inputMessage))
     if text ~= "" then
-        sampSendChat("/sms " .. number .. " " .. text)
+        local profile = phoneData[myNick]
+        local isGroup = profile and profile.groups and profile.groups[number]
+        
+        if isGroup then
+            table.insert(profile.groups[number].history, {sender = "me", msg = text, timestamp = os.time()})
+            for memNum, _ in pairs(profile.groups[number].members) do
+                table.insert(groupSmsQueue, {num = memNum, text = "#" .. number .. " " .. text, groupId = number})
+            end
+            save_all_data()
+            needSortContacts = true
+        else
+            sampSendChat("/sms " .. number .. " " .. text)
+        end
+        
         UI.inputMessage[0] = 0
-        if phoneData[myNick] and phoneData[myNick].drafts then
-            phoneData[myNick].drafts[number] = nil
+        if profile and profile.drafts then
+            profile.drafts[number] = nil
         end
         UI.scrollToBottom = true
         UI.requestFocus = true
