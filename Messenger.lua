@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.81
+local script_version = 1.82
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -39,6 +39,27 @@ local oldDataFile = getWorkingDirectory() .. '\\config\\messenger_data.json'
 local oldSettingsFile = getWorkingDirectory() .. '\\config\\messenger_settings.json'
 
 local phoneData = {}
+local groupSmsQueue = {}
+local lastGroupSmsTime = 0
+local lastAttemptedGroupNum = nil
+local lastAttemptedGroupId = nil
+local cacheFolder = getWorkingDirectory() .. '\\config\\messenger_cache\\'
+pcall(lfs.mkdir, cacheFolder)
+local cacheClearTimer = 0
+local cacheCleared = false
+
+local function isImageSafe(path)
+    local f = io.open(path, "rb")
+    if not f then return false end
+    local bytes = f:read(4)
+    f:close()
+    if not bytes then return false end
+    local b1, b2, b3, b4 = bytes:byte(1, 4)
+    if b1 == 0x89 and b2 == 0x50 and b3 == 0x4E and b4 == 0x47 then return true end
+    if b1 == 0xFF and b2 == 0xD8 and b3 == 0xFF then return true end
+    if b1 == 0x47 and b2 == 0x49 and b3 == 0x46 then return true end
+    return false
+end
 local imageCache = {}
 local imageCacheKeys = {}
 local activeTempFiles = {}
@@ -356,10 +377,16 @@ end
 
 local function cleanupGhostFiles()
     local cfgPath = getWorkingDirectory() .. '\\config\\'
+    pcall(lfs.mkdir, cacheFolder)
     pcall(function()
+        for file in lfs.dir(cacheFolder) do
+            if file ~= "." and file ~= ".." then
+                pcall(os.remove, cacheFolder .. file)
+            end
+        end
         for file in lfs.dir(cfgPath) do
             if type(file) == 'string' then
-                if file:match("^img_%d+%.%a+$") or file:match("%.tmp$") or file:match("^msg_update_%d+%.json$") or file:match("^msg_changelog_%d+%.txt$") or file:match("^temp_news_%d+%.txt$") then
+                if file:match("%.tmp$") or file:match("^msg_update_%d+%.json$") or file:match("^msg_changelog_%d+%.txt$") or file:match("^temp_news_%d+%.txt$") or file:match("^verify_%d+%.json$") then
                     pcall(os.remove, cfgPath .. file)
                 end
             end
@@ -652,6 +679,14 @@ local function downloadImageToCache(url)
             lua_thread.create(function()
                 wait(150)
                 if doesFileExist(tempPath) then
+                    if not isImageSafe(tempPath) then
+                        pcall(os.remove, tempPath)
+                        activeTempFiles[tempPath] = nil
+                        imageCache[url] = { status = 3 }
+                        UI.scrollToBottom = true
+                        return
+                    end
+                    
                     local rtex = renderLoadTextureFromFile(tempPath)
                     if rtex then
                         local tex_w, tex_h = renderGetTextureSize(rtex)
@@ -994,6 +1029,39 @@ function main()
             end
         end
     end)
+	
+	sampRegisterChatCommand("testgroup", function(param)
+        local action, rest = param:match("^(%w+)%s*(.*)")
+        if not action then
+            sampAddChatMessage("Формат: /testgroup create [номер_друга] [ID_группы] [Имя_группы]", 0xFFCC00)
+            sampAddChatMessage("Формат: /testgroup send [ID_группы] [Текст]", 0xFFCC00)
+            return
+        end
+        
+        local profile = phoneData[myNick]
+        if action == "create" then
+            local target, gId, gName = rest:match("^(%d+)%s+(%w+)%s+(.*)")
+            if target and gId and gName then
+                if not profile.groups then profile.groups = {} end
+                profile.groups[gId] = { name = gName, members = {[target]=true}, history = {} }
+                save_all_data()
+                needSortContacts = true
+                sampSendChat("/sms " .. target .. " !GRP_INV|" .. gId .. "|" .. target .. "|" .. gName)
+                sampAddChatMessage("Группа создана! Приглашение отправлено.", 0x00FF00)
+            end
+        elseif action == "send" then
+            local gId, text = rest:match("^(%w+)%s+(.*)")
+            if gId and text and profile.groups and profile.groups[gId] then
+                table.insert(profile.groups[gId].history, {sender = "me", msg = text, timestamp = os.time()})
+                save_all_data()
+                needSortContacts = true
+                for memNum, _ in pairs(profile.groups[gId].members) do
+                    table.insert(groupSmsQueue, {num = memNum, text = "#" .. gId .. " " .. text, groupId = gId})
+                end
+                sampAddChatMessage("Сообщение добавлено в очередь рассылки!", 0x00FF00)
+            end
+        end
+    end)
 
     local result, myId = sampGetPlayerIdByCharHandle(PLAYER_PED)
     if result then
@@ -1022,6 +1090,7 @@ function main()
         if not pData.muted then pData.muted = {} end
         if not pData.drafts then pData.drafts = {} end
         if not pData.calls then pData.calls = {} end
+		if not pData.groups then pData.groups = {} end
         
         pData.history["System_News"] = master_news_hist
         pData.contacts["System_News"] = "Уведомления"
@@ -1040,7 +1109,7 @@ function main()
     end
     
     if myNick ~= "Default" and myNick:find("_") and not phoneData[myNick] then
-        phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
+        phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {} }
         phoneData[myNick].history["System_News"] = master_news_hist
         phoneData[myNick].contacts["System_News"] = "Уведомления"
         save_all_data()
@@ -1193,6 +1262,14 @@ function main()
     while true do
         wait(0)
         
+		if #groupSmsQueue > 0 and (os.clock() - lastGroupSmsTime > 1.5) then
+            local task = table.remove(groupSmsQueue, 1)
+            sampSendChat("/sms " .. task.num .. " " .. task.text)
+            lastAttemptedGroupNum = task.num
+            lastAttemptedGroupId = task.groupId
+            lastGroupSmsTime = os.clock()
+        end
+		
         if os.clock() - lastNickCheck > 1.0 then
             lastNickCheck = os.clock()
             
@@ -1224,7 +1301,7 @@ function main()
                             needSortContacts = true
                             
                             if not phoneData[myNick] then
-                                phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
+                                phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {} }
                                 local m_hist = nil
                                 for _, p in pairs(phoneData) do
                                     if p.history and p.history["System_News"] then m_hist = p.history["System_News"] break end
@@ -1410,6 +1487,17 @@ function samp.onServerMessage(color, text)
     local ts = os.time()
     
     local plain_text = text:gsub("{%x%x%x%x%x%x}", "")
+	
+	if plain_text:find("Сообщение не отправлено%. Абонент вне зоны действия сети") then
+        if lastAttemptedGroupId and lastAttemptedGroupNum and (os.clock() - lastGroupSmsTime < 2.0) then
+            if profile.groups and profile.groups[lastAttemptedGroupId] then
+                profile.groups[lastAttemptedGroupId].members[lastAttemptedGroupNum] = nil
+                save_all_data()
+                showSystemNotification(u8"Номер " .. lastAttemptedGroupNum .. u8" удален из группы (недоступен).", 3)
+            end
+        end
+        return false
+    end
     
     local is_incoming = plain_text:match("^%s*%[Телефон%] Входящий вызов%.%.%.")
     local out_match = plain_text:match("^%s*%[Телефон%] Исходящий вызов (%d+)%.%.%.")
@@ -1599,6 +1687,46 @@ function samp.onServerMessage(color, text)
     end
     
     if inc_num and inc_text then
+		local cmd, payload = inc_text:match("^!(GRP_[A-Z]+)%|(.*)")
+        if cmd then
+            if cmd == "GRP_INV" then
+                local gId, gNums, gName = payload:match("^(%w+)%|([%d%,]+)%|(.*)")
+                if gId then
+                    if not profile.groups then profile.groups = {} end
+                    if not profile.groups[gId] then
+                        profile.groups[gId] = { name = gName, members = {}, history = {} }
+                    end
+                    for n in gNums:gmatch("%d+") do
+                        if n ~= myNick and n ~= actualPlayerNick then
+                            profile.groups[gId].members[n] = true
+                        end
+                    end
+                    save_all_data()
+                    needSortContacts = true
+                end
+            elseif cmd == "GRP_LV" then
+                local gId = payload:match("^(%w+)")
+                if gId and profile.groups and profile.groups[gId] then
+                    profile.groups[gId].members[inc_num] = nil
+                    save_all_data()
+                end
+            end
+            return
+        end
+
+        local gId, real_text = inc_text:match("^#(%w+) (.*)")
+        if gId and profile.groups and profile.groups[gId] then
+            table.insert(profile.groups[gId].history, {sender = inc_num, msg = real_text, timestamp = ts})
+            profile.unread[gId] = (type(profile.unread[gId]) == "number" and profile.unread[gId] or 0) + 1
+            save_all_data()
+            needSortContacts = true
+            if myNick == actualPlayerNick and activeContact == gId then UI.scrollToBottom = true end
+            if not profile.muted[gId] and globalSettings.useScreenNotifications and not globalSettings.dndMode then
+                Sys.activeNotification = { number = gId, name = profile.groups[gId].name, text = real_text, time = os.clock() }
+            end
+            return
+        end
+
         local is_dup = false
         if is_unread and profile.history[inc_num] then
             local hist = profile.history[inc_num]
@@ -2199,7 +2327,7 @@ local newFrame = imgui.OnFrame(
 						if actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
 							myNick = actualNick
 							if not phoneData[myNick] then
-								phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
+								phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {} }
 								local m_hist = nil
 								for nick, p in pairs(phoneData) do if nick ~= myNick and p.history["System_News"] then m_hist = p.history["System_News"] break end end
 								phoneData[myNick].history["System_News"] = m_hist or {}
@@ -2549,22 +2677,29 @@ local newFrame = imgui.OnFrame(
                         return
                     end
                     
-                    wait(800) 
-                    
-                    if sampTextdrawIsExists(327) then
-                        sampSendClickTextdraw(327)
-                    end
-                    
-                    for td = 0, 2304 do
-                        if sampTextdrawIsExists(td) then
-                            local txt = sampTextdrawGetString(td)
-                            if type(txt) == "string" then
-                                local clean = txt:upper()
-                                if clean:find("MESSAGE") or clean:find("СООБЩЕНИЯ") then
+                    local appFound = false
+                    for i = 1, 50 do
+                        wait(50)
+                        -- Перебираем текстдравы с конца, чтобы кликнуть по верхнему слою (кнопке)
+                        for td = 2304, 0, -1 do
+                            if sampTextdrawIsExists(td) then
+                                local posX, posY = sampTextdrawGetPos(td)
+                                -- Ищем иконку сообщений в доке (правый нижний угол)
+                                if posX >= 529.0 and posX <= 533.0 and posY >= 407.0 and posY <= 411.0 then
                                     sampSendClickTextdraw(td)
+                                    appFound = true
+                                    break
                                 end
                             end
                         end
+                        if appFound then break end
+                    end
+
+                    if not appFound then
+                        showSystemNotification(u8"Ошибка: иконка сообщений не появилась.", 2)
+                        Macro.autoCleaning = false
+                        UI.windowState[0] = true
+                        return
                     end
                     
                     Macro.cleanStep = 2
@@ -3113,22 +3248,27 @@ local newFrame = imgui.OnFrame(
                                     return
                                 end
                                 
-                                wait(800) 
-                                
-                                if sampTextdrawIsExists(327) then
-                                    sampSendClickTextdraw(327)
-                                end
-                                
-                                for td = 0, 2304 do
-                                    if sampTextdrawIsExists(td) then
-                                        local txt = sampTextdrawGetString(td)
-                                        if type(txt) == "string" then
-                                            local clean = txt:upper()
-                                            if clean:find("MESSAGE") or clean:find("СООБЩЕНИЯ") then
+                                local appFound = false
+                                for i = 1, 50 do
+                                    wait(50)
+                                    for td = 2304, 0, -1 do
+                                        if sampTextdrawIsExists(td) then
+                                            local posX, posY = sampTextdrawGetPos(td)
+                                            if posX >= 529.0 and posX <= 533.0 and posY >= 407.0 and posY <= 411.0 then
                                                 sampSendClickTextdraw(td)
+                                                appFound = true
+                                                break
                                             end
                                         end
                                     end
+                                    if appFound then break end
+                                end
+
+                                if not appFound then
+                                    showSystemNotification(u8"Ошибка: иконка сообщений не появилась.", 2)
+                                    Macro.autoGeo = false
+                                    UI.windowState[0] = true
+                                    return
                                 end
                                 
                                 Macro.geoStep = 2
