@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.83
+local script_version = 1.84
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -16,6 +16,16 @@ local io = require 'io'
 local ffi = require 'ffi'
 
 math.randomseed(os.time())
+
+local function generateGroupId()
+    local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    local id = ""
+    for i = 1, 6 do
+        local r = math.random(1, #chars)
+        id = id .. chars:sub(r, r)
+    end
+    return id
+end
 
 ffi.cdef[[
     void* ShellExecuteA(void* hwnd, const char* lpOperation, const char* lpFile, const char* lpParameters, const char* lpDirectory, int nShowCmd);
@@ -102,6 +112,7 @@ local lastSmsPhone = nil
 local lastSmsIsUnread = false
 local lastSmsIsDup = false
 local lastSmsSysTime = 0
+local lastSmsGroupId = nil
 
 local cachedSortedContacts = {}
 local needSortContacts = true
@@ -1040,8 +1051,8 @@ function main()
         
         local profile = phoneData[myNick]
         if action == "create" then
-            local myNum, gId, numsStr, gName = rest:match("^(%d+)%s+(%w+)%s+([%d%,]+)%s+(.*)")
-            if myNum and gId and numsStr and gName then
+            local myNum, numsStr, gName = rest:match("^(%d+)%s+([%d%,]+)%s+(.*)")
+            if myNum and numsStr and gName then
                 local membersList = {}
                 for n in numsStr:gmatch("%d+") do
                     table.insert(membersList, n)
@@ -1052,6 +1063,7 @@ function main()
                     return
                 end
                 
+                local gId = generateGroupId()
                 if not profile.groups then profile.groups = {} end
                 local profileMembers = {}
                 for _, n in ipairs(membersList) do profileMembers[n] = true end
@@ -1069,9 +1081,9 @@ function main()
                     table.insert(groupSmsQueue, {num = targetNum, text = "!GRP_INV|" .. gId .. "|" .. payloadStr .. "|" .. gName, groupId = gId})
                 end
                 
-                sampAddChatMessage("Группа '"..gName.."' создана! Инвайты отправляются в очередь.", 0x00FF00)
+                sampAddChatMessage("Группа '"..gName.."' (ID: "..gId..") создана! Инвайты отправляются.", 0x00FF00)
             else
-                sampAddChatMessage("Ошибка! Пример: /testgroup create 9999 A1B2 1111,2222 Банда", 0xFF0000)
+                sampAddChatMessage("Ошибка! Пример: /testgroup create 9999 1111,2222 Банда", 0xFF0000)
             end
         elseif action == "send" then
             local gId, text = rest:match("^(%w+)%s+(.*)")
@@ -1745,24 +1757,18 @@ function samp.onServerMessage(color, text)
             profile.unread[gId] = (type(profile.unread[gId]) == "number" and profile.unread[gId] or 0) + 1
             save_all_data()
             needSortContacts = true
+            
+            lastSmsPhone = inc_num
+            lastSmsGroupId = gId
+            lastSmsSysTime = os.clock()
+            lastSmsIsDup = false
+            lastSmsIsUnread = false
+            
             if myNick == actualPlayerNick and activeContact == gId then UI.scrollToBottom = true end
             if not profile.muted[gId] and globalSettings.useScreenNotifications and not globalSettings.dndMode then
                 Sys.activeNotification = { number = gId, name = profile.groups[gId].name, text = real_text, time = os.clock() }
             end
-            return
-        end
-
-        local gId, real_text = inc_text:match("^#(%w+) (.*)")
-        if gId and profile.groups and profile.groups[gId] then
-            table.insert(profile.groups[gId].history, {sender = inc_num, msg = real_text, timestamp = ts})
-            profile.unread[gId] = (type(profile.unread[gId]) == "number" and profile.unread[gId] or 0) + 1
-            save_all_data()
-            needSortContacts = true
-            if myNick == actualPlayerNick and activeContact == gId then UI.scrollToBottom = true end
-            if not profile.muted[gId] and globalSettings.useScreenNotifications and not globalSettings.dndMode then
-                Sys.activeNotification = { number = gId, name = profile.groups[gId].name, text = real_text, time = os.clock() }
-            end
-            return
+            if globalSettings.useScreenNotifications then return false else return end
         end
 
         local is_dup = false
@@ -1825,7 +1831,21 @@ function samp.onServerMessage(color, text)
     end
     
     if out_num and out_text then
+        local is_sys_grp = out_text:match("^!GRP_")
+        local gId = out_text:match("^#(%w+) ")
+        if is_sys_grp then return false end
+        
+        if gId and profile.groups and profile.groups[gId] then
+            lastSmsPhone = out_num
+            lastSmsGroupId = gId
+            lastSmsSysTime = os.clock()
+            lastSmsIsDup = false
+            lastSmsIsUnread = false
+            if globalSettings.useScreenNotifications then return false else return end
+        end
+
         lastSmsPhone = out_num
+        lastSmsGroupId = nil
         lastSmsIsUnread = false
         lastSmsIsDup = false
         lastSmsSysTime = os.clock()
@@ -1855,14 +1875,21 @@ function samp.onServerMessage(color, text)
     if continued_text then
         if lastSmsPhone and (os.clock() - lastSmsSysTime <= 0.5) then
             if not lastSmsIsDup then
-                local targetHist = profile.history[lastSmsPhone]
+                local targetHist = nil
+                if lastSmsGroupId and profile.groups and profile.groups[lastSmsGroupId] then
+                    targetHist = profile.groups[lastSmsGroupId].history
+                else
+                    targetHist = profile.history[lastSmsPhone]
+                end
+                
                 if targetHist and #targetHist > 0 then
                     local prev_msg = targetHist[#targetHist].msg
                     prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
                     targetHist[#targetHist].msg = prev_msg .. " " .. continued_text
                     targetHist[#targetHist].bubbleSize = nil 
                     save_all_data()
-                    if myNick == actualPlayerNick and activeContact == lastSmsPhone then UI.scrollToBottom = true end
+                    local aContact = lastSmsGroupId or lastSmsPhone
+                    if myNick == actualPlayerNick and activeContact == aContact then UI.scrollToBottom = true end
                 end
             end
             if lastSmsIsUnread and globalSettings.hideUnreadOnLogin then return false
@@ -2933,6 +2960,7 @@ local newFrame = imgui.OnFrame(
                             end
                             imgui.Separator()
                         end
+                        
                         if num == "System_News" then
                             if imgui.Selectable(u8"Очистить историю") then
                                 local nhist = profile.history[num]
@@ -2944,9 +2972,7 @@ local newFrame = imgui.OnFrame(
                                     if p.muted then p.muted[num] = nil end
                                     if p.drafts then p.drafts[num] = nil end
                                 end
-                                if activeContact == num then
-                                    activeContact = nil
-                                end
+                                if activeContact == num then activeContact = nil end
                                 save_all_data()
                                 needSortContacts = true
                             end
@@ -2955,11 +2981,8 @@ local newFrame = imgui.OnFrame(
                             if imgui.Selectable(muteText) then
                                 if not profile.muted then profile.muted = {} end
                                 profile.muted[num] = not profile.muted[num]
-                                
-                                if profile.muted[num] then
-                                    if Sys.activeNotification and Sys.activeNotification.number == num then
-                                        Sys.activeNotification = nil
-                                    end
+                                if profile.muted[num] and Sys.activeNotification and Sys.activeNotification.number == num then
+                                    Sys.activeNotification = nil
                                 end
                                 save_all_data()
                             end
@@ -2969,9 +2992,36 @@ local newFrame = imgui.OnFrame(
                                 profile.unread[num] = nil
                                 if profile.muted then profile.muted[num] = nil end
                                 if profile.drafts then profile.drafts[num] = nil end
-                                if activeContact == num then
-                                    activeContact = nil
+                                if activeContact == num then activeContact = nil end
+                                save_all_data()
+                                needSortContacts = true
+                            end
+                        elseif isGroup then
+                            local muteText = profile.muted and profile.muted[num] and u8"Включить уведомления" or u8"Отключить уведомления"
+                            if imgui.Selectable(muteText) then
+                                if not profile.muted then profile.muted = {} end
+                                profile.muted[num] = not profile.muted[num]
+                                if profile.muted[num] and Sys.activeNotification and Sys.activeNotification.number == num then
+                                    Sys.activeNotification = nil
                                 end
+                                save_all_data()
+                            end
+                            imgui.Separator()
+                            if imgui.Selectable(u8"Очистить историю") then
+                                profile.groups[num].history = {}
+                                profile.unread[num] = nil
+                                save_all_data()
+                                needSortContacts = true
+                            end
+                            if imgui.Selectable(u8"Удалить группу") then
+                                for memNum, _ in pairs(profile.groups[num].members) do
+                                    table.insert(groupSmsQueue, {num = memNum, text = "!GRP_LV|" .. num, groupId = num})
+                                end
+                                profile.groups[num] = nil
+                                profile.unread[num] = nil
+                                if profile.muted then profile.muted[num] = nil end
+                                if profile.drafts then profile.drafts[num] = nil end
+                                if activeContact == num then activeContact = nil end
                                 save_all_data()
                                 needSortContacts = true
                             end
@@ -2987,20 +3037,15 @@ local newFrame = imgui.OnFrame(
                                 sampSendChat("/call " .. num)
                                 UI.windowState[0] = false 
                             end
-                            
                             local muteText = profile.muted and profile.muted[num] and u8"Включить уведомления" or u8"Отключить уведомления"
                             if imgui.Selectable(muteText) then
                                 if not profile.muted then profile.muted = {} end
                                 profile.muted[num] = not profile.muted[num]
-                                
-                                if profile.muted[num] then
-                                    if Sys.activeNotification and Sys.activeNotification.number == num then
-                                        Sys.activeNotification = nil
-                                    end
+                                if profile.muted[num] and Sys.activeNotification and Sys.activeNotification.number == num then
+                                    Sys.activeNotification = nil
                                 end
                                 save_all_data()
                             end
-                            
                             imgui.Separator()
                             if imgui.Selectable(u8"Очистить историю") then
                                 profile.history[num] = nil
@@ -3505,12 +3550,12 @@ local newFrame = imgui.OnFrame(
                                 local foundUrls = {}
                                 local textToDisplay = text
                                 
+                                local sName = nil
+                                local isVer = false
                                 if isGroup and msgData.sender ~= "me" then
-                                    local sName = profile.contacts[msgData.sender]
+                                    sName = profile.contacts[msgData.sender]
                                     sName = (sName and sName ~= "") and sName or msgData.sender
-                                    local isVer = profile.verified and profile.verified[msgData.sender]
-                                    local prefix = u8(tostring(sName)) .. (isVer and u8" [V]" or "") .. ": "
-                                    textToDisplay = prefix .. textToDisplay
+                                    isVer = profile.verified and profile.verified[msgData.sender]
                                 end
                                 
                                 for word in text:gmatch("%S+") do
@@ -3569,9 +3614,19 @@ local newFrame = imgui.OnFrame(
                                         b_width = msgTextSize.x
                                     end
                                     
+                                    local nameTextSize = imgui.ImVec2(0, 0)
+                                    if sName then
+                                        nameTextSize = imgui.CalcTextSize(u8(tostring(sName)))
+                                        if isVer then nameTextSize.x = nameTextSize.x + 16 * scale end
+                                        b_width = math.max(b_width, nameTextSize.x)
+                                    end
+                                    
                                     local b_height = padding.y * 1.5 + timeSize.y
                                     if textToDisplay ~= "" then
                                         b_height = b_height + msgTextSize.y + 5
+                                    end
+                                    if sName then
+                                        b_height = b_height + nameTextSize.y + 2 * scale
                                     end
                                     
                                     for _, url in ipairs(urls) do
@@ -3678,6 +3733,29 @@ local newFrame = imgui.OnFrame(
                                     end
 
                                     local currentOffset = bubble_start_y + padding.y
+
+                                    if sName then
+                                        imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
+                                        local hash = 0
+                                        for i = 1, #msgData.sender do hash = (hash + msgData.sender:byte(i)) % 5 end
+                                        local colors = {
+                                            imgui.ImVec4(0.9, 0.35, 0.35, 1.0),
+                                            imgui.ImVec4(0.25, 0.75, 0.45, 1.0),
+                                            imgui.ImVec4(0.35, 0.55, 0.95, 1.0),
+                                            imgui.ImVec4(0.8, 0.4, 0.8, 1.0),
+                                            imgui.ImVec4(0.95, 0.65, 0.25, 1.0)
+                                        }
+                                        imgui.TextColored(colors[hash + 1], u8(tostring(sName)))
+                                        if isVer then
+                                            imgui.SameLine(0, 4 * scale)
+                                            local dl = imgui.GetWindowDrawList()
+                                            local c_pos = imgui.GetCursorScreenPos()
+                                            local b_radius = 5.5 * scale
+                                            local badge_center = imgui.ImVec2(c_pos.x + b_radius, c_pos.y + (imgui.GetTextLineHeight() / 2))
+                                            DrawVerificationBadge(dl, badge_center, b_radius, scale)
+                                        end
+                                        currentOffset = currentOffset + imgui.GetTextLineHeight() + 2 * scale
+                                    end
 
                                     if msgData.textToDisplay ~= "" then
                                         imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
