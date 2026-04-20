@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.86
+local script_version = 1.87
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -29,6 +29,15 @@ end
 
 ffi.cdef[[
     void* ShellExecuteA(void* hwnd, const char* lpOperation, const char* lpFile, const char* lpParameters, const char* lpDirectory, int nShowCmd);
+    
+    typedef struct IDirect3DTexture9 IDirect3DTexture9;
+    struct IDirect3DTexture9 {
+        struct {
+            void* QueryInterface;
+            uint32_t (__stdcall *AddRef)(IDirect3DTexture9*);
+            uint32_t (__stdcall *Release)(IDirect3DTexture9*);
+        }* lpVtbl;
+    };
 ]]
 local shell32 = ffi.load('shell32')
 
@@ -56,6 +65,8 @@ local lastAttemptedGroupId = nil
 local cacheFolder = getWorkingDirectory() .. '\\config\\messenger_cache\\'
 pcall(lfs.mkdir, cacheFolder)
 local cacheClearTimer = 0
+local downloadQueue = {}
+local activeDownloads = 0
 local cacheCleared = false
 
 local function isImageSafe(path)
@@ -78,6 +89,7 @@ local onlinePlayersById = {}
 
 local globalSettings = {
     theme = 1,
+    font = 1,
     useScreenNotifications = false,
     logBank = false,
     hideSmsJunk = false,
@@ -170,7 +182,9 @@ local Macro = {
     autoGeo = false,
     geoStep = 0,
     targetGeoNumber = "",
-    waitingForGeoConfirm = false
+    waitingForGeoConfirm = false,
+    autoBlock = false,
+    targetBlockNumber = ""
 }
 
 local CallState = {
@@ -410,6 +424,33 @@ local function file_exists(name)
     local f = io.open(name, "r")
     if f ~= nil then io.close(f) return true else return false end
 end
+
+local fontNames = {
+    u8"Стандартный (Trebuchet MS)",
+    "Arial",
+    "Arial Bold",
+    "Comic Sans MS",
+    "Tahoma"
+}
+
+local customFonts = {}
+
+imgui.OnInitialize(function()
+    local glyphRanges = imgui.GetIO().Fonts:GetGlyphRangesCyrillic()
+    
+    if file_exists("C:\\Windows\\Fonts\\arial.ttf") then
+        customFonts[2] = imgui.GetIO().Fonts:AddFontFromFileTTF("C:\\Windows\\Fonts\\arial.ttf", 14.0, nil, glyphRanges)
+    end
+    if file_exists("C:\\Windows\\Fonts\\arialbd.ttf") then
+        customFonts[3] = imgui.GetIO().Fonts:AddFontFromFileTTF("C:\\Windows\\Fonts\\arialbd.ttf", 14.0, nil, glyphRanges)
+    end
+    if file_exists("C:\\Windows\\Fonts\\comic.ttf") then
+        customFonts[4] = imgui.GetIO().Fonts:AddFontFromFileTTF("C:\\Windows\\Fonts\\comic.ttf", 14.0, nil, glyphRanges)
+    end
+    if file_exists("C:\\Windows\\Fonts\\tahoma.ttf") then
+        customFonts[5] = imgui.GetIO().Fonts:AddFontFromFileTTF("C:\\Windows\\Fonts\\tahoma.ttf", 14.0, nil, glyphRanges)
+    end
+end)
 
 local function save_json(path, data)
     local file = io.open(path, "wb")
@@ -679,79 +720,93 @@ local function syncGlobalVerified(number)
 end
 
 local function downloadImageToCache(url)
+    if imageCache[url] and imageCache[url].status == 1 then return end
     imageCache[url] = { status = 1 }
-    local cleanUrl = url:match("([^%?]+)") or url
-    local ext = cleanUrl:match("%.([^%.]+)$") or "png"
-    local tempPath = getWorkingDirectory() .. "\\config\\img_" .. tostring(math.random(1000000,9999999)) .. "." .. ext
-    activeTempFiles[tempPath] = true
-    local dlstatus = require('moonloader').download_status
-    
-    downloadUrlToFile(url, tempPath, function(id, status)
-        if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-            lua_thread.create(function()
-                wait(150)
-                if doesFileExist(tempPath) then
-                    if not isImageSafe(tempPath) then
-                        pcall(os.remove, tempPath)
-                        activeTempFiles[tempPath] = nil
-                        imageCache[url] = { status = 3 }
-                        UI.scrollToBottom = true
-                        return
-                    end
-                    
-                    local rtex = renderLoadTextureFromFile(tempPath)
-                    if rtex then
-                        local tex_w, tex_h = renderGetTextureSize(rtex)
-                        renderReleaseTexture(rtex)
-                        
-                        local tex = imgui.CreateTextureFromFile(tempPath)
-                        if tex then
-                            table.insert(imageCacheKeys, url)
-                            if #imageCacheKeys > 15 then
-                                local oldUrl = table.remove(imageCacheKeys, 1)
-                                if imageCache[oldUrl] and imageCache[oldUrl].tex then
-                                    imageCache[oldUrl].tex:Release() 
-                                    imageCache[oldUrl] = nil
-                                end
-                            end
+    table.insert(downloadQueue, url)
+end
 
-                            local max_dim = 300.0
-                            local draw_w, draw_h = tex_w, tex_h
-                            if tex_w > max_dim or tex_h > max_dim then
-                                local ratio = tex_w / tex_h
-                                if tex_w > tex_h then
-                                    draw_w = max_dim
-                                    draw_h = max_dim / ratio
-                                else
-                                    draw_h = max_dim
-                                    draw_w = max_dim * ratio
-                                end
-                            end
-                            imageCache[url] = { status = 2, tex = tex, w = draw_w, h = draw_h, orig_w = tex_w, orig_h = tex_h }
+local function processDownloadQueue()
+    if #downloadQueue > 0 and activeDownloads < 2 then
+        local url = table.remove(downloadQueue, 1)
+        if not imageCache[url] or imageCache[url].status ~= 1 then return end
+        activeDownloads = activeDownloads + 1
+
+        local cleanUrl = url:match("([^%?]+)") or url
+        local ext = cleanUrl:match("%.([^%.]+)$") or "png"
+        local tempPath = getWorkingDirectory() .. "\\config\\img_" .. tostring(math.random(1000000,9999999)) .. "." .. ext
+        activeTempFiles[tempPath] = true
+        local dlstatus = require('moonloader').download_status
+        
+        downloadUrlToFile(url, tempPath, function(id, status)
+            if status == dlstatus.STATUS_ENDDOWNLOADDATA then
+                lua_thread.create(function()
+                    wait(150)
+                    activeDownloads = activeDownloads - 1
+                    if doesFileExist(tempPath) then
+                        if not isImageSafe(tempPath) then
+                            pcall(os.remove, tempPath)
+                            activeTempFiles[tempPath] = nil
+                            imageCache[url] = { status = 3 }
                             UI.scrollToBottom = true
+                            return
+                        end
+                        
+                        local rtex = renderLoadTextureFromFile(tempPath)
+                        if rtex then
+                            local tex_w, tex_h = renderGetTextureSize(rtex)
+                            renderReleaseTexture(rtex)
+                            
+                            local tex = imgui.CreateTextureFromFile(tempPath)
+                            if tex then
+                                table.insert(imageCacheKeys, url)
+                                if #imageCacheKeys > 15 then
+                                    local oldUrl = table.remove(imageCacheKeys, 1)
+                                    if imageCache[oldUrl] and imageCache[oldUrl].tex then
+                                        local pTex = ffi.cast("IDirect3DTexture9*", imageCache[oldUrl].tex)
+                                        pTex.lpVtbl.Release(pTex)
+                                        imageCache[oldUrl] = nil
+                                    end
+                                end
+
+                                local max_dim = 300.0
+                                local draw_w, draw_h = tex_w, tex_h
+                                if tex_w > max_dim or tex_h > max_dim then
+                                    local ratio = tex_w / tex_h
+                                    if tex_w > tex_h then
+                                        draw_w = max_dim
+                                        draw_h = max_dim / ratio
+                                    else
+                                        draw_h = max_dim
+                                        draw_w = max_dim * ratio
+                                    end
+                                end
+                                imageCache[url] = { status = 2, tex = tex, w = draw_w, h = draw_h, orig_w = tex_w, orig_h = tex_h }
+                                UI.scrollToBottom = true
+                            else
+                                imageCache[url] = { status = 3 }
+                                UI.scrollToBottom = true
+                            end
                         else
                             imageCache[url] = { status = 3 }
                             UI.scrollToBottom = true
                         end
+                        pcall(os.remove, tempPath)
+                        activeTempFiles[tempPath] = nil
                     else
                         imageCache[url] = { status = 3 }
                         UI.scrollToBottom = true
+                        activeTempFiles[tempPath] = nil
                     end
-                    pcall(os.remove, tempPath)
-                    activeTempFiles[tempPath] = nil
-                else
-                    imageCache[url] = { status = 3 }
-                    UI.scrollToBottom = true
-                    activeTempFiles[tempPath] = nil
-                end
-            end)
-        elseif status == dlstatus.STATUS_EX_ERROR then
-            pcall(os.remove, tempPath)
-            activeTempFiles[tempPath] = nil
-            imageCache[url] = { status = 3 }
-            UI.scrollToBottom = true
-        end
-    end)
+                end)
+            elseif status == dlstatus.STATUS_EX_ERROR then
+                activeDownloads = activeDownloads - 1
+                pcall(os.remove, tempPath)
+                activeTempFiles[tempPath] = nil
+                imageCache[url] = { status = 3 }
+                UI.scrollToBottom = true
+            end
+        end)
+    end
 end
 
 function checkUpdates()
@@ -1132,6 +1187,7 @@ function main()
         if not pData.drafts then pData.drafts = {} end
         if not pData.calls then pData.calls = {} end
 		if not pData.groups then pData.groups = {} end
+		if not pData.blocked then pData.blocked = {} end
         
         pData.history["System_News"] = master_news_hist
         pData.contacts["System_News"] = "Уведомления"
@@ -1150,7 +1206,7 @@ function main()
     end
     
     if myNick ~= "Default" and myNick:find("_") and not phoneData[myNick] then
-        phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {} }
+        phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
         phoneData[myNick].history["System_News"] = master_news_hist
         phoneData[myNick].contacts["System_News"] = "Уведомления"
         save_all_data()
@@ -1302,6 +1358,7 @@ function main()
 
     while true do
         wait(0)
+		processDownloadQueue()
         
 		if #groupSmsQueue > 0 and (os.clock() - lastGroupSmsTime > 1.5) then
             local task = table.remove(groupSmsQueue, 1)
@@ -1342,7 +1399,7 @@ function main()
                             needSortContacts = true
                             
                             if not phoneData[myNick] then
-                                phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {} }
+                                phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
                                 local m_hist = nil
                                 for _, p in pairs(phoneData) do
                                     if p.history and p.history["System_News"] then m_hist = p.history["System_News"] break end
@@ -1520,6 +1577,28 @@ function samp.onShowDialog(id, st, title, b1, b2, text)
             return false
         end
     end
+	
+    if Macro.autoBlock then
+        local txtStr = tostring(text)
+        local cleanText = txtStr:gsub("{.-}", "")
+        
+        local search1 = u8:decode("хотите заблокировать номер")
+        local search2 = u8:decode("Желаете разблокировать его")
+        
+        if cleanText:find(search1) or cleanText:find(search2) then
+            Macro.autoBlock = false
+            
+            lua_thread.create(function()
+                wait(10)
+                if sampIsDialogActive() then
+                    sampCloseCurrentDialogWithButton(1) 
+                else
+                    sampSendDialogResponse(id, 1, 0, "")
+                end
+            end)
+            return
+        end
+    end
 end
 
 function samp.onServerMessage(color, text)
@@ -1528,6 +1607,48 @@ function samp.onServerMessage(color, text)
     local ts = os.time()
     
     local plain_text = text:gsub("{%x%x%x%x%x%x}", "")
+	
+    if plain_text:find("|", 1, true) and plain_text:find("SMS", 1, true) then
+        local num = plain_text:match("Номер.-(%d+)") or plain_text:match("\xcd\xee\xec\xe5\xf0.-(%d+)")
+        
+        if num then
+            local is_unblock = plain_text:find("\xf3\xe4\xe0\xeb") or plain_text:find("\xf0\xe0\xe7\xf0\xe5\xf8\xe5\xed")
+            is_unblock = is_unblock or plain_text:find("удал") or plain_text:find("разрешен")
+            
+            local is_block = plain_text:find("\xe2\xed\xe5\xf1")
+            is_block = is_block or plain_text:find("внес")
+            
+            if is_unblock then
+                if profile.blocked then
+                    profile.blocked[tostring(num)] = nil
+                    profile.blocked[tonumber(num)] = nil
+                end
+                
+                save_all_data()
+                needSortContacts = true
+                
+                if globalSettings.useScreenNotifications then
+                    showSystemNotification(u8"Номер " .. num .. u8" разблокирован.", 1)
+                    return false
+                end
+                return
+                
+            elseif is_block then
+                if not profile.blocked then profile.blocked = {} end
+                profile.blocked[tostring(num)] = true
+                profile.blocked[tonumber(num)] = true 
+                
+                save_all_data()
+                needSortContacts = true
+                
+                if globalSettings.useScreenNotifications then
+                    showSystemNotification(u8"Номер " .. num .. u8" заблокирован.", 1)
+                    return false
+                end
+                return
+            end
+        end
+    end
 	
 	if plain_text:find("Сообщение не отправлено%. Абонент вне зоны действия сети") then
         if lastAttemptedGroupId and lastAttemptedGroupNum and (os.clock() - lastGroupSmsTime < 2.0) then
@@ -1766,40 +1887,56 @@ function samp.onServerMessage(color, text)
             return
         end
 
+        local is_dup = false
         local gId, real_text = inc_text:match("^#(%w+) (.*)")
-        if gId and profile.groups and profile.groups[gId] then
-            table.insert(profile.groups[gId].history, {sender = inc_num, msg = real_text, timestamp = ts})
-            profile.unread[gId] = (type(profile.unread[gId]) == "number" and profile.unread[gId] or 0) + 1
-            save_all_data()
-            needSortContacts = true
+
+        if is_unread then
+            local targetHist = nil
+            local search_text = ""
             
+            if gId and profile.groups and profile.groups[gId] then
+                targetHist = profile.groups[gId].history
+                search_text = real_text:gsub("%s*%.%.%.?%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+            elseif profile.history[inc_num] then
+                targetHist = profile.history[inc_num]
+                search_text = inc_text:gsub("%s*%.%.%.?%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+            end
+            
+            if targetHist then
+                for i = #targetHist, math.max(1, #targetHist - 100), -1 do
+                    local h_text = targetHist[i].msg:gsub("^%s+", ""):gsub("%s+$", "")
+                    if h_text:sub(1, #search_text) == search_text then
+                        is_dup = true
+                        break
+                    end
+                end
+            end
+        end
+
+        if gId and profile.groups and profile.groups[gId] then
             lastSmsPhone = inc_num
             lastSmsGroupId = gId
             lastSmsSysTime = os.clock()
-            lastSmsIsDup = false
-            lastSmsIsUnread = false
+            lastSmsIsDup = is_dup
+            lastSmsIsUnread = is_unread
             lastSmsIsOutgoingGroup = false
             
-            if myNick == actualPlayerNick and activeContact == gId then UI.scrollToBottom = true end
-            if not profile.muted[gId] and globalSettings.useScreenNotifications and not globalSettings.dndMode then
-                Sys.activeNotification = { number = gId, name = profile.groups[gId].name, text = real_text, time = os.clock() }
-            end
-            if globalSettings.useScreenNotifications then return false else return end
-        end
-
-        local is_dup = false
-
-        local is_dup = false
-        if is_unread and profile.history[inc_num] then
-            local hist = profile.history[inc_num]
-            local search_text = inc_text:gsub("%s*%.%.%.?%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
-            for i = #hist, math.max(1, #hist - 100), -1 do
-                local h_text = hist[i].msg:gsub("^%s+", ""):gsub("%s+$", "")
-                if h_text:sub(1, #search_text) == search_text then
-                    is_dup = true
-                    break
+            if not is_dup then
+                table.insert(profile.groups[gId].history, {sender = inc_num, msg = real_text, timestamp = ts})
+                if myNick ~= actualPlayerNick or activeContact ~= gId or not UI.windowState[0] then
+                    profile.unread[gId] = (type(profile.unread[gId]) == "number" and profile.unread[gId] or 0) + 1
+                    if not profile.muted[gId] and globalSettings.useScreenNotifications and not globalSettings.dndMode then
+                        Sys.activeNotification = { number = gId, name = profile.groups[gId].name, text = real_text, time = os.clock() }
+                    end
                 end
+                save_all_data()
+                needSortContacts = true
+                if myNick == actualPlayerNick and activeContact == gId then UI.scrollToBottom = true end
             end
+            
+            if is_unread and globalSettings.hideUnreadOnLogin then return false
+            elseif globalSettings.useScreenNotifications then return false 
+            else return end
         end
         
         lastSmsPhone = inc_num
@@ -1943,6 +2080,10 @@ local notifyFrame = imgui.OnFrame(
         return Sys.activeNotification ~= nil and (os.clock() - Sys.activeNotification.time < 5.0) and not UI.windowState[0] 
     end,
     function(player)
+        if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
+            imgui.PushFont(customFonts[globalSettings.font])
+        end
+        
         local scale = globalSettings.uiScale or 1.0
         imgui.GetIO().FontGlobalScale = scale
         
@@ -1990,6 +2131,10 @@ local notifyFrame = imgui.OnFrame(
         end
         imgui.PopStyleVar(3)
         imgui.PopStyleColor(22)
+        
+        if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
+            imgui.PopFont()
+        end
     end
 )
 notifyFrame.HideCursor = true 
@@ -2006,6 +2151,10 @@ local unreadIndicatorFrame = imgui.OnFrame(
         return false
     end,
     function(player)
+        if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
+            imgui.PushFont(customFonts[globalSettings.font])
+        end
+        
         local scale = globalSettings.uiScale or 1.0
         imgui.GetIO().FontGlobalScale = scale
         
@@ -2068,6 +2217,10 @@ local unreadIndicatorFrame = imgui.OnFrame(
         end
         imgui.PopStyleVar(3)
         imgui.PopStyleColor(3)
+        
+        if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
+            imgui.PopFont()
+        end
     end
 )
 unreadIndicatorFrame.HideCursor = true
@@ -2075,6 +2228,10 @@ unreadIndicatorFrame.HideCursor = true
 local newFrame = imgui.OnFrame(
     function() return UI.windowState[0] or UI.viewingImage ~= nil or UI.showGallery[0] end,
     function(player)
+        if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
+            imgui.PushFont(customFonts[globalSettings.font])
+        end
+        
         local scale = globalSettings.uiScale or 1.0
         imgui.GetIO().FontGlobalScale = scale
         
@@ -2418,7 +2575,7 @@ local newFrame = imgui.OnFrame(
 						if actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
 							myNick = actualNick
 							if not phoneData[myNick] then
-								phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {} }
+								phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
 								local m_hist = nil
 								for nick, p in pairs(phoneData) do if nick ~= myNick and p.history["System_News"] then m_hist = p.history["System_News"] break end end
 								phoneData[myNick].history["System_News"] = m_hist or {}
@@ -2527,6 +2684,22 @@ local newFrame = imgui.OnFrame(
                     end
                 end
                 
+				imgui.Spacing()
+                imgui.Text(u8"Шрифт интерфейса:")
+                local current_font_idx = globalSettings.font or 1
+                if current_font_idx > #fontNames then current_font_idx = 1 end
+                imgui.PushItemWidth(comboWidth)
+                if imgui.BeginCombo("##SetFontCombo", fontNames[current_font_idx]) then
+                    for i, fName in ipairs(fontNames) do
+                        if imgui.Selectable(fName, current_font_idx == i) then
+                            globalSettings.font = i
+                            save_all_data()
+                        end
+                    end
+                    imgui.EndCombo()
+                end
+                imgui.PopItemWidth()
+				
                 imgui.Spacing()
                 imgui.Text(u8"Масштаб интерфейса:")
                 local uiScaleArr = imgui.new.float[1](globalSettings.uiScale or 1.0)
@@ -2771,11 +2944,9 @@ local newFrame = imgui.OnFrame(
                     local appFound = false
                     for i = 1, 50 do
                         wait(50)
-                        -- Перебираем текстдравы с конца, чтобы кликнуть по верхнему слою (кнопке)
                         for td = 2304, 0, -1 do
                             if sampTextdrawIsExists(td) then
                                 local posX, posY = sampTextdrawGetPos(td)
-                                -- Ищем иконку сообщений в доке (правый нижний угол)
                                 if posX >= 529.0 and posX <= 533.0 and posY >= 407.0 and posY <= 411.0 then
                                     sampSendClickTextdraw(td)
                                     appFound = true
@@ -3077,6 +3248,15 @@ local newFrame = imgui.OnFrame(
                                 save_all_data()
                                 needSortContacts = true
                             end
+							
+							local isBlocked = profile.blocked and profile.blocked[num]
+                            local blockText = isBlocked and u8"Разблокировать" or u8"Заблокировать"
+                            if imgui.Selectable(blockText) then
+                                Macro.autoBlock = true
+                                sampSendChat("/blocknum " .. num)
+                            end
+                            imgui.Separator()
+							
                             if imgui.Selectable(u8"Удалить контакт") then
                                 profile.contacts[num] = nil
                                 profile.history[num] = nil
@@ -3156,6 +3336,13 @@ local newFrame = imgui.OnFrame(
                         local mutedColor = active_theme_render.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0)
                         dl:AddText(imgui.ImVec2(p_min.x + nextOffset, p_min.y + 6), imgui.GetColorU32Vec4(mutedColor), mutedText)
                         nextOffset = nextOffset + imgui.CalcTextSize(mutedText).x
+                    end
+					
+					if profile.blocked and profile.blocked[num] then
+                        local blockedText = u8" [ЧС]"
+                        local blockedColor = imgui.ImVec4(0.8, 0.2, 0.2, 1.0)
+                        dl:AddText(imgui.ImVec2(p_min.x + nextOffset, p_min.y + 6), imgui.GetColorU32Vec4(blockedColor), blockedText)
+                        nextOffset = nextOffset + imgui.CalcTextSize(blockedText).x
                     end
                     
                     if profile.nicknames and profile.nicknames[num] then
@@ -3240,15 +3427,22 @@ local newFrame = imgui.OnFrame(
                 elseif isGroup then
                     local memCount = 1
                     local memListStr = u8"Вы\n"
-                    for mNum, _ in pairs(profile.groups[activeContact].members) do
-                        memCount = memCount + 1
-                        local mName = profile.contacts[mNum]
-                        if mName and mName ~= "" then
-                            memListStr = memListStr .. u8(mName) .. " (" .. mNum .. ")\n"
-                        else
-                            memListStr = memListStr .. mNum .. "\n"
-                        end
-                    end
+					for mNum, _ in pairs(profile.groups[activeContact].members) do
+						memCount = memCount + 1
+						local mName = profile.contacts[mNum]
+						local dName = ""
+						if mName and mName ~= "" then
+							dName = u8(mName) .. " (" .. mNum .. ")"
+						else
+							dName = "#" .. mNum
+						end
+    
+						local mNick = profile.nicknames and profile.nicknames[mNum]
+						if mNick and onlinePlayers[mNick] then
+							dName = dName .. u8" [Онлайн]"
+						end
+						memListStr = memListStr .. dName .. "\n"
+					end
                     contactName = u8"[Группа] " .. u8(profile.groups[activeContact].name) .. " (" .. memCount .. u8" уч.)"
                     tooltipText = memListStr
                 else
@@ -3289,132 +3483,144 @@ local newFrame = imgui.OnFrame(
                     local actTheme = GetActiveTheme()
                     imgui.TextColored(actTheme.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0), u8"[Мут]")
                 end
+				
+				if profile.blocked and profile.blocked[activeContact] then
+                    imgui.SameLine(0, 4 * scale)
+                    imgui.TextColored(imgui.ImVec4(0.8, 0.2, 0.2, 1.0), u8"[Заблокирован]")
+                end
                 
                 if not isSystemChat then
-                    local framePadX = imgui.GetStyle().FramePadding.x
-                    local spaceX = imgui.GetStyle().ItemSpacing.x
-                    
-                    local geoBtnText = u8"Геопозиция"
-                    local searchBtnText = u8"Поиск"
-                    local galBtnText = u8"Галерея"
-                    local callHistBtnText = u8"История звонков"
-                    
-                    local geoBtnWidth = imgui.CalcTextSize(geoBtnText).x + (framePadX * 2.0)
-                    local searchBtnWidth = imgui.CalcTextSize(searchBtnText).x + (framePadX * 2.0)
-                    local galBtnWidth = imgui.CalcTextSize(galBtnText).x + (framePadX * 2.0)
-                    local callHistBtnWidth = imgui.CalcTextSize(callHistBtnText).x + (framePadX * 2.0)
-                    
-                    local totalRightBtnsWidth = searchBtnWidth + geoBtnWidth + callHistBtnWidth + galBtnWidth + (spaceX * 3)
-                    
-                    local right_edge = imgui.GetCursorPosX() + imgui.GetContentRegionAvail().x
-                    imgui.SameLine()
-                    if right_edge - totalRightBtnsWidth > imgui.GetCursorPosX() then
-                        imgui.SetCursorPosX(right_edge - totalRightBtnsWidth)
-                    end
-                    
-                    if imgui.Button(callHistBtnText) then
-                        UI.showCallHistory = not UI.showCallHistory
-                        UI.viewingCallIndex = 0
-                        UI.showMessageSearch = false
-                        UI.showGallery[0] = false
-                    end
-                    
-                    imgui.SameLine(0, spaceX)
-                    if imgui.Button(galBtnText) then
-                        UI.showGallery[0] = not UI.showGallery[0]
-                        UI.showCallHistory = false
-                        UI.showMessageSearch = false
-                    end
-                    
-                    imgui.SameLine(0, spaceX)
-                    if imgui.Button(searchBtnText) then
-                        UI.showMessageSearch = not UI.showMessageSearch
-                        if UI.showMessageSearch then 
-                            UI.showCallHistory = false
-                            UI.showGallery[0] = false
-                            UI.requestFocusSearch = true 
-                        else 
-                            UI.inputSearchMessage[0] = 0 
+    local framePadX = imgui.GetStyle().FramePadding.x
+    local spaceX = imgui.GetStyle().ItemSpacing.x
+    
+    local geoBtnText = u8"Геопозиция"
+    local searchBtnText = u8"Поиск"
+    local galBtnText = u8"Галерея"
+    local callHistBtnText = u8"История звонков"
+    
+    local geoBtnWidth = imgui.CalcTextSize(geoBtnText).x + (framePadX * 2.0)
+    local searchBtnWidth = imgui.CalcTextSize(searchBtnText).x + (framePadX * 2.0)
+    local galBtnWidth = imgui.CalcTextSize(galBtnText).x + (framePadX * 2.0)
+    local callHistBtnWidth = imgui.CalcTextSize(callHistBtnText).x + (framePadX * 2.0)
+    
+    local totalRightBtnsWidth = searchBtnWidth + galBtnWidth + spaceX
+    if not isGroup then
+        totalRightBtnsWidth = totalRightBtnsWidth + geoBtnWidth + callHistBtnWidth + (spaceX * 2)
+    end
+    
+    local right_edge = imgui.GetCursorPosX() + imgui.GetContentRegionAvail().x
+    imgui.SameLine()
+    if right_edge - totalRightBtnsWidth > imgui.GetCursorPosX() then
+        imgui.SetCursorPosX(right_edge - totalRightBtnsWidth)
+    end
+    
+    if not isGroup then
+        if imgui.Button(callHistBtnText) then
+            UI.showCallHistory = not UI.showCallHistory
+            UI.viewingCallIndex = 0
+            UI.showMessageSearch = false
+            UI.showGallery[0] = false
+        end
+        imgui.SameLine(0, spaceX)
+    end
+    
+    if imgui.Button(galBtnText) then
+        UI.showGallery[0] = not UI.showGallery[0]
+        UI.showCallHistory = false
+        UI.showMessageSearch = false
+    end
+    
+    imgui.SameLine(0, spaceX)
+    if imgui.Button(searchBtnText) then
+        UI.showMessageSearch = not UI.showMessageSearch
+        if UI.showMessageSearch then 
+            UI.showCallHistory = false
+            UI.showGallery[0] = false
+            UI.requestFocusSearch = true 
+        else 
+            UI.inputSearchMessage[0] = 0 
+        end
+    end
+    
+    if not isGroup then
+        imgui.SameLine(0, spaceX)
+        if imgui.Button(geoBtnText) then
+            Macro.targetGeoNumber = tostring(activeContact):match("%d+")
+            if Macro.targetGeoNumber then
+                UI.windowState[0] = false 
+                Macro.autoGeo = true
+                Macro.geoStep = 1
+                showSystemNotification(u8"Запуск отправки геопозиции...", 0)
+                sampSendChat("/phone")
+                
+                lua_thread.create(function()
+                    local swiped = false
+                    for i = 1, 50 do
+                        wait(100)
+                        for td = 0, 2304 do
+                            if sampTextdrawIsExists(td) then
+                                local txt = sampTextdrawGetString(td)
+                                if type(txt) == "string" then
+                                    local cleanText = txt:gsub("~.-~", ""):upper()
+                                    if cleanText:find("SWIPE UP TO UNLOCK") and not swiped then
+                                        sampSendClickTextdraw(td)
+                                        swiped = true
+                                        break
+                                    end
+                                end
+                            end
                         end
+                        if swiped then break end
                     end
                     
-                    imgui.SameLine(0, spaceX)
-                    if imgui.Button(geoBtnText) then
-                        Macro.targetGeoNumber = tostring(activeContact):match("%d+")
-                        if Macro.targetGeoNumber then
-                            UI.windowState[0] = false 
-                            Macro.autoGeo = true
-                            Macro.geoStep = 1
-                            showSystemNotification(u8"Запуск отправки геопозиции...", 0)
-                            sampSendChat("/phone")
-                            
-                            lua_thread.create(function()
-                                local swiped = false
-                                for i = 1, 50 do
-                                    wait(100)
-                                    for td = 0, 2304 do
-                                        if sampTextdrawIsExists(td) then
-                                            local txt = sampTextdrawGetString(td)
-                                            if type(txt) == "string" then
-                                                local cleanText = txt:gsub("~.-~", ""):upper()
-                                                if cleanText:find("SWIPE UP TO UNLOCK") and not swiped then
-                                                    sampSendClickTextdraw(td)
-                                                    swiped = true
-                                                    break
-                                                end
-                                            end
-                                        end
-                                    end
-                                    if swiped then break end
+                    if not swiped then
+                        showSystemNotification(u8"Ошибка: не найден экран блокировки телефона.", 2)
+                        Macro.autoGeo = false
+                        UI.windowState[0] = true
+                        return
+                    end
+                    
+                    local appFound = false
+                    for i = 1, 50 do
+                        wait(50)
+                        for td = 2304, 0, -1 do
+                            if sampTextdrawIsExists(td) then
+                                local posX, posY = sampTextdrawGetPos(td)
+                                if posX >= 529.0 and posX <= 533.0 and posY >= 407.0 and posY <= 411.0 then
+                                    sampSendClickTextdraw(td)
+                                    appFound = true
+                                    break
                                 end
-                                
-                                if not swiped then
-                                    showSystemNotification(u8"Ошибка: не найден экран блокировки телефона.", 2)
-                                    Macro.autoGeo = false
-                                    UI.windowState[0] = true
-                                    return
-                                end
-                                
-                                local appFound = false
-                                for i = 1, 50 do
-                                    wait(50)
-                                    for td = 2304, 0, -1 do
-                                        if sampTextdrawIsExists(td) then
-                                            local posX, posY = sampTextdrawGetPos(td)
-                                            if posX >= 529.0 and posX <= 533.0 and posY >= 407.0 and posY <= 411.0 then
-                                                sampSendClickTextdraw(td)
-                                                appFound = true
-                                                break
-                                            end
-                                        end
-                                    end
-                                    if appFound then break end
-                                end
+                            end
+                        end
+                        if appFound then break end
+                    end
 
-                                if not appFound then
-                                    showSystemNotification(u8"Ошибка: иконка сообщений не появилась.", 2)
-                                    Macro.autoGeo = false
-                                    UI.windowState[0] = true
-                                    return
-                                end
-                                
-                                Macro.geoStep = 2
-                                
-                                wait(10000)
-                                if Macro.autoGeo then
-                                    Macro.autoGeo = false
-                                    Macro.geoStep = 0
-                                    showSystemNotification(u8"Ошибка: Таймаут. Сервер не ответил на диалоги.", 2)
-                                    sampSendClickTextdraw(65535)
-                                    sampSendChat("/untd 2")
-                                    UI.windowState[0] = true 
-                                end
-                            end)
-                        else
-                            showSystemNotification(u8"Ошибка: неверный номер телефона.", 2)
-                        end
+                    if not appFound then
+                        showSystemNotification(u8"Ошибка: иконка сообщений не появилась.", 2)
+                        Macro.autoGeo = false
+                        UI.windowState[0] = true
+                        return
                     end
-                else
+                    
+                    Macro.geoStep = 2
+                    
+                    wait(10000)
+                    if Macro.autoGeo then
+                        Macro.autoGeo = false
+                        Macro.geoStep = 0
+                        showSystemNotification(u8"Ошибка: Таймаут. Сервер не ответил на диалоги.", 2)
+                        sampSendClickTextdraw(65535)
+                        sampSendChat("/untd 2")
+                        UI.windowState[0] = true 
+                    end
+                end)
+            else
+                showSystemNotification(u8"Ошибка: неверный номер телефона.", 2)
+            end
+        end
+    end
+else
                     local searchBtnText = u8"Поиск"
                     local framePadX = imgui.GetStyle().FramePadding.x
                     local searchBtnWidth = imgui.CalcTextSize(searchBtnText).x + (framePadX * 2.0)
@@ -3589,8 +3795,8 @@ local newFrame = imgui.OnFrame(
                                 local isVer = false
                                 if isGroup and msgData.sender ~= "me" then
                                     sName = profile.contacts[msgData.sender]
-                                    sName = (sName and sName ~= "") and sName or msgData.sender
-                                    isVer = profile.verified and profile.verified[msgData.sender]
+									sName = (sName and sName ~= "") and sName or ("#" .. msgData.sender)
+									isVer = profile.verified and profile.verified[msgData.sender]
                                 end
                                 
                                 for word in text:gmatch("%S+") do
@@ -4110,6 +4316,10 @@ local newFrame = imgui.OnFrame(
         imgui.PopStyleVar(4)
         imgui.PopStyleColor(20) 
         if UI.forceResize then UI.forceResize = false end
+        
+        if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
+            imgui.PopFont()
+        end
     end
 )
 
