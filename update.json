@@ -1,5 +1,5 @@
 {
-  "version": "1.86",
+  "version": "1.87",
   "url": "https://raw.githubusercontent.com/kaip0v/Messenger/main/Messenger.lua",
-  "silent": true
+  "silent": false
 }
