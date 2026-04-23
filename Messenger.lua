@@ -4197,11 +4197,19 @@ local function DrawChatHistory(scale, profile)
                     needSortContacts = true
                 end
             end
-            imgui.Spacing()
+            
+            imgui.Dummy(imgui.ImVec2(0, 4 * scale))
+            
             if UI.scrollToBottom then
-                imgui.SetScrollY(imgui.GetScrollMaxY() + 999999)
+                UI.scrollTicks = 2
                 UI.scrollToBottom = false
             end
+            
+            if UI.scrollTicks and UI.scrollTicks > 0 then
+                imgui.SetScrollY(imgui.GetScrollMaxY() + 999999.0)
+                UI.scrollTicks = UI.scrollTicks - 1
+            end
+            
             imgui.EndChild()
         end
         if activeContact == "Bank_System" or activeContact == "System_News" then
