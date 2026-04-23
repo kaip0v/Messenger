@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.88
+local script_version = 1.89
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -67,6 +67,8 @@ local mainFolder = getWorkingDirectory() .. '\\config\\Messenger\\'
 pcall(lfs.mkdir, mainFolder)
 local cacheFolder = mainFolder .. 'cache\\'
 pcall(lfs.mkdir, cacheFolder)
+local imagesFolder = mainFolder .. 'images\\'
+pcall(lfs.mkdir, imagesFolder)
 
 local cacheClearTimer = 0
 local downloadQueue = {}
@@ -109,8 +111,15 @@ local globalSettings = {
     contactSortMode = 1,
     uiScale = 1.0,
     hideUnreadOnLogin = false,
-    gallery = {}
+    gallery = {},
+    closeChatOnEsc = false,
+    saveImagesPersistently = false,
+    fontSize = 14.0,
+    chatBackgroundUrl = "",
+    hideContactNumber = false
 }
+
+local loadedFontSize = 14.0
 
 local newsUrl = "https://raw.githubusercontent.com/kaip0v/Messenger/main/news.txt"
 local updateUrl = "https://raw.githubusercontent.com/kaip0v/Messenger/main/update.json"
@@ -163,8 +172,14 @@ local UI = {
     settingDND = imgui.new.bool(false),
     settingAutoDownload = imgui.new.bool(true),
     settingHideUnread = imgui.new.bool(false),
+    settingCloseChatOnEsc = imgui.new.bool(false),
+    settingSaveImages = imgui.new.bool(false),
+    settingHideContactNumber = imgui.new.bool(false),
     showThemeEditor = imgui.new.bool(false),
-    forceResize = false
+    forceResize = false,
+    anyModalOpen = false,
+    requestCloseModal = false,
+    inputChatBg = imgui.new.char[256]("")
 }
 
 local Sys = {
@@ -431,12 +446,29 @@ local function truncateToLastWord(text, maxWidth)
     return current_str .. ellipsis
 end
 
+local function truncateText(text, maxWidth)
+    if imgui.CalcTextSize(text).x <= maxWidth then return text end
+    local cp_text = u8:decode(text) or text
+    local ellipsis = "..."
+    for i = #cp_text, 1, -1 do
+        if imgui.CalcTextSize(u8(cp_text:sub(1, i)) .. ellipsis).x <= maxWidth then
+            return u8(cp_text:sub(1, i)) .. ellipsis
+        end
+    end
+    return ellipsis
+end
+
 local function cleanupGhostFiles()
     pcall(lfs.mkdir, cacheFolder)
     pcall(function()
+        local now = os.time()
         for file in lfs.dir(cacheFolder) do
             if file ~= "." and file ~= ".." then
-                pcall(os.remove, cacheFolder .. file)
+                local path = cacheFolder .. file
+                local mod = lfs.attributes(path, "modification") or 0
+                if now - mod > 86400 then
+                    pcall(os.remove, path)
+                end
             end
         end
     end)
@@ -478,19 +510,24 @@ imgui.OnInitialize(function()
     local glyphRanges = imgui.GetIO().Fonts:GetGlyphRangesCyrillic()
     
     local currentFont = 1
+    local currentSize = 14.0
     local file = io.open(masterFile, "rb")
     if file then
         local content = file:read("*a")
         file:close()
         local fontMatch = content:match('%["font"%]%s*=%s*(%d+)') or content:match('["\']font["\']%s*:%s*(%d+)')
         if fontMatch then currentFont = tonumber(fontMatch) end
+        local sizeMatch = content:match('%["fontSize"%]%s*=%s*([%d%.]+)') or content:match('["\']fontSize["\']%s*:%s*([%d%.]+)')
+        if sizeMatch then currentSize = tonumber(sizeMatch) end
     end
+    
+    loadedFontSize = currentSize
     
     if currentFont > #availableFonts then currentFont = 1 end
     
     local selectedFont = availableFonts[currentFont]
     if selectedFont and selectedFont.path and file_exists(selectedFont.path) then
-        customFonts[currentFont] = imgui.GetIO().Fonts:AddFontFromFileTTF(selectedFont.path, 14.0, nil, glyphRanges)
+        customFonts[currentFont] = imgui.GetIO().Fonts:AddFontFromFileTTF(selectedFont.path, currentSize, nil, glyphRanges)
     end
 end)
 
@@ -768,37 +805,30 @@ local function downloadImageToCache(url)
 end
 
 local function processDownloadQueue()
-    if #downloadQueue > 0 and activeDownloads < 2 then
-        local url = table.remove(downloadQueue, 1)
-        if not imageCache[url] or imageCache[url].status ~= 1 then return end
-        activeDownloads = activeDownloads + 1
+    if #downloadQueue > 0 then
+        local i = 1
+        while i <= #downloadQueue do
+            local url = downloadQueue[i]
+            if not imageCache[url] or imageCache[url].status ~= 1 then
+                table.remove(downloadQueue, i)
+            else
+                local cleanUrl = url:match("([^%?]+)") or url
+                local ext = cleanUrl:match("%.([^%.]+)$") or "png"
+                if #ext > 4 then ext = "png" end
+                local safeName = toHex(url)
+                if #safeName > 50 then safeName = safeName:sub(#safeName - 50) end
+                local fileName = safeName .. "." .. ext
+                local persistentPath = imagesFolder .. fileName
 
-        local cleanUrl = url:match("([^%?]+)") or url
-        local ext = cleanUrl:match("%.([^%.]+)$") or "png"
-        local tempPath = cacheFolder .. "img_" .. tostring(math.random(1000000,9999999)) .. "." .. ext
-        activeTempFiles[tempPath] = true
-        local dlstatus = require('moonloader').download_status
-        
-        downloadUrlToFile(url, tempPath, function(id, status)
-            if status == dlstatus.STATUS_ENDDOWNLOADDATA then
-                lua_thread.create(function()
-                    wait(150)
-                    activeDownloads = activeDownloads - 1
-                    if doesFileExist(tempPath) then
-                        if not isImageSafe(tempPath) then
-                            pcall(os.remove, tempPath)
-                            activeTempFiles[tempPath] = nil
-                            imageCache[url] = { status = 3 }
-                            UI.scrollToBottom = true
-                            return
-                        end
-                        
-                        local rtex = renderLoadTextureFromFile(tempPath)
+                if globalSettings.saveImagesPersistently and doesFileExist(persistentPath) then
+                    table.remove(downloadQueue, i)
+                    lua_thread.create(function()
+                        wait(0)
+                        local rtex = renderLoadTextureFromFile(persistentPath)
                         if rtex then
                             local tex_w, tex_h = renderGetTextureSize(rtex)
                             renderReleaseTexture(rtex)
-                            
-                            local tex = imgui.CreateTextureFromFile(tempPath)
+                            local tex = imgui.CreateTextureFromFile(persistentPath)
                             if tex then
                                 table.insert(imageCacheKeys, url)
                                 if #imageCacheKeys > 15 then
@@ -809,7 +839,6 @@ local function processDownloadQueue()
                                         imageCache[oldUrl] = nil
                                     end
                                 end
-
                                 local max_dim = 300.0
                                 local draw_w, draw_h = tex_w, tex_h
                                 if tex_w > max_dim or tex_h > max_dim then
@@ -832,22 +861,96 @@ local function processDownloadQueue()
                             imageCache[url] = { status = 3 }
                             UI.scrollToBottom = true
                         end
-                        pcall(os.remove, tempPath)
-                        activeTempFiles[tempPath] = nil
+                    end)
+                else
+                    if activeDownloads < 2 then
+                        table.remove(downloadQueue, i)
+                        activeDownloads = activeDownloads + 1
+                        local tempPath = cacheFolder .. "img_" .. tostring(math.random(1000000,9999999)) .. "." .. ext
+                        activeTempFiles[tempPath] = true
+                        local dlstatus = require('moonloader').download_status
+                        downloadUrlToFile(url, tempPath, function(id, status)
+                            if status == dlstatus.STATUS_ENDDOWNLOADDATA then
+                                lua_thread.create(function()
+                                    wait(50)
+                                    activeDownloads = activeDownloads - 1
+                                    if doesFileExist(tempPath) then
+                                        if not isImageSafe(tempPath) then
+                                            pcall(os.remove, tempPath)
+                                            activeTempFiles[tempPath] = nil
+                                            imageCache[url] = { status = 3 }
+                                            UI.scrollToBottom = true
+                                            return
+                                        end
+                                        
+                                        local finalPath = tempPath
+                                        if globalSettings.saveImagesPersistently then
+                                            os.rename(tempPath, persistentPath)
+                                            finalPath = persistentPath
+                                            activeTempFiles[tempPath] = nil
+                                        end
+                                        
+                                        local rtex = renderLoadTextureFromFile(finalPath)
+                                        if rtex then
+                                            local tex_w, tex_h = renderGetTextureSize(rtex)
+                                            renderReleaseTexture(rtex)
+                                            local tex = imgui.CreateTextureFromFile(finalPath)
+                                            if tex then
+                                                table.insert(imageCacheKeys, url)
+                                                if #imageCacheKeys > 15 then
+                                                    local oldUrl = table.remove(imageCacheKeys, 1)
+                                                    if imageCache[oldUrl] and imageCache[oldUrl].tex then
+                                                        local pTex = ffi.cast("IDirect3DTexture9*", imageCache[oldUrl].tex)
+                                                        pTex.lpVtbl.Release(pTex)
+                                                        imageCache[oldUrl] = nil
+                                                    end
+                                                end
+                                                local max_dim = 300.0
+                                                local draw_w, draw_h = tex_w, tex_h
+                                                if tex_w > max_dim or tex_h > max_dim then
+                                                    local ratio = tex_w / tex_h
+                                                    if tex_w > tex_h then
+                                                        draw_w = max_dim
+                                                        draw_h = max_dim / ratio
+                                                    else
+                                                        draw_h = max_dim
+                                                        draw_w = max_dim * ratio
+                                                    end
+                                                end
+                                                imageCache[url] = { status = 2, tex = tex, w = draw_w, h = draw_h, orig_w = tex_w, orig_h = tex_h }
+                                                UI.scrollToBottom = true
+                                            else
+                                                imageCache[url] = { status = 3 }
+                                                UI.scrollToBottom = true
+                                            end
+                                        else
+                                            imageCache[url] = { status = 3 }
+                                            UI.scrollToBottom = true
+                                        end
+                                        if not globalSettings.saveImagesPersistently then
+                                            pcall(os.remove, tempPath)
+                                            activeTempFiles[tempPath] = nil
+                                        end
+                                    else
+                                        imageCache[url] = { status = 3 }
+                                        UI.scrollToBottom = true
+                                        activeTempFiles[tempPath] = nil
+                                    end
+                                end)
+                            elseif status == dlstatus.STATUS_EX_ERROR then
+                                activeDownloads = activeDownloads - 1
+                                pcall(os.remove, tempPath)
+                                activeTempFiles[tempPath] = nil
+                                imageCache[url] = { status = 3 }
+                                UI.scrollToBottom = true
+                            end
+                        end)
                     else
-                        imageCache[url] = { status = 3 }
-                        UI.scrollToBottom = true
-                        activeTempFiles[tempPath] = nil
+                        i = i + 1
                     end
-                end)
-            elseif status == dlstatus.STATUS_EX_ERROR then
-                activeDownloads = activeDownloads - 1
-                pcall(os.remove, tempPath)
-                activeTempFiles[tempPath] = nil
-                imageCache[url] = { status = 3 }
-                UI.scrollToBottom = true
+                end
             end
-        end)
+        end
     end
 end
 
@@ -1019,46 +1122,48 @@ end
 
 addEventHandler('onWindowMessage', function(msg, wparam, lparam)
     if msg == 0x0100 or msg == 0x0101 then 
-        if wparam == vkeys.VK_ESCAPE and (UI.windowState[0] or UI.viewingImage) then
+        if wparam == vkeys.VK_ESCAPE and (UI.windowState[0] or UI.viewingImage or UI.showGallery[0]) then
             consumeWindowMessage(true, false)
             if msg == 0x0100 then
+                local intercepted = false
+                
                 if UI.viewingImage then
                     UI.viewingImage = nil
-                    Sys.wasTypingEscape = true
-                    return
-                end
-                
-                if imgui.IsPopupOpen("SettingsModal") or imgui.IsPopupOpen("ContactModal") or imgui.IsPopupOpen("DeleteContactConfirm") or imgui.IsPopupOpen("LinkConfirmModal") then
-                    Sys.wasTypingEscape = true
-                    return
-                end
-                
-                if UI.showThemeEditor[0] then
+                    intercepted = true
+                elseif UI.anyModalOpen then
+                    UI.requestCloseModal = true
+                    intercepted = true
+                elseif UI.showThemeEditor[0] then
                     UI.showThemeEditor[0] = false
-                    Sys.wasTypingEscape = true
-                    return
-                end
-                if UI.showGallery[0] then
+                    intercepted = true
+                elseif UI.showGallery[0] then
                     UI.showGallery[0] = false
-                    Sys.wasTypingEscape = true
-                    return
-                end
-                if UI.showMessageSearch then
+                    intercepted = true
+                elseif UI.showMessageSearch then
                     UI.showMessageSearch = false
-                    Sys.wasTypingEscape = true
-                    return
-                end
-                if UI.showCallHistory then
+                    intercepted = true
+                elseif UI.showCallHistory then
                     UI.showCallHistory = false
-                    Sys.wasTypingEscape = true
-                    return
+                    intercepted = true
+                elseif imgui.GetIO().WantCaptureKeyboard then
+                    intercepted = true
                 end
                 
-                Sys.wasTypingEscape = imgui.GetIO().WantCaptureKeyboard
+                Sys.wasTypingEscape = intercepted
             elseif msg == 0x0101 then
                 if not Sys.wasTypingEscape then
-                    UI.windowState[0] = false
-                    SaveCurrentDraft()
+                    if globalSettings.closeChatOnEsc and activeContact then
+                        SaveCurrentDraft()
+                        activeContact = nil
+                        UI.showCallHistory = false
+                        UI.viewingCallIndex = 0
+                        UI.showMessageSearch = false
+                        UI.inputSearchMessage[0] = 0
+                        UI.inputMessage[0] = 0
+                    else
+                        UI.windowState[0] = false
+                        SaveCurrentDraft()
+                    end
                 end
                 Sys.wasTypingEscape = false
             end
@@ -1127,6 +1232,7 @@ function main()
     end
     
     ffi.copy(UI.inputOpenCommand, globalSettings.openCommand or "p")
+    ffi.copy(UI.inputChatBg, globalSettings.chatBackgroundUrl or "")
     
     if globalSettings.contactSortMode and globalSettings.contactSortMode > #sortModes then
         globalSettings.contactSortMode = 1
@@ -1139,68 +1245,6 @@ function main()
             UI.scrollToBottom = true
         else
             SaveCurrentDraft()
-        end
-    end)
-	
-	sampRegisterChatCommand("testgroup", function(param)
-        local action, rest = param:match("^(%w+)%s*(.*)")
-        if not action then
-            sampAddChatMessage("Формат: /testgroup create [ТвойНомер] [ID] [НомераДрузей_через_запятую] [Имя]", 0xFFCC00)
-            sampAddChatMessage("Формат: /testgroup send [ID] [Текст]", 0xFFCC00)
-            return
-        end
-        
-        local profile = phoneData[myNick]
-        if action == "create" then
-            local myNum, numsStr, gName = rest:match("^(%d+)%s+([%d%,]+)%s+(.*)")
-            if myNum and numsStr and gName then
-                local membersList = {}
-                for n in numsStr:gmatch("%d+") do
-                    table.insert(membersList, n)
-                end
-                
-                if #membersList > 3 then
-                    sampAddChatMessage("Ошибка: максимум 3 друга в группе!", 0xFF0000)
-                    return
-                end
-                
-                local gId = generateGroupId()
-                if not profile.groups then profile.groups = {} end
-                local profileMembers = {}
-                for _, n in ipairs(membersList) do profileMembers[n] = true end
-                
-                profile.groups[gId] = { name = gName, members = profileMembers, history = {} }
-                table.insert(profile.groups[gId].history, {sender = "me", msg = "[Система] Вы создали эту группу", timestamp = os.time()})
-                
-                save_all_data()
-                needSortContacts = true
-                
-                for i, targetNum in ipairs(membersList) do
-                    local payloadMembers = {myNum}
-                    for j, otherNum in ipairs(membersList) do
-                        if i ~= j then table.insert(payloadMembers, otherNum) end
-                    end
-                    local payloadStr = table.concat(payloadMembers, ",")
-                    table.insert(groupSmsQueue, {num = targetNum, text = "!GRP_INV|" .. gId .. "|" .. payloadStr .. "|" .. gName, groupId = gId})
-                end
-                
-                sampAddChatMessage("Группа '"..gName.."' (ID: "..gId..") создана! Инвайты отправляются.", 0x00FF00)
-            else
-                sampAddChatMessage("Ошибка! Пример: /testgroup create 9999 1111,2222 Банда", 0xFF0000)
-            end
-        elseif action == "send" then
-            local gId, text = rest:match("^(%w+)%s+(.*)")
-            if gId and text and profile.groups and profile.groups[gId] then
-                table.insert(profile.groups[gId].history, {sender = "me", msg = text, timestamp = os.time()})
-                save_all_data()
-                needSortContacts = true
-                for memNum, _ in pairs(profile.groups[gId].members) do
-                    table.insert(groupSmsQueue, {num = memNum, text = "#" .. gId .. " " .. text, groupId = gId})
-                end
-                sampAddChatMessage("Сообщение добавлено в очередь рассылки!", 0x00FF00)
-            else
-                sampAddChatMessage("Группа не найдена или ошибка ввода.", 0xFF0000)
-            end
         end
     end)
 
@@ -2130,7 +2174,8 @@ local notifyFrame = imgui.OnFrame(
         end
         
         local scale = globalSettings.uiScale or 1.0
-        imgui.GetIO().FontGlobalScale = scale
+        local fontPreview = globalSettings.fontSize / loadedFontSize
+        imgui.GetIO().FontGlobalScale = scale * fontPreview
         
         if not Sys.activeNotification then return end
 
@@ -2201,7 +2246,8 @@ local unreadIndicatorFrame = imgui.OnFrame(
         end
         
         local scale = globalSettings.uiScale or 1.0
-        imgui.GetIO().FontGlobalScale = scale
+        local fontPreview = globalSettings.fontSize / loadedFontSize
+        imgui.GetIO().FontGlobalScale = scale * fontPreview
         
         local profile = phoneData[actualPlayerNick]
         if not profile then return end
@@ -2438,6 +2484,7 @@ local function DrawGalleryWindow(scale)
 end
 
 local function DrawModals(scale)
+    UI.anyModalOpen = false
     local profile = phoneData[myNick]
     if not profile then return end
 
@@ -2447,6 +2494,9 @@ local function DrawModals(scale)
     end
     
     if imgui.BeginPopupModal("LinkConfirmModal", nil, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoTitleBar) then
+        UI.anyModalOpen = true
+        if UI.requestCloseModal then imgui.CloseCurrentPopup() UI.requestCloseModal = false end
+        
         imgui.Text(u8"Переход по ссылке")
         imgui.Spacing()
         imgui.Text(u8"Вы собираетесь открыть внешнюю ссылку в браузере:")
@@ -2462,19 +2512,12 @@ local function DrawModals(scale)
         
         if imgui.Button(u8"Перейти", imgui.ImVec2(btnWidth, 0)) then
             local safeUrl = UI.linkToOpen
-            if not safeUrl:match("^https?://") then
-                safeUrl = "http://" .. safeUrl
-            end
-            lua_thread.create(function()
-                wait(150)
-                shell32.ShellExecuteA(nil, "open", safeUrl, nil, nil, 1)
-            end)
+            if not safeUrl:match("^https?://") then safeUrl = "http://" .. safeUrl end
+            lua_thread.create(function() wait(150) shell32.ShellExecuteA(nil, "open", safeUrl, nil, nil, 1) end)
             imgui.CloseCurrentPopup()
         end
         imgui.SameLine()
-        if imgui.Button(u8"Отмена", imgui.ImVec2(btnWidth, 0)) then
-            imgui.CloseCurrentPopup()
-        end
+        if imgui.Button(u8"Отмена", imgui.ImVec2(btnWidth, 0)) then imgui.CloseCurrentPopup() end
         imgui.EndPopup()
     end
 
@@ -2484,17 +2527,16 @@ local function DrawModals(scale)
     end
 
     if imgui.BeginPopupModal("DeleteContactConfirm", nil, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoTitleBar) then
+        UI.anyModalOpen = true
+        if UI.requestCloseModal then imgui.CloseCurrentPopup() UI.requestCloseModal = false end
+        
         imgui.Text(u8"Подтверждение")
         if UI.contactToDelete then
             local rawName = profile.contacts[UI.contactToDelete] or ""
             local cName = ""
-            if UI.contactToDelete == "Bank_System" then
-                cName = u8"Банк"
-            elseif UI.contactToDelete == "System_News" then
-                cName = u8"Уведомления"
-            else
-                cName = (rawName == "" and "#" .. UI.contactToDelete or u8(rawName) .. " (" .. UI.contactToDelete .. ")")
-            end
+            if UI.contactToDelete == "Bank_System" then cName = u8"Банк"
+            elseif UI.contactToDelete == "System_News" then cName = u8"Уведомления"
+            else cName = (rawName == "" and "#" .. UI.contactToDelete or u8(rawName) .. " (" .. UI.contactToDelete .. ")") end
             imgui.Text(u8"Вы действительно хотите удалить контакт " .. cName .. u8"?\nВся история сообщений будет стерта.")
         end
         imgui.Spacing()
@@ -2520,10 +2562,7 @@ local function DrawModals(scale)
             imgui.CloseCurrentPopup()
         end
         imgui.SameLine()
-        if imgui.Button(u8"Отмена", imgui.ImVec2(btnWidth, 0)) then
-            UI.contactToDelete = nil
-            imgui.CloseCurrentPopup()
-        end
+        if imgui.Button(u8"Отмена", imgui.ImVec2(btnWidth, 0)) then UI.contactToDelete = nil imgui.CloseCurrentPopup() end
         imgui.EndPopup()
     end
     
@@ -2533,6 +2572,9 @@ local function DrawModals(scale)
     end
     
     if imgui.BeginPopupModal("ContactModal", nil, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoTitleBar) then
+        UI.anyModalOpen = true
+        if UI.requestCloseModal then imgui.CloseCurrentPopup() UI.requestCloseModal = false end
+        
         imgui.Text(u8"Управление контактом")
         imgui.Spacing()
         imgui.InputTextWithHint("##CName", u8"Имя контакта", UI.inputContactName, 256)
@@ -2544,9 +2586,7 @@ local function DrawModals(scale)
             local suggestions = {}
             local lower_input = current_nick_input:lower()
             for nick, _ in pairs(onlinePlayers) do
-                if nick:lower():find(lower_input, 1, true) and nick ~= current_nick_input then
-                    table.insert(suggestions, nick)
-                end
+                if nick:lower():find(lower_input, 1, true) and nick ~= current_nick_input then table.insert(suggestions, nick) end
             end
             if #suggestions > 0 then
                 table.sort(suggestions)
@@ -2556,9 +2596,7 @@ local function DrawModals(scale)
                 local list_height = visible_items * item_height + padding_y * 2
                 imgui.BeginChild("SuggestList", imgui.ImVec2(0, list_height), true)
                 for _, s_nick in ipairs(suggestions) do
-                    if imgui.Selectable(s_nick) then
-                        ffi.copy(UI.inputContactNick, s_nick)
-                    end
+                    if imgui.Selectable(s_nick) then ffi.copy(UI.inputContactNick, s_nick) end
                 end
                 imgui.EndChild()
             end
@@ -2577,26 +2615,22 @@ local function DrawModals(scale)
             local nick = ffi.string(UI.inputContactNick)
             if number:match("^[%d%_a%-zA%-Z]+$") then
                 profile.contacts[number] = name
-                
                 if not profile.nicknames then profile.nicknames = {} end
-                if nick ~= "" then
-                    profile.nicknames[number] = nick
-                else
-                    profile.nicknames[number] = nil
-                end
+                if nick ~= "" then profile.nicknames[number] = nick else profile.nicknames[number] = nil end
                 save_all_data()
                 needSortContacts = true
                 imgui.CloseCurrentPopup()
             end
         end
         imgui.SameLine()
-        if imgui.Button(u8"Отмена", imgui.ImVec2(btnW, 0)) then
-            imgui.CloseCurrentPopup()
-        end
+        if imgui.Button(u8"Отмена", imgui.ImVec2(btnW, 0)) then imgui.CloseCurrentPopup() end
         imgui.EndPopup()
     end
 
     if imgui.BeginPopupModal("SettingsModal", nil, imgui.WindowFlags.AlwaysAutoResize + imgui.WindowFlags.NoTitleBar) then
+        UI.anyModalOpen = true
+        if UI.requestCloseModal then imgui.CloseCurrentPopup() UI.requestCloseModal = false end
+        
         imgui.Text(u8"Настройки мессенджера")
         imgui.SameLine()
         local ver_str = tostring(script_version)
@@ -2756,7 +2790,7 @@ local function DrawModals(scale)
         end
         
         imgui.Spacing()
-        imgui.Text(u8"Шрифт интерфейса:")
+        imgui.Text(u8"Шрифт и размер текста:")
         local current_font_idx = globalSettings.font or 1
         if current_font_idx > #fontNames then current_font_idx = 1 end
         imgui.PushItemWidth(comboWidth)
@@ -2765,14 +2799,39 @@ local function DrawModals(scale)
                 if imgui.Selectable(fName, current_font_idx == i) then
                     globalSettings.font = i
                     save_all_data()
-                    thisScript():reload()
+                    lua_thread.create(function() wait(50) thisScript():reload() end)
                 end
             end
             imgui.EndCombo()
         end
         imgui.PopItemWidth()
-        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Изменить шрифт интерфейса.\nВнимание: Скрипт будет перезагружен!") end
+        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Изменить шрифт текста.\nВнимание: Скрипт будет перезагружен!") end
         
+        local fSizeArr = imgui.new.float[1](globalSettings.fontSize or 14.0)
+        imgui.PushItemWidth(100 * scale)
+        if imgui.SliderFloat("##FontSize", fSizeArr, 10.0, 24.0, "%.1f") then
+            globalSettings.fontSize = fSizeArr[0]
+            UI.forceResize = true
+            save_all_data()
+        end
+        imgui.PopItemWidth()
+        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Настроить размер шрифта.\nИзменения отображаются сразу в предпросмотре.") end
+        
+        imgui.SameLine()
+        if imgui.Button(u8"Сбросить") then
+            globalSettings.fontSize = 14.0
+            UI.forceResize = true
+            save_all_data()
+            lua_thread.create(function() wait(50) thisScript():reload() end)
+        end
+        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Вернуть стандартный размер шрифта (14.0).") end
+        
+        imgui.SameLine()
+        if imgui.Button(u8"Применить и перезагрузить##Font") then
+            save_all_data()
+            lua_thread.create(function() wait(50) thisScript():reload() end)
+        end
+        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Запечь шрифт в новом размере для высокого качества.\nВнимание: Скрипт будет перезагружен!") end
         imgui.Spacing()
         imgui.Text(u8"Масштаб интерфейса:")
         local uiScaleArr = imgui.new.float[1](globalSettings.uiScale or 1.0)
@@ -2864,7 +2923,7 @@ local function DrawModals(scale)
         if imgui.Button(u8"Сохранить команду и перезагрузить") then
             globalSettings.openCommand = ffi.string(UI.inputOpenCommand)
             save_all_data()
-            thisScript():reload()
+            lua_thread.create(function() wait(50) thisScript():reload() end)
         end
         imgui.PopItemWidth()
         if imgui.IsItemHovered() then imgui.SetTooltip(u8"Изменить команду для открытия (например: /phone).\nВнимание: Скрипт будет перезагружен!") end
@@ -2876,12 +2935,33 @@ local function DrawModals(scale)
         imgui.Text(u8"Дополнительные функции:")
         imgui.Spacing()
         
+        UI.settingCloseChatOnEsc[0] = globalSettings.closeChatOnEsc or false
+        if imgui.Checkbox(u8"Закрывать диалог по нажатию ESC", UI.settingCloseChatOnEsc) then
+            globalSettings.closeChatOnEsc = UI.settingCloseChatOnEsc[0]
+            save_all_data()
+        end
+        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Если включено, ESC сначала закроет открытый диалог (вернет к списку), а повторное нажатие закроет мессенджер.") end
+
+        UI.settingSaveImages[0] = globalSettings.saveImagesPersistently or false
+        if imgui.Checkbox(u8"Сохранять картинки на диске (Кэширование)", UI.settingSaveImages) then
+            globalSettings.saveImagesPersistently = UI.settingSaveImages[0]
+            save_all_data()
+        end
+        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Картинки сохраняются в папку images и не скачиваются повторно, ускоряя загрузку и экономя трафик.") end
+        
         UI.settingHideUnread[0] = globalSettings.hideUnreadOnLogin or false
         if imgui.Checkbox(u8"Скрывать непрочитанные при входе", UI.settingHideUnread) then
             globalSettings.hideUnreadOnLogin = UI.settingHideUnread[0]
             save_all_data()
         end
         if imgui.IsItemHovered() then imgui.SetTooltip(u8"Скрывать из чата оффлайн-сообщения (UNREAD SMS), которые приходят при авторизации. Они всё равно будут сохранены в историю.") end
+
+        UI.settingHideContactNumber[0] = globalSettings.hideContactNumber or false
+        if imgui.Checkbox(u8"Скрывать номер у сохраненных контактов", UI.settingHideContactNumber) then
+            globalSettings.hideContactNumber = UI.settingHideContactNumber[0]
+            save_all_data()
+        end
+        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Если у контакта задано имя, его номер не будет отображаться в списке контактов (в чате он останется).") end
 
         UI.settingScreenNotif[0] = globalSettings.useScreenNotifications
         if imgui.Checkbox(u8"Всплывающие уведомления (и скрытие SMS из чата)", UI.settingScreenNotif) then
@@ -2926,9 +3006,7 @@ local function DrawModals(scale)
         if imgui.IsItemHovered() then imgui.SetTooltip(u8"Автоматически проверять наличие новых версий скрипта при запуске игры.") end
         
         imgui.SameLine()
-        if imgui.Button(u8"Проверить обновление") then
-            checkUpdates(true)
-        end
+        if imgui.Button(u8"Проверить обновление") then checkUpdates(true) end
         if imgui.IsItemHovered() then imgui.SetTooltip(u8"Принудительно проверить новые версии прямо сейчас.") end
         
         imgui.Spacing()
@@ -2936,18 +3014,13 @@ local function DrawModals(scale)
         imgui.Spacing()
         
         local dbSize = 0
-        if file_exists(masterFile) then
-            dbSize = lfs.attributes(masterFile, "size") or 0
-        end
+        local dbFile = getWorkingDirectory() .. '\\config\\Messenger.json'
+        if file_exists(dbFile) then dbSize = lfs.attributes(dbFile, "size") or 0 end
         
         local sizeText = ""
-        if dbSize < 1024 then
-            sizeText = string.format("%d B", dbSize)
-        elseif dbSize < 1048576 then
-            sizeText = string.format("%.2f KB", dbSize / 1024.0)
-        else
-            sizeText = string.format("%.2f MB", dbSize / 1048576.0)
-        end
+        if dbSize < 1024 then sizeText = string.format("%d B", dbSize)
+        elseif dbSize < 1048576 then sizeText = string.format("%.2f KB", dbSize / 1024.0)
+        else sizeText = string.format("%.2f MB", dbSize / 1048576.0) end
         
         local btnWidth = 100 * scale
         local currentY = imgui.GetCursorPosY()
@@ -2957,14 +3030,10 @@ local function DrawModals(scale)
         
         imgui.SameLine()
         local availRight = imgui.GetContentRegionAvail().x
-        if availRight > btnWidth then
-            imgui.SetCursorPosX(imgui.GetCursorPosX() + availRight - btnWidth)
-        end
+        if availRight > btnWidth then imgui.SetCursorPosX(imgui.GetCursorPosX() + availRight - btnWidth) end
         
         imgui.SetCursorPosY(currentY)
-        if imgui.Button(u8"Закрыть", imgui.ImVec2(btnWidth, 0)) then
-            imgui.CloseCurrentPopup()
-        end
+        if imgui.Button(u8"Закрыть", imgui.ImVec2(btnWidth, 0)) then imgui.CloseCurrentPopup() end
         
         imgui.EndPopup()
     end
@@ -3120,19 +3189,15 @@ local function DrawContactsList(scale, profile, leftAvailW)
         end
         if profile.history and profile.history["Bank_System"] then uniqueNumbers["Bank_System"] = true end
         if profile.history and profile.history["System_News"] then uniqueNumbers["System_News"] = true end
-        if profile.groups then
-            for gId, _ in pairs(profile.groups) do uniqueNumbers[gId] = true end
-        end
         for num, _ in pairs(uniqueNumbers) do
-            local isGroup = profile.groups and profile.groups[num]
-            local name = isGroup and profile.groups[num].name or (profile.contacts[num] or "")
+            local name = profile.contacts[num] or ""
             local hasName = (name ~= "")
-            local hist = isGroup and profile.groups[num].history or (profile.history and profile.history[num])
+            local hist = profile.history and profile.history[num]
             local hasHistory = (hist and #hist > 0)
             local calls = profile.calls and profile.calls[num]
             local hasCalls = (calls and #calls > 0)
             local isSystem = (num == "Bank_System" or num == "System_News")
-            if hasName or hasHistory or hasCalls or isSystem or isGroup then
+            if hasName or hasHistory or hasCalls or isSystem then
                 local last_ts = 0
                 if hasHistory then
                     last_ts = hist[#hist].timestamp or 0
@@ -3169,11 +3234,9 @@ local function DrawContactsList(scale, profile, leftAvailW)
     end
     imgui.BeginChild("ContactsList", imgui.ImVec2(0, 0), true)
     local sContactText = cp1251_lower(u8:decode(ffi.string(UI.inputSearchContact)))
-    local deleteGroupNum = nil
     for _, c in ipairs(cachedSortedContacts) do
         local num = c.num
         local name = c.name
-        local isGroup = profile.groups and profile.groups[num]
         local skipContact = false
         if sContactText ~= "" then
             local lowerName = cp1251_lower(name)
@@ -3183,8 +3246,6 @@ local function DrawContactsList(scale, profile, leftAvailW)
                 localDisplay = cp1251_lower(u8:decode(u8"Банк"))
             elseif num == "System_News" then 
                 localDisplay = cp1251_lower(u8:decode(u8"Уведомления"))
-            elseif isGroup then
-                localDisplay = cp1251_lower(u8:decode(u8"[Группа] " .. u8(name)))
             else 
                 localDisplay = lowerName == "" and ("#" .. lowerNum) or (lowerName .. " (" .. lowerNum .. ")")
             end
@@ -3206,10 +3267,16 @@ local function DrawContactsList(scale, profile, leftAvailW)
                 displayName = u8"Банк"
             elseif num == "System_News" then
                 displayName = u8"Уведомления"
-            elseif isGroup then
-                displayName = u8"[Группа] " .. u8(name)
             else
-                displayName = (name == "" and "#" .. num or u8(name) .. " (" .. num .. ")")
+                if name == "" then
+                    displayName = "#" .. num
+                else
+                    if globalSettings.hideContactNumber then
+                        displayName = u8(name)
+                    else
+                        displayName = u8(name) .. " (" .. num .. ")"
+                    end
+                end
             end
             local cursorPos = imgui.GetCursorScreenPos()
             local avail_w = imgui.GetContentRegionAvail().x
@@ -3275,26 +3342,6 @@ local function DrawContactsList(scale, profile, leftAvailW)
                         if activeContact == num then activeContact = nil end
                         save_all_data()
                         needSortContacts = true
-                    end
-                elseif isGroup then
-                    local muteText = profile.muted and profile.muted[num] and u8"Включить уведомления" or u8"Отключить уведомления"
-                    if imgui.Selectable(muteText) then
-                        if not profile.muted then profile.muted = {} end
-                        profile.muted[num] = not profile.muted[num]
-                        if profile.muted[num] then
-                            if Sys.activeNotification and Sys.activeNotification.number == num then Sys.activeNotification = nil end
-                        end
-                        save_all_data()
-                    end
-                    imgui.Separator()
-                    if imgui.Selectable(u8"Очистить историю") then
-                        profile.groups[num].history = {}
-                        profile.unread[num] = nil
-                        save_all_data()
-                        needSortContacts = true
-                    end
-                    if imgui.Selectable(u8"Удалить группу у всех") then
-                        deleteGroupNum = num
                     end
                 else
                     if imgui.Selectable(u8"Изменить") then
@@ -3365,7 +3412,7 @@ local function DrawContactsList(scale, profile, leftAvailW)
             dl:AddRectFilled(p_min, p_max, imgui.GetColorU32Vec4(bg_color), 8.0)
             local time_str = ""
             local snippet = ""
-            local hist = isGroup and profile.groups[num].history or (profile.history and profile.history[num])
+            local hist = profile.history and profile.history[num]
             local calls = profile.calls and profile.calls[num]
             local last_sms_ts = (hist and #hist > 0) and hist[#hist].timestamp or 0
             local last_call_ts = (calls and #calls > 0) and calls[#calls].timestamp or 0
@@ -3387,13 +3434,31 @@ local function DrawContactsList(scale, profile, leftAvailW)
             else
                 snippet = u8"Нет сообщений"
             end
-            local name_color = imgui.ImVec4(1, 1, 1, 1)
-            dl:AddText(imgui.ImVec2(p_min.x + 10, p_min.y + 6), imgui.GetColorU32Vec4(name_color), displayName)
-            local nextOffset = 10 + imgui.CalcTextSize(displayName).x
+            local time_w = imgui.CalcTextSize(time_str).x
+            local badges_w = 0
             local isVerified = (num == "Bank_System" or num == "System_News" or (profile.verified and profile.verified[num]))
+            if isVerified then badges_w = badges_w + (22 * scale) end
+            if profile.muted and profile.muted[num] then badges_w = badges_w + imgui.CalcTextSize(u8" [Мут]").x end
+            if profile.blocked and profile.blocked[num] then badges_w = badges_w + imgui.CalcTextSize(u8" [ЧС]").x end
+            if profile.nicknames and profile.nicknames[num] and onlinePlayers[profile.nicknames[num]] then badges_w = badges_w + (14 * scale) end
+            
+            local max_name_w = avail_w - time_w - badges_w - (30 * scale)
+            local truncDisplayName = truncateText(displayName, max_name_w)
+
+            local name_color = imgui.ImVec4(1, 1, 1, 1)
+            dl:AddText(imgui.ImVec2(p_min.x + 10, p_min.y + 6), imgui.GetColorU32Vec4(name_color), truncDisplayName)
+            local nextOffset = 10 + imgui.CalcTextSize(truncDisplayName).x
+            
             if isVerified then
                 local badge_center = imgui.ImVec2(p_min.x + nextOffset + (12 * scale), p_min.y + (6 * scale) + imgui.GetTextLineHeight() / 2)
                 DrawVerificationBadge(dl, badge_center, 6.0 * scale, scale)
+                
+                local old_pos = imgui.GetCursorScreenPos()
+                imgui.SetCursorScreenPos(imgui.ImVec2(badge_center.x - 6*scale, badge_center.y - 6*scale))
+                imgui.InvisibleButton("##BadgeTipList" .. num, imgui.ImVec2(12*scale, 12*scale))
+                if imgui.IsItemHovered() then imgui.SetTooltip(u8"Этот контакт официально верифицирован.") end
+                imgui.SetCursorScreenPos(old_pos)
+                
                 nextOffset = nextOffset + (22 * scale)
             end
             if profile.muted and profile.muted[num] then
@@ -3416,7 +3481,6 @@ local function DrawContactsList(scale, profile, leftAvailW)
                     dl:AddCircleFilled(circle_center, 4.0 * scale, imgui.GetColorU32Vec4(onlineCol))
                 end
             end
-            local time_w = imgui.CalcTextSize(time_str).x
             dl:AddText(imgui.ImVec2(p_max.x - time_w - (10 * scale), p_min.y + (6 * scale)), imgui.GetColorU32Vec4(imgui.ImVec4(0.6, 0.6, 0.6, 1.0)), time_str)
             if is_unread and not is_selected then
                 local unreadCount = type(profile.unread[num]) == "number" and profile.unread[num] or 1
@@ -3452,60 +3516,23 @@ local function DrawContactsList(scale, profile, leftAvailW)
             imgui.PopID()
         end
     end
-    if deleteGroupNum then
-        for memNum, _ in pairs(profile.groups[deleteGroupNum].members) do
-            table.insert(groupSmsQueue, {num = memNum, text = "!GRP_DEL|" .. deleteGroupNum, groupId = deleteGroupNum})
-        end
-        profile.groups[deleteGroupNum] = nil
-        profile.unread[deleteGroupNum] = nil
-        if profile.muted then profile.muted[deleteGroupNum] = nil end
-        if profile.drafts then profile.drafts[deleteGroupNum] = nil end
-        if activeContact == deleteGroupNum then activeContact = nil end
-        save_all_data()
-        needSortContacts = true
-    end
     imgui.EndChild()
 end
 
 local function DrawChatHistory(scale, profile)
     if activeContact then
-        local isGroup = profile.groups and profile.groups[activeContact]
         local contactName = ""
-        local tooltipText = nil
         if activeContact == "Bank_System" then
             contactName = u8"Банк"
         elseif activeContact == "System_News" then
             contactName = u8"Уведомления"
-        elseif isGroup then
-            local memCount = 1
-            local memListStr = u8"Вы\n"
-            for mNum, _ in pairs(profile.groups[activeContact].members) do
-                memCount = memCount + 1
-                local mName = profile.contacts[mNum]
-                local dName = ""
-                if mName and mName ~= "" then
-                    dName = u8(mName) .. " (" .. mNum .. ")"
-                else
-                    dName = "#" .. mNum
-                end
-                local mNick = profile.nicknames and profile.nicknames[mNum]
-                if mNick and onlinePlayers[mNick] then
-                    dName = dName .. u8" [Онлайн]"
-                end
-                memListStr = memListStr .. dName .. "\n"
-            end
-            contactName = u8"[Группа] " .. u8(profile.groups[activeContact].name) .. " (" .. memCount .. u8" уч.)"
-            tooltipText = memListStr
         else
             local rawName = profile.contacts[activeContact] or ""
-            contactName = (rawName == "" and "#" .. activeContact or u8(rawName))
+            contactName = (rawName == "" and "#" .. activeContact or u8(rawName) .. " (" .. activeContact .. ")")
         end
         local isSystemChat = (activeContact == "Bank_System" or activeContact == "System_News")
         imgui.AlignTextToFramePadding()
         imgui.Text(u8"Диалог: " .. contactName)
-        if tooltipText and imgui.IsItemHovered() then
-            imgui.SetTooltip(u8"Участники:\n" .. tooltipText)
-        end
         local isVerifiedChat = (isSystemChat or (profile.verified and profile.verified[activeContact]))
         if isVerifiedChat then
             imgui.SameLine(0, 2 * scale)
@@ -3543,25 +3570,22 @@ local function DrawChatHistory(scale, profile)
             local searchBtnWidth = imgui.CalcTextSize(searchBtnText).x + (framePadX * 2.0)
             local galBtnWidth = imgui.CalcTextSize(galBtnText).x + (framePadX * 2.0)
             local callHistBtnWidth = imgui.CalcTextSize(callHistBtnText).x + (framePadX * 2.0)
-            local totalRightBtnsWidth = searchBtnWidth + galBtnWidth + spaceX
-            if not isGroup then
-                totalRightBtnsWidth = totalRightBtnsWidth + geoBtnWidth + callHistBtnWidth + (spaceX * 2)
-            end
+            
+            local totalRightBtnsWidth = searchBtnWidth + galBtnWidth + geoBtnWidth + callHistBtnWidth + (spaceX * 3)
             local right_edge = imgui.GetCursorPosX() + imgui.GetContentRegionAvail().x
             imgui.SameLine()
             if right_edge - totalRightBtnsWidth > imgui.GetCursorPosX() then
                 imgui.SetCursorPosX(right_edge - totalRightBtnsWidth)
             end
-            if not isGroup then
-                if imgui.Button(callHistBtnText) then
-                    UI.showCallHistory = not UI.showCallHistory
-                    UI.viewingCallIndex = 0
-                    UI.showMessageSearch = false
-                    UI.showGallery[0] = false
-                end
-                if imgui.IsItemHovered() then imgui.SetTooltip(u8"Посмотреть историю звонков с этим контактом") end
-                imgui.SameLine(0, spaceX)
+            
+            if imgui.Button(callHistBtnText) then
+                UI.showCallHistory = not UI.showCallHistory
+                UI.viewingCallIndex = 0
+                UI.showMessageSearch = false
+                UI.showGallery[0] = false
             end
+            if imgui.IsItemHovered() then imgui.SetTooltip(u8"Посмотреть историю звонков с этим контактом") end
+            imgui.SameLine(0, spaceX)
             
             if imgui.Button(galBtnText) then
                 UI.showGallery[0] = not UI.showGallery[0]
@@ -3583,9 +3607,8 @@ local function DrawChatHistory(scale, profile)
             end
             if imgui.IsItemHovered() then imgui.SetTooltip(u8"Поиск по сообщениям в текущем диалоге") end
             
-            if not isGroup then
-                imgui.SameLine(0, spaceX)
-                if imgui.Button(geoBtnText) then
+            imgui.SameLine(0, spaceX)
+            if imgui.Button(geoBtnText) then
                     Macro.targetGeoNumber = tostring(activeContact):match("%d+")
                     if Macro.targetGeoNumber then
                         UI.windowState[0] = false 
@@ -3654,7 +3677,6 @@ local function DrawChatHistory(scale, profile)
                         showSystemNotification(u8"Ошибка: неверный номер телефона.", 2)
                     end
                 end
-            end
 			if imgui.IsItemHovered() then imgui.SetTooltip(u8"Автоматически отправить свои координаты этому контакту") end
         else
             local searchBtnText = u8"Поиск"
@@ -3724,7 +3746,7 @@ local function DrawChatHistory(scale, profile)
                             end
                             imgui.EndPopup()
                         elseif imgui.IsItemHovered() then
-                            imgui.SetTooltip(u8"ПКМ — удалить звонок")
+                            imgui.SetTooltip(u8"ПКМ - удалить звонок")
                         end
                         imgui.PopID()
                     end
@@ -3778,8 +3800,80 @@ local function DrawChatHistory(scale, profile)
             end
             imgui.EndChild()
         else
+            imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(0, 0))
             imgui.BeginChild("ChatHistory", imgui.ImVec2(0, -40 * scale), true)
-            local currentHistory = isGroup and profile.groups[activeContact].history or profile.history[activeContact]
+            imgui.PopStyleVar()
+            
+            imgui.SetCursorPosY(10 * scale)
+            
+            if not UI.localBgCheckTime or os.clock() - UI.localBgCheckTime > 2.0 then
+                UI.localBgCheckTime = os.clock()
+                UI.localBgPath = nil
+                if file_exists(imagesFolder .. "background.png") then UI.localBgPath = imagesFolder .. "background.png"
+                elseif file_exists(imagesFolder .. "background.jpg") then UI.localBgPath = imagesFolder .. "background.jpg"
+                end
+            end
+
+            local bgUrl = nil
+            local isLocalBg = false
+            
+            if globalVerified[activeContact] and globalVerified[activeContact].background_url and globalVerified[activeContact].background_url ~= "" then
+                bgUrl = globalVerified[activeContact].background_url
+            elseif UI.localBgPath then
+                bgUrl = UI.localBgPath
+                isLocalBg = true
+            end
+
+            if bgUrl then
+                if not imageCache[bgUrl] then
+                    if isLocalBg then
+                        imageCache[bgUrl] = { status = 1 }
+                        lua_thread.create(function()
+                            wait(0)
+                            local rtex = renderLoadTextureFromFile(bgUrl)
+                            if rtex then
+                                local tex_w, tex_h = renderGetTextureSize(rtex)
+                                renderReleaseTexture(rtex)
+                                local tex = imgui.CreateTextureFromFile(bgUrl)
+                                if tex then
+                                    imageCache[bgUrl] = { status = 2, tex = tex, w = tex_w, h = tex_h, orig_w = tex_w, orig_h = tex_h }
+                                else
+                                    imageCache[bgUrl] = { status = 3 }
+                                end
+                            else
+                                imageCache[bgUrl] = { status = 3 }
+                            end
+                        end)
+                    else
+                        if globalSettings.autoDownloadMedia then downloadImageToCache(bgUrl) else imageCache[bgUrl] = { status = 4 } end
+                    end
+                end
+                
+                local bg = imageCache[bgUrl]
+                if bg and bg.status == 2 then
+                    local dl = imgui.GetWindowDrawList()
+                    local c_pos = imgui.GetWindowPos()
+                    local c_size = imgui.GetWindowSize()
+                    
+                    local scale_w = c_size.x / bg.orig_w
+                    local scale_h = c_size.y / bg.orig_h
+                    local max_scale = math.max(scale_w, scale_h)
+                    
+                    local draw_w = bg.orig_w * max_scale
+                    local draw_h = bg.orig_h * max_scale
+                    local off_x = (c_size.x - draw_w) / 2
+                    local off_y = (c_size.y - draw_h) / 2
+                    
+                    dl:AddImage(bg.tex, 
+                        imgui.ImVec2(c_pos.x + off_x, c_pos.y + off_y), 
+                        imgui.ImVec2(c_pos.x + off_x + draw_w, c_pos.y + off_y + draw_h), 
+                        imgui.ImVec2(0, 0), imgui.ImVec2(1, 1), 
+                        imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 0.15))
+                    )
+                end
+            end
+            
+            local currentHistory = profile.history[activeContact]
             local deleteMsgIndex = nil
             if currentHistory then
                 local last_date_str = ""
@@ -3804,11 +3898,6 @@ local function DrawChatHistory(scale, profile)
                         local textToDisplay = text
                         local sName = nil
                         local isVer = false
-                        if isGroup and msgData.sender ~= "me" then
-                            sName = profile.contacts[msgData.sender]
-                            sName = (sName and sName ~= "") and sName or ("#" .. msgData.sender)
-                            isVer = profile.verified and profile.verified[msgData.sender]
-                        end
                         for word in text:gmatch("%S+") do
                             local isUrl = false
                             if word:match("^https?://[a-zA-Z0-9_%-%.%?%.:/%+=&]+") then
@@ -3924,9 +4013,9 @@ local function DrawChatHistory(scale, profile)
                             end
                             local bubble_start_y = imgui.GetCursorPosY()
                             local windowWidth = imgui.GetWindowWidth()
-                            local cursorX = imgui.GetCursorPosX()
+                            local cursorX = 10 * scale
                             if msgData.sender == "me" then
-                                cursorX = windowWidth - bubbleSize.x - 20
+                                cursorX = windowWidth - bubbleSize.x - (25 * scale)
                             end
                             imgui.SetCursorPos(imgui.ImVec2(cursorX, bubble_start_y))
                             local screenPos = imgui.GetCursorScreenPos()
@@ -3956,7 +4045,7 @@ local function DrawChatHistory(scale, profile)
                                 end
                                 imgui.EndPopup()
                             elseif imgui.IsItemHovered() then
-                                imgui.SetTooltip(u8"ПКМ — управление сообщением")
+                                imgui.SetTooltip(u8"ПКМ - управление сообщением")
                             end
                             local currentOffset = bubble_start_y + padding.y
                             if sName then
@@ -4160,7 +4249,8 @@ local newFrame = imgui.OnFrame(
         end
         
         local scale = globalSettings.uiScale or 1.0
-        imgui.GetIO().FontGlobalScale = scale
+        local fontPreview = globalSettings.fontSize / loadedFontSize
+        imgui.GetIO().FontGlobalScale = scale * fontPreview
         
         local resX, resY = getScreenResolution()
         imgui.SetNextWindowPos(imgui.ImVec2(resX / 2, resY / 2), imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
@@ -4216,19 +4306,7 @@ local newFrame = imgui.OnFrame(
 function sendMessage(number)
     local text = u8:decode(ffi.string(UI.inputMessage))
     if text ~= "" then
-        local profile = phoneData[myNick]
-        local isGroup = profile and profile.groups and profile.groups[number]
-        
-        if isGroup then
-            table.insert(profile.groups[number].history, {sender = "me", msg = text, timestamp = os.time()})
-            for memNum, _ in pairs(profile.groups[number].members) do
-                table.insert(groupSmsQueue, {num = memNum, text = "#" .. number .. " " .. text, groupId = number})
-            end
-            save_all_data()
-            needSortContacts = true
-        else
-            sampSendChat("/sms " .. number .. " " .. text)
-        end
+        sampSendChat("/sms " .. number .. " " .. text)
         
         ClearDraft(number)
         UI.scrollToBottom = true
