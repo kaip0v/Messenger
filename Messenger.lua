@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.89
+local script_version = 1.9
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -2173,9 +2173,11 @@ local notifyFrame = imgui.OnFrame(
             imgui.PushFont(customFonts[globalSettings.font])
         end
         
-        local scale = globalSettings.uiScale or 1.0
-        local fontPreview = globalSettings.fontSize / loadedFontSize
-        imgui.GetIO().FontGlobalScale = scale * fontPreview
+        local baseScale = globalSettings.uiScale or 1.0
+        local fontScale = (globalSettings.fontSize or 14.0) / 14.0
+        local scale = baseScale * fontScale
+        local fontPreview = (globalSettings.fontSize or 14.0) / loadedFontSize
+        imgui.GetIO().FontGlobalScale = baseScale * fontPreview
         
         if not Sys.activeNotification then return end
 
@@ -2245,9 +2247,11 @@ local unreadIndicatorFrame = imgui.OnFrame(
             imgui.PushFont(customFonts[globalSettings.font])
         end
         
-        local scale = globalSettings.uiScale or 1.0
-        local fontPreview = globalSettings.fontSize / loadedFontSize
-        imgui.GetIO().FontGlobalScale = scale * fontPreview
+        local baseScale = globalSettings.uiScale or 1.0
+        local fontScale = (globalSettings.fontSize or 14.0) / 14.0
+        local scale = baseScale * fontScale
+        local fontPreview = (globalSettings.fontSize or 14.0) / loadedFontSize
+        imgui.GetIO().FontGlobalScale = baseScale * fontPreview
         
         local profile = phoneData[actualPlayerNick]
         if not profile then return end
@@ -3541,14 +3545,11 @@ local function DrawChatHistory(scale, profile)
             local b_radius = 6.5 * scale
             local badge_center = imgui.ImVec2(c_pos.x + b_radius, c_pos.y + (imgui.GetTextLineHeight() / 2) + (2.0 * scale))
             DrawVerificationBadge(dl, badge_center, b_radius, scale)
-            local ret_pos = imgui.GetCursorScreenPos()
-            imgui.SetCursorScreenPos(imgui.ImVec2(badge_center.x - 8, badge_center.y - 8))
-            imgui.InvisibleButton("BadgeHintHead", imgui.ImVec2(16, 16))
+            
+            imgui.InvisibleButton("BadgeHintHead", imgui.ImVec2(b_radius * 2, b_radius * 2))
             if imgui.IsItemHovered() then
                 imgui.SetTooltip(u8"Этот контакт официально верифицирован.")
             end
-            imgui.SetCursorScreenPos(ret_pos)
-            imgui.SetCursorPosX(imgui.GetCursorPosX() + (b_radius * 2) + (2 * scale))
         end
         if profile.muted and profile.muted[activeContact] then
             imgui.SameLine(0, 4 * scale)
@@ -3573,9 +3574,12 @@ local function DrawChatHistory(scale, profile)
             
             local totalRightBtnsWidth = searchBtnWidth + galBtnWidth + geoBtnWidth + callHistBtnWidth + (spaceX * 3)
             local right_edge = imgui.GetCursorPosX() + imgui.GetContentRegionAvail().x
-            imgui.SameLine()
+            
             if right_edge - totalRightBtnsWidth > imgui.GetCursorPosX() then
+                imgui.SameLine()
                 imgui.SetCursorPosX(right_edge - totalRightBtnsWidth)
+            else
+                imgui.Spacing()
             end
             
             if imgui.Button(callHistBtnText) then
@@ -3682,11 +3686,15 @@ local function DrawChatHistory(scale, profile)
             local searchBtnText = u8"Поиск"
             local framePadX = imgui.GetStyle().FramePadding.x
             local searchBtnWidth = imgui.CalcTextSize(searchBtnText).x + (framePadX * 2.0)
-            imgui.SameLine()
-            local availRight = imgui.GetContentRegionAvail().x
-            if availRight > searchBtnWidth then
-                imgui.SetCursorPosX(imgui.GetCursorPosX() + availRight - searchBtnWidth)
+            local right_edge = imgui.GetCursorPosX() + imgui.GetContentRegionAvail().x
+            
+            if right_edge - searchBtnWidth > imgui.GetCursorPosX() then
+                imgui.SameLine()
+                imgui.SetCursorPosX(right_edge - searchBtnWidth)
+            else
+                imgui.Spacing()
             end
+            
             if imgui.Button(searchBtnText) then
                 UI.showMessageSearch = not UI.showMessageSearch
                 if UI.showMessageSearch then 
@@ -4256,15 +4264,18 @@ local newFrame = imgui.OnFrame(
             imgui.PushFont(customFonts[globalSettings.font])
         end
         
-        local scale = globalSettings.uiScale or 1.0
-        local fontPreview = globalSettings.fontSize / loadedFontSize
-        imgui.GetIO().FontGlobalScale = scale * fontPreview
+        local baseScale = globalSettings.uiScale or 1.0
+        local fontScale = (globalSettings.fontSize or 14.0) / 14.0
+        local scale = baseScale * fontScale
+        local fontPreview = (globalSettings.fontSize or 14.0) / loadedFontSize
+        imgui.GetIO().FontGlobalScale = baseScale * fontPreview
         
         local resX, resY = getScreenResolution()
         imgui.SetNextWindowPos(imgui.ImVec2(resX / 2, resY / 2), imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
         
         local sizeCond = UI.forceResize and imgui.Cond.Always or imgui.Cond.FirstUseEver
         imgui.SetNextWindowSize(imgui.ImVec2(750 * scale, 500 * scale), sizeCond)
+        if UI.forceResize then UI.forceResize = false end
         
         local profile = phoneData[myNick]
         if not profile then return end
@@ -4303,7 +4314,6 @@ local newFrame = imgui.OnFrame(
         
         imgui.PopStyleVar(4)
         imgui.PopStyleColor(20) 
-        if UI.forceResize then UI.forceResize = false end
         
         if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
             imgui.PopFont()
