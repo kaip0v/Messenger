@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 1.9
+local script_version = 2.0
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -53,11 +53,12 @@ local function fromHex(str)
     end))
 end
 
-local masterFile = getWorkingDirectory() .. '\\config\\Messenger.json'
-local oldDataFile = getWorkingDirectory() .. '\\config\\messenger_data.json'
-local oldSettingsFile = getWorkingDirectory() .. '\\config\\messenger_settings.json'
+local oldMasterFile = getWorkingDirectory() .. '\\config\\Messenger.json'
+local settingsFile = getWorkingDirectory() .. '\\config\\Messenger\\settings.json'
 
 local phoneData = {}
+local activeChatHistory = nil
+local activeChatId = nil
 local groupSmsQueue = {}
 local lastGroupSmsTime = 0
 local lastAttemptedGroupNum = nil
@@ -510,9 +511,10 @@ imgui.OnInitialize(function()
     local glyphRanges = imgui.GetIO().Fonts:GetGlyphRangesCyrillic()
     
     local currentFont = 1
-    local currentSize = 14.0
-    local file = io.open(masterFile, "rb")
-    if file then
+        local currentSize = 14.0
+        local file = io.open(settingsFile, "rb")
+        if not file then file = io.open(oldMasterFile, "rb") end
+        if file then
         local content = file:read("*a")
         file:close()
         local fontMatch = content:match('%["font"%]%s*=%s*(%d+)') or content:match('["\']font["\']%s*:%s*(%d+)')
@@ -574,12 +576,45 @@ local function load_json(path)
     return false
 end
 
+local function save_global_settings()
+    save_json(settingsFile, globalSettings)
+end
+
+local function save_profile_data(nick)
+    if not phoneData[nick] then return end
+    local pDir = getWorkingDirectory() .. '\\config\\Messenger\\' .. nick
+    pcall(lfs.mkdir, pDir)
+    pcall(lfs.mkdir, pDir .. '\\chats')
+    local pData = {}
+    for k, v in pairs(phoneData[nick]) do
+        if k ~= "history" then pData[k] = v end
+    end
+    save_json(pDir .. '\\profile.json', pData)
+end
+
+local function save_chat_data(nick, chatId, historyData)
+    local path = getWorkingDirectory() .. '\\config\\Messenger\\' .. nick .. '\\chats\\' .. chatId .. '.json'
+    save_json(path, historyData)
+end
+
 local function save_all_data()
-    local toSave = {
-        global_settings = globalSettings,
-        profiles = phoneData
-    }
-    save_json(masterFile, toSave)
+    save_global_settings()
+    for nick, _ in pairs(phoneData) do
+        save_profile_data(nick)
+    end
+    if myNick and activeChatId and activeChatHistory then
+        save_chat_data(myNick, activeChatId, activeChatHistory)
+    end
+end
+
+local function load_chat_history(nick, chatId)
+    if not nick or not chatId then return {} end
+    local path = getWorkingDirectory() .. '\\config\\Messenger\\' .. nick .. '\\chats\\' .. chatId .. '.json'
+    if file_exists(path) then
+        local data = load_json(path)
+        return type(data) == "table" and data or {}
+    end
+    return {}
 end
 
 local function get_day_string(ts)
@@ -732,8 +767,27 @@ end
 
 local function addSmsToHistory(profile, number, sender, text, ts)
     if not profile.contacts[number] then profile.contacts[number] = "" end
-    if not profile.history[number] then profile.history[number] = {} end
-    table.insert(profile.history[number], {sender = sender, msg = text, timestamp = ts})
+    if not profile.metadata then profile.metadata = {} end
+    profile.metadata[number] = { sender = sender, text = text, timestamp = ts }
+    
+    local targetNick = nil
+    for nick, p in pairs(phoneData) do
+        if p == profile then targetNick = nick break end
+    end
+    
+    if targetNick then
+        local hist = {}
+        if targetNick == myNick and activeChatId == number and activeChatHistory then
+            hist = activeChatHistory
+        else
+            hist = load_chat_history(targetNick, number)
+        end
+        table.insert(hist, {sender = sender, msg = text, timestamp = ts})
+        if targetNick == myNick and activeChatId == number then
+            activeChatHistory = hist
+        end
+        save_chat_data(targetNick, number, hist)
+    end
     save_all_data()
 end
 
@@ -1058,7 +1112,7 @@ function checkUpdates(is_manual)
                                                 local decoded = u8:decode(changelogText)
                                                 if decoded then text_to_save = decoded end
                                             end
-                                            local sys_num = "System_News"
+                                            local sys_num = "system"
                                             local base_profile = nil
                                             for _, p in pairs(phoneData) do base_profile = p break end
                                             if base_profile then
@@ -1192,43 +1246,78 @@ function main()
     
     cleanupGhostFiles()
     
-    if file_exists(masterFile) then
-        local masterData = load_json(masterFile)
-        
+    if file_exists(oldMasterFile) then
+        local masterData = load_json(oldMasterFile)
         if type(masterData) == "table" then
             if masterData.global_settings then
-                for k, v in pairs(masterData.global_settings) do
-                    globalSettings[k] = v
-                end
+                for k, v in pairs(masterData.global_settings) do globalSettings[k] = v end
                 if globalSettings.customTheme then
                     globalSettings.customThemes = { globalSettings.customTheme }
                     globalSettings.customTheme = nil
-                    if globalSettings.theme == 0 then
-                        globalSettings.theme = #themes + 1
-                    end
-                    save_all_data()
+                    if globalSettings.theme == 0 then globalSettings.theme = #themes + 1 end
                 end
             end
             if masterData.profiles then
                 phoneData = masterData.profiles
+                for pNick, pData in pairs(phoneData) do
+                    local oldBank = "Bank" .. "_System"
+                    local oldNews = "System" .. "_News"
+                    local function migrateKey(tbl, oldK, newK)
+                        if tbl and tbl[oldK] ~= nil then
+                            tbl[newK] = tbl[oldK]
+                            tbl[oldK] = nil
+                        end
+                    end
+                    
+                    migrateKey(pData.contacts, oldNews, "system")
+                    migrateKey(pData.contacts, oldBank, "banking")
+                    migrateKey(pData.history, oldNews, "system")
+                    migrateKey(pData.history, oldBank, "banking")
+                    migrateKey(pData.unread, oldNews, "system")
+                    migrateKey(pData.unread, oldBank, "banking")
+                    migrateKey(pData.muted, oldNews, "system")
+                    migrateKey(pData.muted, oldBank, "banking")
+                    migrateKey(pData.drafts, oldNews, "system")
+                    migrateKey(pData.drafts, oldBank, "banking")
+                    
+                    if not pData.metadata then pData.metadata = {} end
+                    if pData.history then
+                        for cNum, cHist in pairs(pData.history) do
+                            if #cHist > 0 then
+                                local lastMsg = cHist[#cHist]
+                                pData.metadata[cNum] = { sender = lastMsg.sender, text = lastMsg.msg, timestamp = lastMsg.timestamp }
+                                local pDir = getWorkingDirectory() .. '\\config\\Messenger\\' .. pNick
+                                pcall(lfs.mkdir, pDir)
+                                pcall(lfs.mkdir, pDir .. '\\chats')
+                                save_chat_data(pNick, cNum, cHist)
+                            end
+                        end
+                        pData.history = nil
+                    end
+                end
             end
-        elseif masterData == false then
-            sampAddChatMessage("ImGui Messenger: {FF0000}Ошибка чтения базы данных! Создана резервная копия, чтобы не потерять историю.", -1)
-            os.rename(masterFile, masterFile .. ".bak_" .. tostring(os.time()))
+            os.rename(oldMasterFile, getWorkingDirectory() .. '\\config\\Messenger_backup_' .. tostring(os.time()) .. '.json')
+            save_all_data()
         end
     else
-        if file_exists(oldDataFile) then
-            phoneData = load_json(oldDataFile)
-            pcall(os.remove, oldDataFile)
-        end
-        if file_exists(oldSettingsFile) then
-            local loadedSettings = load_json(oldSettingsFile)
-            for k, v in pairs(loadedSettings) do
-                globalSettings[k] = v
+        if file_exists(settingsFile) then
+            local sData = load_json(settingsFile)
+            if type(sData) == "table" then
+                for k, v in pairs(sData) do globalSettings[k] = v end
             end
-            pcall(os.remove, oldSettingsFile)
         end
-        save_all_data()
+        for dir in lfs.dir(getWorkingDirectory() .. '\\config\\Messenger\\') do
+            if dir ~= "." and dir ~= ".." and dir ~= "settings.json" and dir ~= "cache" and dir ~= "images" then
+                local pPath = getWorkingDirectory() .. '\\config\\Messenger\\' .. dir .. '\\profile.json'
+                if file_exists(pPath) then
+                    local pData = load_json(pPath)
+                    if type(pData) == "table" then
+                        if not pData.metadata then pData.metadata = {} end
+                        phoneData[dir] = pData
+                    end
+                end
+            end
+        end
     end
     
     ffi.copy(UI.inputOpenCommand, globalSettings.openCommand or "p")
@@ -1259,9 +1348,10 @@ function main()
     end
     
     local master_news_hist = nil
-    for _, pData in pairs(phoneData) do
-        if pData.history and pData.history["System_News"] then
-            master_news_hist = pData.history["System_News"]
+    for nick, _ in pairs(phoneData) do
+        local sysHist = load_chat_history(nick, "system")
+        if sysHist and #sysHist > 0 then
+            master_news_hist = sysHist
             break
         end
     end
@@ -1270,7 +1360,7 @@ function main()
     for pName, pData in pairs(phoneData) do
         if not pData.unread then pData.unread = {} end
         if not pData.contacts then pData.contacts = {} end
-        if not pData.history then pData.history = {} end
+        if not pData.metadata then pData.metadata = {} end
         if not pData.nicknames then pData.nicknames = {} end
         if not pData.muted then pData.muted = {} end
         if not pData.drafts then pData.drafts = {} end
@@ -1278,26 +1368,26 @@ function main()
 		if not pData.groups then pData.groups = {} end
 		if not pData.blocked then pData.blocked = {} end
         
-        pData.history["System_News"] = master_news_hist
-        pData.contacts["System_News"] = "Уведомления"
+        if #master_news_hist > 0 then
+            save_chat_data(pName, "system", master_news_hist)
+            local lMsg = master_news_hist[#master_news_hist]
+            pData.metadata["system"] = { sender = lMsg.sender, text = lMsg.msg, timestamp = lMsg.timestamp }
+        end
+        pData.contacts["system"] = "Уведомления"
         
         pData.numbers = nil
         pData.activeNumber = nil
         pData.settings = nil
-        
-        for cNum, cHist in pairs(pData.history) do
-            for _, msg in ipairs(cHist) do
-                msg.bubbleSize = nil 
-                msg.loadedStr = nil
-                if not msg.timestamp then msg.timestamp = 0 end
-            end
-        end
     end
     
     if myNick ~= "Default" and myNick:find("_") and not phoneData[myNick] then
-        phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
-        phoneData[myNick].history["System_News"] = master_news_hist
-        phoneData[myNick].contacts["System_News"] = "Уведомления"
+        phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
+        if #master_news_hist > 0 then
+            save_chat_data(myNick, "system", master_news_hist)
+            local lMsg = master_news_hist[#master_news_hist]
+            phoneData[myNick].metadata["system"] = { sender = lMsg.sender, text = lMsg.msg, timestamp = lMsg.timestamp }
+        end
+        phoneData[myNick].contacts["system"] = "Уведомления"
         save_all_data()
     end
     
@@ -1335,7 +1425,7 @@ function main()
                             end
                         end
 
-                        for num, _ in pairs(profile.history or {}) do
+                        for num, _ in pairs(profile.metadata or {}) do
                             if globalVerified[num] then
                                 local data = globalVerified[num]
                                 if data.verified and not profile.verified[num] then
@@ -1403,7 +1493,7 @@ function main()
                                 globalSettings.lastNewsText = text_cp1251
                                 save_all_data()
                                 
-                                local sys_num = "System_News"
+                                local sys_num = "system"
                                 if not profile.contacts[sys_num] then profile.contacts[sys_num] = "Уведомления" end
                                 addSmsToHistory(profile, sys_num, "them", text_cp1251, os.time())
 
@@ -1491,10 +1581,10 @@ function main()
                                 phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
                                 local m_hist = nil
                                 for _, p in pairs(phoneData) do
-                                    if p.history and p.history["System_News"] then m_hist = p.history["System_News"] break end
+                                    if p.history and p.history["system"] then m_hist = p.history["system"] break end
                                 end
-                                phoneData[myNick].history["System_News"] = m_hist or {}
-                                phoneData[myNick].contacts["System_News"] = "Уведомления"
+                                phoneData[myNick].history["system"] = m_hist or {}
+                                phoneData[myNick].contacts["system"] = "Уведомления"
                                 save_all_data()
                             end
                         end
@@ -1899,19 +1989,19 @@ function samp.onServerMessage(color, text)
                 Bank.isCollecting = false
                 if #Bank.buffer > 0 then
                     local full_text = table.concat(Bank.buffer, "\n")
-                    if not profile.contacts["Bank_System"] then profile.contacts["Bank_System"] = "Банк" end
-                    addSmsToHistory(profile, "Bank_System", "them", full_text, os.time())
+                    if not profile.contacts["banking"] then profile.contacts["banking"] = "Банк" end
+                    addSmsToHistory(profile, "banking", "them", full_text, os.time())
                     needSortContacts = true
-                    if myNick == actualPlayerNick and activeContact ~= "Bank_System" or not UI.windowState[0] then
-                        profile.unread["Bank_System"] = (type(profile.unread["Bank_System"]) == "number" and profile.unread["Bank_System"] or 0) + 1
-                        if not profile.muted["Bank_System"] then
+                    if myNick == actualPlayerNick and activeContact ~= "banking" or not UI.windowState[0] then
+                        profile.unread["banking"] = (type(profile.unread["banking"]) == "number" and profile.unread["banking"] or 0) + 1
+                        if not profile.muted["banking"] then
                             if globalSettings.useScreenNotifications and not globalSettings.dndMode then
-                                Sys.activeNotification = { number = "Bank_System", name = "Банк", text = "Получена новая выписка с банковского счета.", time = os.clock() }
+                                Sys.activeNotification = { number = "banking", name = "Банк", text = "Получена новая выписка с банковского счета.", time = os.clock() }
                             end
                         end
                     end
                     save_all_data()
-                    if myNick == actualPlayerNick and activeContact == "Bank_System" then UI.scrollToBottom = true end
+                    if myNick == actualPlayerNick and activeContact == "banking" then UI.scrollToBottom = true end
                 end
             end)
             return false
@@ -1986,8 +2076,8 @@ function samp.onServerMessage(color, text)
             if gId and profile.groups and profile.groups[gId] then
                 targetHist = profile.groups[gId].history
                 search_text = real_text:gsub("%s*%.%.%.?%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
-            elseif profile.history[inc_num] then
-                targetHist = profile.history[inc_num]
+            elseif profile.metadata and profile.metadata[inc_num] then
+                targetHist = (myNick == actualPlayerNick and activeChatId == inc_num) and activeChatHistory or load_chat_history(actualPlayerNick, inc_num)
                 search_text = inc_text:gsub("%s*%.%.%.?%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
             end
             
@@ -2128,10 +2218,11 @@ function samp.onServerMessage(color, text)
             
             if not lastSmsIsDup then
                 local targetHist = nil
-                if lastSmsGroupId and profile.groups and profile.groups[lastSmsGroupId] then
+                local isGroup = lastSmsGroupId and profile.groups and profile.groups[lastSmsGroupId]
+                if isGroup then
                     targetHist = profile.groups[lastSmsGroupId].history
                 else
-                    targetHist = profile.history[lastSmsPhone]
+                    targetHist = (myNick == actualPlayerNick and activeChatId == lastSmsPhone) and activeChatHistory or load_chat_history(actualPlayerNick, lastSmsPhone)
                 end
                 
                 if targetHist and #targetHist > 0 then
@@ -2139,6 +2230,13 @@ function samp.onServerMessage(color, text)
                     prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
                     targetHist[#targetHist].msg = prev_msg .. " " .. continued_text
                     targetHist[#targetHist].bubbleSize = nil 
+                    
+                    if not isGroup then
+                        save_chat_data(actualPlayerNick, lastSmsPhone, targetHist)
+                        if profile.metadata and profile.metadata[lastSmsPhone] then
+                            profile.metadata[lastSmsPhone].text = targetHist[#targetHist].msg
+                        end
+                    end
                     save_all_data()
                     local aContact = lastSmsGroupId or lastSmsPhone
                     if myNick == actualPlayerNick and activeContact == aContact then UI.scrollToBottom = true end
@@ -2538,8 +2636,8 @@ local function DrawModals(scale)
         if UI.contactToDelete then
             local rawName = profile.contacts[UI.contactToDelete] or ""
             local cName = ""
-            if UI.contactToDelete == "Bank_System" then cName = u8"Банк"
-            elseif UI.contactToDelete == "System_News" then cName = u8"Уведомления"
+            if UI.contactToDelete == "banking" then cName = u8"Банк"
+            elseif UI.contactToDelete == "system" then cName = u8"Уведомления"
             else cName = (rawName == "" and "#" .. UI.contactToDelete or u8(rawName) .. " (" .. UI.contactToDelete .. ")") end
             imgui.Text(u8"Вы действительно хотите удалить контакт " .. cName .. u8"?\nВся история сообщений будет стерта.")
         end
@@ -2553,12 +2651,13 @@ local function DrawModals(scale)
         if imgui.Button(u8"Удалить", imgui.ImVec2(btnWidth, 0)) then
             if UI.contactToDelete then
                 profile.contacts[UI.contactToDelete] = nil
-                profile.history[UI.contactToDelete] = nil
+                save_chat_data(myNick, UI.contactToDelete, {})
+                profile.metadata[UI.contactToDelete] = nil
                 profile.calls[UI.contactToDelete] = nil
                 profile.unread[UI.contactToDelete] = nil
                 if profile.muted then profile.muted[UI.contactToDelete] = nil end
                 if profile.drafts then profile.drafts[UI.contactToDelete] = nil end
-                if activeContact == UI.contactToDelete then activeContact = nil end
+                if activeContact == UI.contactToDelete then activeContact = nil activeChatId = nil activeChatHistory = nil end
                 save_all_data()
                 needSortContacts = true
             end
@@ -2654,6 +2753,8 @@ local function DrawModals(scale)
                     myNick = nick
                     profile = phoneData[myNick]
                     activeContact = nil 
+                    activeChatId = nil
+                    activeChatHistory = nil
                     needSortContacts = true
                 end
             end
@@ -2664,6 +2765,19 @@ local function DrawModals(scale)
         
         imgui.SameLine(btnOffset)
         if imgui.Button(u8"Удалить профиль##char", imgui.ImVec2(130 * scale, 0)) then
+            local pDir = getWorkingDirectory() .. '\\config\\Messenger\\' .. myNick
+            local cDir = pDir .. '\\chats'
+            if lfs.attributes(cDir, "mode") == "directory" then
+                for file in lfs.dir(cDir) do
+                    if file ~= "." and file ~= ".." then
+                        pcall(os.remove, cDir .. '\\' .. file)
+                    end
+                end
+                pcall(lfs.rmdir, cDir)
+            end
+            pcall(os.remove, pDir .. '\\profile.json')
+            pcall(lfs.rmdir, pDir)
+
             local actualNick = "Default"
             local r, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
             if r then actualNick = sampGetPlayerNickname(id) end
@@ -2671,20 +2785,14 @@ local function DrawModals(scale)
             phoneData[myNick] = nil
             
             if myNick == actualNick and actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
-                phoneData[actualNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
-                local m_hist = nil
-                for nick, p in pairs(phoneData) do if nick ~= actualNick and p.history["System_News"] then m_hist = p.history["System_News"] break end end
-                phoneData[actualNick].history["System_News"] = m_hist or {}
-                phoneData[actualNick].contacts["System_News"] = "Уведомления"
+                phoneData[actualNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
+                phoneData[actualNick].contacts["system"] = "Уведомления"
             else
                 if actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
                     myNick = actualNick
                     if not phoneData[myNick] then
-                        phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
-                        local m_hist = nil
-                        for nick, p in pairs(phoneData) do if nick ~= myNick and p.history["System_News"] then m_hist = p.history["System_News"] break end end
-                        phoneData[myNick].history["System_News"] = m_hist or {}
-                        phoneData[myNick].contacts["System_News"] = "Уведомления"
+                        phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
+                        phoneData[myNick].contacts["system"] = "Уведомления"
                     end
                 else
                     local local_any = next(phoneData)
@@ -2694,6 +2802,8 @@ local function DrawModals(scale)
             
             profile = phoneData[myNick]
             activeContact = nil
+            activeChatId = nil
+            activeChatHistory = nil
             needSortContacts = true
             save_all_data()
         end
@@ -3018,8 +3128,22 @@ local function DrawModals(scale)
         imgui.Spacing()
         
         local dbSize = 0
-        local dbFile = getWorkingDirectory() .. '\\config\\Messenger.json'
-        if file_exists(dbFile) then dbSize = lfs.attributes(dbFile, "size") or 0 end
+        local pDir = getWorkingDirectory() .. '\\config\\Messenger\\' .. myNick
+        if lfs.attributes(pDir, "mode") == "directory" then
+            local pFile = pDir .. '\\profile.json'
+            if file_exists(pFile) then dbSize = dbSize + (lfs.attributes(pFile, "size") or 0) end
+            local cDir = pDir .. '\\chats'
+            if lfs.attributes(cDir, "mode") == "directory" then
+                for file in lfs.dir(cDir) do
+                    if file ~= "." and file ~= ".." then
+                        local cPath = cDir .. '\\' .. file
+                        if lfs.attributes(cPath, "mode") == "file" then
+                            dbSize = dbSize + (lfs.attributes(cPath, "size") or 0)
+                        end
+                    end
+                end
+            end
+        end
         
         local sizeText = ""
         if dbSize < 1024 then sizeText = string.format("%d B", dbSize)
@@ -3185,26 +3309,26 @@ local function DrawContactsList(scale, profile, leftAvailW)
         cachedSortedContacts = {}
         local uniqueNumbers = {}
         for num, _ in pairs(profile.contacts) do uniqueNumbers[num] = true end
-        if profile.history then
-            for num, _ in pairs(profile.history) do uniqueNumbers[num] = true end
+        if profile.metadata then
+            for num, _ in pairs(profile.metadata) do uniqueNumbers[num] = true end
         end
         if profile.calls then
             for num, _ in pairs(profile.calls) do uniqueNumbers[num] = true end
         end
-        if profile.history and profile.history["Bank_System"] then uniqueNumbers["Bank_System"] = true end
-        if profile.history and profile.history["System_News"] then uniqueNumbers["System_News"] = true end
+        if profile.metadata and profile.metadata["banking"] then uniqueNumbers["banking"] = true end
+        if profile.metadata and profile.metadata["system"] then uniqueNumbers["system"] = true end
         for num, _ in pairs(uniqueNumbers) do
             local name = profile.contacts[num] or ""
             local hasName = (name ~= "")
-            local hist = profile.history and profile.history[num]
-            local hasHistory = (hist and #hist > 0)
+            local meta = profile.metadata and profile.metadata[num]
+            local hasHistory = (meta ~= nil)
             local calls = profile.calls and profile.calls[num]
             local hasCalls = (calls and #calls > 0)
-            local isSystem = (num == "Bank_System" or num == "System_News")
+            local isSystem = (num == "banking" or num == "system")
             if hasName or hasHistory or hasCalls or isSystem then
                 local last_ts = 0
                 if hasHistory then
-                    last_ts = hist[#hist].timestamp or 0
+                    last_ts = meta.timestamp or 0
                 end
                 if hasCalls then
                     local last_call_ts = calls[#calls].timestamp or 0
@@ -3246,9 +3370,9 @@ local function DrawContactsList(scale, profile, leftAvailW)
             local lowerName = cp1251_lower(name)
             local lowerNum = cp1251_lower(num)
             local localDisplay = ""
-            if num == "Bank_System" then 
+            if num == "banking" then 
                 localDisplay = cp1251_lower(u8:decode(u8"Банк"))
-            elseif num == "System_News" then 
+            elseif num == "system" then 
                 localDisplay = cp1251_lower(u8:decode(u8"Уведомления"))
             else 
                 localDisplay = lowerName == "" and ("#" .. lowerNum) or (lowerName .. " (" .. lowerNum .. ")")
@@ -3267,9 +3391,9 @@ local function DrawContactsList(scale, profile, leftAvailW)
                 is_unread = false
             end
             local displayName = ""
-            if num == "Bank_System" then
+            if num == "banking" then
                 displayName = u8"Банк"
-            elseif num == "System_News" then
+            elseif num == "system" then
                 displayName = u8"Уведомления"
             else
                 if name == "" then
@@ -3293,6 +3417,8 @@ local function DrawContactsList(scale, profile, leftAvailW)
                 if activeContact ~= num then
                     SaveCurrentDraft()
                     activeContact = num
+                    activeChatId = num
+                    activeChatHistory = load_chat_history(myNick, num)
                     UI.showCallHistory = false
                     UI.viewingCallIndex = 0
                     LoadDraft(num)
@@ -3304,30 +3430,27 @@ local function DrawContactsList(scale, profile, leftAvailW)
             end
             if imgui.BeginPopupContextItem("ContactPopup_" .. num) then
                 if profile.tagger and profile.tagger[num] then
-                    if imgui.Selectable(u8"Открыть Tagger (Social)") then
-                        local url = "https://tagger.gambit-rp.com/" .. profile.tagger[num]
+                    if imgui.Selectable(u8"Открыть Nova (Social)") then
+                        local url = "https://nova.gambit-rp.com/" .. profile.tagger[num]
                         shell32.ShellExecuteA(nil, "open", url, nil, nil, 1)
                     end
                     imgui.Separator()
                 end
-                if num == "System_News" then
+                if num == "system" then
                     if imgui.Selectable(u8"Очистить историю") then
-                        local nhist = profile.history[num]
-                        if nhist then
-                            for k in pairs(nhist) do nhist[k] = nil end
-                        end
+                        save_chat_data(myNick, num, {})
+                        if activeContact == num then activeChatHistory = {} end
+                        profile.metadata[num] = nil
                         for _, p in pairs(phoneData) do
                             if p.unread then p.unread[num] = nil end
                             if p.muted then p.muted[num] = nil end
                             if p.drafts then p.drafts[num] = nil end
                         end
-                        if activeContact == num then
-                            activeContact = nil
-                        end
+                        if activeContact == num then activeContact = nil activeChatId = nil activeChatHistory = nil end
                         save_all_data()
                         needSortContacts = true
                     end
-                elseif num == "Bank_System" then
+                elseif num == "banking" then
                     local muteText = profile.muted and profile.muted[num] and u8"Включить уведомления" or u8"Отключить уведомления"
                     if imgui.Selectable(muteText) then
                         if not profile.muted then profile.muted = {} end
@@ -3339,11 +3462,13 @@ local function DrawContactsList(scale, profile, leftAvailW)
                     end
                     imgui.Separator()
                     if imgui.Selectable(u8"Очистить историю") then
-                        profile.history[num] = nil
+                        save_chat_data(myNick, num, {})
+                        if activeContact == num then activeChatHistory = {} end
+                        profile.metadata[num] = nil
                         profile.unread[num] = nil
                         if profile.muted then profile.muted[num] = nil end
                         if profile.drafts then profile.drafts[num] = nil end
-                        if activeContact == num then activeContact = nil end
+                        if activeContact == num then activeContact = nil activeChatId = nil activeChatHistory = nil end
                         save_all_data()
                         needSortContacts = true
                     end
@@ -3370,7 +3495,9 @@ local function DrawContactsList(scale, profile, leftAvailW)
                     end
                     imgui.Separator()
                     if imgui.Selectable(u8"Очистить историю") then
-                        profile.history[num] = nil
+                        save_chat_data(myNick, num, {})
+                        if activeContact == num then activeChatHistory = {} end
+                        profile.metadata[num] = nil
                         profile.calls[num] = nil
                         profile.unread[num] = nil
                         save_all_data()
@@ -3385,12 +3512,14 @@ local function DrawContactsList(scale, profile, leftAvailW)
                     imgui.Separator()
                     if imgui.Selectable(u8"Удалить контакт") then
                         profile.contacts[num] = nil
-                        profile.history[num] = nil
+                        save_chat_data(myNick, num, {})
+                        if activeContact == num then activeChatHistory = {} end
+                        profile.metadata[num] = nil
                         profile.calls[num] = nil
                         profile.unread[num] = nil
                         if profile.muted then profile.muted[num] = nil end
                         if profile.drafts then profile.drafts[num] = nil end
-                        if activeContact == num then activeContact = nil end
+                        if activeContact == num then activeContact = nil activeChatId = nil activeChatHistory = nil end
                         save_all_data()
                         needSortContacts = true
                     end
@@ -3416,20 +3545,20 @@ local function DrawContactsList(scale, profile, leftAvailW)
             dl:AddRectFilled(p_min, p_max, imgui.GetColorU32Vec4(bg_color), 8.0)
             local time_str = ""
             local snippet = ""
-            local hist = profile.history and profile.history[num]
+            local meta = profile.metadata and profile.metadata[num]
             local calls = profile.calls and profile.calls[num]
-            local last_sms_ts = (hist and #hist > 0) and hist[#hist].timestamp or 0
+            local last_sms_ts = meta and meta.timestamp or 0
             local last_call_ts = (calls and #calls > 0) and calls[#calls].timestamp or 0
             if last_sms_ts > 0 or last_call_ts > 0 then
                 if last_sms_ts >= last_call_ts then
                     time_str = formatMessageTime(last_sms_ts)
-                    if num == "Bank_System" then snippet = u8"Вам пришла выписка из банка"
-                    elseif num == "System_News" then
-                        local prefix = (hist[#hist].sender == "me") and u8"Вы: " or ""
-                        snippet = prefix .. u8(hist[#hist].msg):gsub("\n", " ")
+                    if num == "banking" then snippet = u8"Вам пришла выписка из банка"
+                    elseif num == "system" then
+                        local prefix = (meta.sender == "me") and u8"Вы: " or ""
+                        snippet = prefix .. u8(meta.text):gsub("\n", " ")
                     else
-                        local prefix = (hist[#hist].sender == "me") and u8"Вы: " or ""
-                        snippet = prefix .. u8(hist[#hist].msg):gsub("\n", " ")
+                        local prefix = (meta.sender == "me") and u8"Вы: " or ""
+                        snippet = prefix .. u8(meta.text):gsub("\n", " ")
                     end
                 else
                     time_str = formatMessageTime(last_call_ts)
@@ -3440,7 +3569,7 @@ local function DrawContactsList(scale, profile, leftAvailW)
             end
             local time_w = imgui.CalcTextSize(time_str).x
             local badges_w = 0
-            local isVerified = (num == "Bank_System" or num == "System_News" or (profile.verified and profile.verified[num]))
+            local isVerified = (num == "banking" or num == "system" or (profile.verified and profile.verified[num]))
             if isVerified then badges_w = badges_w + (22 * scale) end
             if profile.muted and profile.muted[num] then badges_w = badges_w + imgui.CalcTextSize(u8" [Мут]").x end
             if profile.blocked and profile.blocked[num] then badges_w = badges_w + imgui.CalcTextSize(u8" [ЧС]").x end
@@ -3526,15 +3655,15 @@ end
 local function DrawChatHistory(scale, profile)
     if activeContact then
         local contactName = ""
-        if activeContact == "Bank_System" then
+        if activeContact == "banking" then
             contactName = u8"Банк"
-        elseif activeContact == "System_News" then
+        elseif activeContact == "system" then
             contactName = u8"Уведомления"
         else
             local rawName = profile.contacts[activeContact] or ""
             contactName = (rawName == "" and "#" .. activeContact or u8(rawName) .. " (" .. activeContact .. ")")
         end
-        local isSystemChat = (activeContact == "Bank_System" or activeContact == "System_News")
+        local isSystemChat = (activeContact == "banking" or activeContact == "system")
         imgui.AlignTextToFramePadding()
         imgui.Text(u8"Диалог: " .. contactName)
         local isVerifiedChat = (isSystemChat or (profile.verified and profile.verified[activeContact]))
@@ -3881,7 +4010,7 @@ local function DrawChatHistory(scale, profile)
                 end
             end
             
-            local currentHistory = profile.history[activeContact]
+            local currentHistory = activeChatHistory
             local deleteMsgIndex = nil
             if currentHistory then
                 local last_date_str = ""
@@ -4201,6 +4330,13 @@ local function DrawChatHistory(scale, profile)
                 end
                 if deleteMsgIndex then
                     table.remove(currentHistory, deleteMsgIndex)
+                    if #currentHistory > 0 then
+                        local lMsg = currentHistory[#currentHistory]
+                        profile.metadata[activeContact] = { sender = lMsg.sender, text = lMsg.msg, timestamp = lMsg.timestamp }
+                    else
+                        profile.metadata[activeContact] = nil
+                    end
+                    save_chat_data(myNick, activeContact, currentHistory)
                     save_all_data()
                     needSortContacts = true
                 end
@@ -4220,7 +4356,7 @@ local function DrawChatHistory(scale, profile)
             
             imgui.EndChild()
         end
-        if activeContact == "Bank_System" or activeContact == "System_News" then
+        if activeContact == "banking" or activeContact == "system" then
             local bText = u8"Это системный чат. Ответить на эти сообщения нельзя."
             local text_h = imgui.GetTextLineHeight()
             local offset_y = ((40 * scale) - text_h) / 2
@@ -4293,6 +4429,8 @@ local newFrame = imgui.OnFrame(
         if imgui.Begin(u8"Мессенджер", UI.windowState, imgui.WindowFlags.NoCollapse) then
 
             DrawModals(scale)
+
+            profile = phoneData[myNick]
 
             imgui.Columns(2, "PhoneColumns", false)
             imgui.SetColumnWidth(0, 280 * scale)
