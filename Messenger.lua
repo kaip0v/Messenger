@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 2.0
+local script_version = 2.1
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -694,6 +694,8 @@ local function GetActiveTheme()
             call_them = imgui.ImVec4(ThemeEditor.temp.call_them[0], ThemeEditor.temp.call_them[1], ThemeEditor.temp.call_them[2], ThemeEditor.temp.call_them[3]),
             call_time = imgui.ImVec4(ThemeEditor.temp.call_time[0], ThemeEditor.temp.call_time[1], ThemeEditor.temp.call_time[2], ThemeEditor.temp.call_time[3]),
             checkmark = imgui.ImVec4(ThemeEditor.temp.checkmark[0], ThemeEditor.temp.checkmark[1], ThemeEditor.temp.checkmark[2], ThemeEditor.temp.checkmark[3]),
+            badge_text = imgui.ImVec4(ThemeEditor.temp.badge_text[0], ThemeEditor.temp.badge_text[1], ThemeEditor.temp.badge_text[2], ThemeEditor.temp.badge_text[3]),
+            bubble_muted = imgui.ImVec4(ThemeEditor.temp.bubble_muted[0], ThemeEditor.temp.bubble_muted[1], ThemeEditor.temp.bubble_muted[2], ThemeEditor.temp.bubble_muted[3]),
             name = "Live Preview"
         }
     else
@@ -716,6 +718,8 @@ local function GetActiveTheme()
                 call_them = sv(ct.call_them, imgui.ImVec4(1.0, 1.0, 1.0, 1.0)),
                 call_time = sv(ct.call_time, imgui.ImVec4(0.5, 0.5, 0.5, 1.0)),
                 checkmark = sv(ct.checkmark, ct.me and imgui.ImVec4(ct.me[1],ct.me[2],ct.me[3],ct.me[4]) or imgui.ImVec4(0.18, 0.35, 0.58, 1.0)),
+                badge_text = sv(ct.badge_text, imgui.ImVec4(1.0, 1.0, 1.0, 1.0)),
+                bubble_muted = sv(ct.bubble_muted, imgui.ImVec4(0.5, 0.5, 0.5, 1.0)),
                 name = "Пользовательская тема #" .. (globalSettings.theme - #themes)
             }
         else
@@ -727,6 +731,8 @@ local function GetActiveTheme()
             t.call_them = t.call_them or imgui.ImVec4(1.0, 1.0, 1.0, 1.0)
             t.call_time = t.call_time or imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
             t.checkmark = t.checkmark or t.me
+            t.badge_text = t.badge_text or imgui.ImVec4(1.0, 1.0, 1.0, 1.0)
+            t.bubble_muted = t.bubble_muted or imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
             return t
         end
     end
@@ -1151,7 +1157,7 @@ end
 function samp.onShowTextDraw(id, data)
     if CallState.active and not CallState.number then
         if type(data.text) == "string" then
-            local tnum = data.text:match("^%d%d%d%d%d%d?$")
+            local tnum = data.text:match("^%d%d%d%d?%d?%d?$")
             if tnum then
                 CallState.number = tnum
                 if actualPlayerNick ~= "Default" and phoneData[actualPlayerNick] then
@@ -1209,6 +1215,8 @@ addEventHandler('onWindowMessage', function(msg, wparam, lparam)
                     if globalSettings.closeChatOnEsc and activeContact then
                         SaveCurrentDraft()
                         activeContact = nil
+                        activeChatId = nil
+                        activeChatHistory = nil
                         UI.showCallHistory = false
                         UI.viewingCallIndex = 0
                         UI.showMessageSearch = false
@@ -1347,15 +1355,13 @@ function main()
         end
     end
     
-    local master_news_hist = nil
+    local master_news_hist = {}
     for nick, _ in pairs(phoneData) do
         local sysHist = load_chat_history(nick, "system")
-        if sysHist and #sysHist > 0 then
+        if sysHist and #sysHist > #master_news_hist then
             master_news_hist = sysHist
-            break
         end
     end
-    if not master_news_hist then master_news_hist = {} end
     
     for pName, pData in pairs(phoneData) do
         if not pData.unread then pData.unread = {} end
@@ -1575,15 +1581,22 @@ function main()
                             actualPlayerNick = currentInGameNick
                             myNick = currentInGameNick
                             activeContact = nil
+                            activeChatId = nil
+                            activeChatHistory = nil
                             needSortContacts = true
                             
                             if not phoneData[myNick] then
-                                phoneData[myNick] = { contacts = {}, history = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
-                                local m_hist = nil
-                                for _, p in pairs(phoneData) do
-                                    if p.history and p.history["system"] then m_hist = p.history["system"] break end
+                                phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
+                                local m_hist = {}
+                                for nick, _ in pairs(phoneData) do
+                                    local sHist = load_chat_history(nick, "system")
+                                    if sHist and #sHist > #m_hist then m_hist = sHist end
                                 end
-                                phoneData[myNick].history["system"] = m_hist or {}
+                                if #m_hist > 0 then
+                                    save_chat_data(myNick, "system", m_hist)
+                                    local lMsg = m_hist[#m_hist]
+                                    phoneData[myNick].metadata["system"] = { sender = lMsg.sender, text = lMsg.msg, timestamp = lMsg.timestamp }
+                                end
                                 phoneData[myNick].contacts["system"] = "Уведомления"
                                 save_all_data()
                             end
@@ -1597,6 +1610,9 @@ function main()
             if isKeyJustPressed(globalSettings.openKey or vkeys.VK_P) and not sampIsChatInputActive() and not sampIsDialogActive() and not sampIsCursorActive() then
                 UI.windowState[0] = true
                 activeContact = Sys.activeNotification.number
+                activeChatId = activeContact
+                activeChatHistory = load_chat_history(myNick, activeContact)
+                LoadDraft(activeContact)
                 UI.scrollToBottom = true
                 UI.requestFocus = true
                 Sys.activeNotification = nil 
