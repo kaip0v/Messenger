@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 2.1
+local script_version = 2.2
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -16,16 +16,6 @@ local io = require 'io'
 local ffi = require 'ffi'
 
 math.randomseed(os.time())
-
-local function generateGroupId()
-    local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    local id = ""
-    for i = 1, 6 do
-        local r = math.random(1, #chars)
-        id = id .. chars:sub(r, r)
-    end
-    return id
-end
 
 ffi.cdef[[
     void* ShellExecuteA(void* hwnd, const char* lpOperation, const char* lpFile, const char* lpParameters, const char* lpDirectory, int nShowCmd);
@@ -59,10 +49,8 @@ local settingsFile = getWorkingDirectory() .. '\\config\\Messenger\\settings.jso
 local phoneData = {}
 local activeChatHistory = nil
 local activeChatId = nil
-local groupSmsQueue = {}
-local lastGroupSmsTime = 0
-local lastAttemptedGroupNum = nil
-local lastAttemptedGroupId = nil
+local smsOutQueue = {}
+local lastSmsOutTime = 0
 
 local mainFolder = getWorkingDirectory() .. '\\config\\Messenger\\'
 pcall(lfs.mkdir, mainFolder)
@@ -138,8 +126,8 @@ local lastSmsPhone = nil
 local lastSmsIsUnread = false
 local lastSmsIsDup = false
 local lastSmsSysTime = 0
-local lastSmsGroupId = nil
-local lastSmsIsOutgoingGroup = false
+local lastSmsWasSkipped = false
+local pendingLocalSms = {}
 
 local cachedSortedContacts = {}
 local needSortContacts = true
@@ -157,12 +145,13 @@ local UI = {
     inputContactName = imgui.new.char[256](""),
     inputContactNumber = imgui.new.char[256](""),
     inputContactNick = imgui.new.char[256](""),
-    inputMessage = imgui.new.char[512](""),
+    inputMessage = imgui.new.char[2048](""),
     inputSearchContact = imgui.new.char[256](""),
     inputSearchMessage = imgui.new.char[256](""),
     inputOpenCommand = imgui.new.char[64](""),
     showMessageSearch = false,
     showCallHistory = false,
+    callOpenedFromChat = false,
     showGallery = imgui.new.bool(false),
     viewingCallIndex = 0,
 	viewingImage = nil,
@@ -258,68 +247,6 @@ local ThemeEditor = {
     },
     selectedIdx = 1
 }
-
-local function GetActiveTheme()
-    if UI.showThemeEditor[0] then
-        return {
-            me = imgui.ImVec4(ThemeEditor.temp.me[0], ThemeEditor.temp.me[1], ThemeEditor.temp.me[2], ThemeEditor.temp.me[3]),
-            them = imgui.ImVec4(ThemeEditor.temp.them[0], ThemeEditor.temp.them[1], ThemeEditor.temp.them[2], ThemeEditor.temp.them[3]),
-            warn = imgui.ImVec4(ThemeEditor.temp.warn[0], ThemeEditor.temp.warn[1], ThemeEditor.temp.warn[2], ThemeEditor.temp.warn[3]),
-            notif_bg = imgui.ImVec4(ThemeEditor.temp.notif_bg[0], ThemeEditor.temp.notif_bg[1], ThemeEditor.temp.notif_bg[2], ThemeEditor.temp.notif_bg[3]),
-            notif_text = imgui.ImVec4(ThemeEditor.temp.notif_text[0], ThemeEditor.temp.notif_text[1], ThemeEditor.temp.notif_text[2], ThemeEditor.temp.notif_text[3]),
-            sys_ok = imgui.ImVec4(ThemeEditor.temp.sys_ok[0], ThemeEditor.temp.sys_ok[1], ThemeEditor.temp.sys_ok[2], ThemeEditor.temp.sys_ok[3]),
-            sys_err = imgui.ImVec4(ThemeEditor.temp.sys_err[0], ThemeEditor.temp.sys_err[1], ThemeEditor.temp.sys_err[2], ThemeEditor.temp.sys_err[3]),
-            sys_info = imgui.ImVec4(ThemeEditor.temp.sys_info[0], ThemeEditor.temp.sys_info[1], ThemeEditor.temp.sys_info[2], ThemeEditor.temp.sys_info[3]),
-            online = imgui.ImVec4(ThemeEditor.temp.online[0], ThemeEditor.temp.online[1], ThemeEditor.temp.online[2], ThemeEditor.temp.online[3]),
-            muted = imgui.ImVec4(ThemeEditor.temp.muted[0], ThemeEditor.temp.muted[1], ThemeEditor.temp.muted[2], ThemeEditor.temp.muted[3]),
-            draft = imgui.ImVec4(ThemeEditor.temp.draft[0], ThemeEditor.temp.draft[1], ThemeEditor.temp.draft[2], ThemeEditor.temp.draft[3]),
-            call_me = imgui.ImVec4(ThemeEditor.temp.call_me[0], ThemeEditor.temp.call_me[1], ThemeEditor.temp.call_me[2], ThemeEditor.temp.call_me[3]),
-            call_them = imgui.ImVec4(ThemeEditor.temp.call_them[0], ThemeEditor.temp.call_them[1], ThemeEditor.temp.call_them[2], ThemeEditor.temp.call_them[3]),
-            call_time = imgui.ImVec4(ThemeEditor.temp.call_time[0], ThemeEditor.temp.call_time[1], ThemeEditor.temp.call_time[2], ThemeEditor.temp.call_time[3]),
-            checkmark = imgui.ImVec4(ThemeEditor.temp.checkmark[0], ThemeEditor.temp.checkmark[1], ThemeEditor.temp.checkmark[2], ThemeEditor.temp.checkmark[3]),
-            badge_text = imgui.ImVec4(ThemeEditor.temp.badge_text[0], ThemeEditor.temp.badge_text[1], ThemeEditor.temp.badge_text[2], ThemeEditor.temp.badge_text[3]),
-            bubble_muted = imgui.ImVec4(ThemeEditor.temp.bubble_muted[0], ThemeEditor.temp.bubble_muted[1], ThemeEditor.temp.bubble_muted[2], ThemeEditor.temp.bubble_muted[3]),
-            name = "Live Preview"
-        }
-    else
-        if globalSettings.theme > #themes and globalSettings.customThemes and globalSettings.customThemes[globalSettings.theme - #themes] then
-            local ct = globalSettings.customThemes[globalSettings.theme - #themes]
-            local function sv(a, d) return (a and type(a) == "table" and #a>=4) and imgui.ImVec4(a[1],a[2],a[3],a[4]) or d end
-            return {
-                me = sv(ct.me, imgui.ImVec4(0.18, 0.35, 0.58, 1.0)),
-                them = sv(ct.them, imgui.ImVec4(0.25, 0.25, 0.25, 1.0)),
-                warn = sv(ct.warn, imgui.ImVec4(0.20, 0.60, 0.90, 1.0)),
-                notif_bg = sv(ct.notif_bg, imgui.ImVec4(0.12, 0.12, 0.12, 0.95)),
-                notif_text = sv(ct.notif_text, imgui.ImVec4(0.9, 0.9, 0.9, 1.0)),
-                sys_ok = sv(ct.sys_ok, imgui.ImVec4(0.20, 0.80, 0.20, 0.80)),
-                sys_err = sv(ct.sys_err, imgui.ImVec4(0.80, 0.20, 0.20, 0.80)),
-                sys_info = sv(ct.sys_info, imgui.ImVec4(0.20, 0.60, 0.90, 0.80)),
-                online = sv(ct.online, imgui.ImVec4(0.2, 0.8, 0.2, 1.0)),
-                muted = sv(ct.muted, imgui.ImVec4(0.6, 0.6, 0.6, 1.0)),
-                draft = sv(ct.draft, imgui.ImVec4(0.8, 0.4, 0.4, 1.0)),
-                call_me = sv(ct.call_me, imgui.ImVec4(0.4, 0.7, 1.0, 1.0)),
-                call_them = sv(ct.call_them, imgui.ImVec4(1.0, 1.0, 1.0, 1.0)),
-                call_time = sv(ct.call_time, imgui.ImVec4(0.5, 0.5, 0.5, 1.0)),
-                checkmark = sv(ct.checkmark, ct.me and imgui.ImVec4(ct.me[1],ct.me[2],ct.me[3],ct.me[4]) or imgui.ImVec4(0.18, 0.35, 0.58, 1.0)),
-                badge_text = sv(ct.badge_text, imgui.ImVec4(1.0, 1.0, 1.0, 1.0)),
-                bubble_muted = sv(ct.bubble_muted, imgui.ImVec4(0.5, 0.5, 0.5, 1.0)),
-                name = "Пользовательская тема #" .. (globalSettings.theme - #themes)
-            }
-        else
-            local t = themes[globalSettings.theme] or themes[1]
-            t.online = t.online or imgui.ImVec4(0.2, 0.8, 0.2, 1.0)
-            t.muted = t.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0)
-            t.draft = t.draft or imgui.ImVec4(0.8, 0.4, 0.4, 1.0)
-            t.call_me = t.call_me or imgui.ImVec4(0.4, 0.7, 1.0, 1.0)
-            t.call_them = t.call_them or imgui.ImVec4(1.0, 1.0, 1.0, 1.0)
-            t.call_time = t.call_time or imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
-            t.checkmark = t.checkmark or t.me
-            t.badge_text = t.badge_text or imgui.ImVec4(1.0, 1.0, 1.0, 1.0)
-            t.bubble_muted = t.bubble_muted or imgui.ImVec4(0.5, 0.5, 0.5, 1.0)
-            return t
-        end
-    end
-end
 
 local availableKeys = {}
 for i = 65, 90 do
@@ -674,6 +601,81 @@ local function DrawVerificationBadge(dl, center, radius, scale)
     
     dl:AddLine(p1, p2, fg_col, thick)
     dl:AddLine(p2, p3, fg_col, thick)
+end
+
+local function DrawPinBadge(dl, center, radius, scale)
+    local r = radius * 1.15
+    local pin_col = imgui.GetColorU32Vec4(imgui.ImVec4(1.0, 0.78, 0.20, 1.0))
+    local needle_col = imgui.GetColorU32Vec4(imgui.ImVec4(0.90, 0.92, 0.95, 1.0))
+    
+    dl:AddLine(
+        imgui.ImVec2(center.x - r * 0.15, center.y + r * 0.15),
+        imgui.ImVec2(center.x - r * 0.95, center.y + r * 0.95),
+        needle_col, 2.0 * scale
+    )
+    dl:AddLine(
+        imgui.ImVec2(center.x - r * 0.20, center.y + r * 0.20),
+        imgui.ImVec2(center.x + r * 0.50, center.y - r * 0.50),
+        pin_col, 3.6 * scale
+    )
+    dl:AddLine(
+        imgui.ImVec2(center.x - r * 0.60, center.y - r * 0.10),
+        imgui.ImVec2(center.x + r * 0.10, center.y + r * 0.60),
+        pin_col, 2.4 * scale
+    )
+    dl:AddLine(
+        imgui.ImVec2(center.x + r * 0.20, center.y - r * 0.80),
+        imgui.ImVec2(center.x + r * 0.80, center.y - r * 0.20),
+        pin_col, 2.4 * scale
+    )
+end
+
+local function DrawMuteBadge(dl, center, radius, scale, colorVec4)
+    local r = radius * 1.15
+    local col = imgui.GetColorU32Vec4(colorVec4 or imgui.ImVec4(0.65, 0.65, 0.65, 1.0))
+    local strike_col = imgui.GetColorU32Vec4(imgui.ImVec4(0.95, 0.35, 0.35, 1.0))
+    
+    dl:AddRectFilled(
+        imgui.ImVec2(center.x - r * 0.85, center.y - r * 0.35),
+        imgui.ImVec2(center.x - r * 0.35, center.y + r * 0.35),
+        col, 1.5 * scale
+    )
+    dl:AddTriangleFilled(
+        imgui.ImVec2(center.x - r * 0.45, center.y),
+        imgui.ImVec2(center.x + r * 0.20, center.y - r * 0.80),
+        imgui.ImVec2(center.x + r * 0.20, center.y + r * 0.80),
+        col
+    )
+    dl:AddLine(
+        imgui.ImVec2(center.x - r * 0.75, center.y - r * 0.75),
+        imgui.ImVec2(center.x + r * 0.75, center.y + r * 0.75),
+        strike_col, 2.2 * scale
+    )
+end
+
+local function DrawBlockBadge(dl, center, radius, scale)
+    local r = radius * 1.05
+    local col = imgui.GetColorU32Vec4(imgui.ImVec4(0.90, 0.25, 0.25, 1.0))
+    dl:AddCircle(center, r, col, 20, 2.2 * scale)
+    dl:AddLine(
+        imgui.ImVec2(center.x - r * 0.68, center.y - r * 0.68),
+        imgui.ImVec2(center.x + r * 0.68, center.y + r * 0.68),
+        col, 2.2 * scale
+    )
+end
+
+local function formatCallDuration(calc_duration)
+    if not calc_duration or calc_duration <= 0 then return "0 сек." end
+    local h = math.floor(calc_duration / 3600)
+    local m = math.floor((calc_duration % 3600) / 60)
+    local s = calc_duration % 60
+    if h > 0 then
+        return string.format("%d ч. %d мин. %d сек.", h, m, s)
+    elseif m > 0 then
+        return string.format("%d мин. %d сек.", m, s)
+    else
+        return string.format("%d сек.", s)
+    end
 end
 
 local function GetActiveTheme()
@@ -1203,7 +1205,13 @@ addEventHandler('onWindowMessage', function(msg, wparam, lparam)
                     UI.showMessageSearch = false
                     intercepted = true
                 elseif UI.showCallHistory then
-                    UI.showCallHistory = false
+                    if UI.viewingCallIndex > 0 and not UI.callOpenedFromChat then
+                        UI.viewingCallIndex = 0
+                    else
+                        UI.showCallHistory = false
+                        UI.viewingCallIndex = 0
+                        UI.callOpenedFromChat = false
+                    end
                     intercepted = true
                 elseif imgui.GetIO().WantCaptureKeyboard then
                     intercepted = true
@@ -1219,6 +1227,7 @@ addEventHandler('onWindowMessage', function(msg, wparam, lparam)
                         activeChatHistory = nil
                         UI.showCallHistory = false
                         UI.viewingCallIndex = 0
+                        UI.callOpenedFromChat = false
                         UI.showMessageSearch = false
                         UI.inputSearchMessage[0] = 0
                         UI.inputMessage[0] = 0
@@ -1371,8 +1380,9 @@ function main()
         if not pData.muted then pData.muted = {} end
         if not pData.drafts then pData.drafts = {} end
         if not pData.calls then pData.calls = {} end
-		if not pData.groups then pData.groups = {} end
-		if not pData.blocked then pData.blocked = {} end
+        if not pData.pinned then pData.pinned = {} end
+        if not pData.blocked then pData.blocked = {} end
+        pData.groups = nil
         
         if #master_news_hist > 0 then
             save_chat_data(pName, "system", master_news_hist)
@@ -1387,7 +1397,7 @@ function main()
     end
     
     if myNick ~= "Default" and myNick:find("_") and not phoneData[myNick] then
-        phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
+        phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
         if #master_news_hist > 0 then
             save_chat_data(myNick, "system", master_news_hist)
             local lMsg = master_news_hist[#master_news_hist]
@@ -1543,14 +1553,12 @@ function main()
 
     while true do
         wait(0)
-		processDownloadQueue()
+        processDownloadQueue()
         
-		if #groupSmsQueue > 0 and (os.clock() - lastGroupSmsTime > 1.5) then
-            local task = table.remove(groupSmsQueue, 1)
+        if #smsOutQueue > 0 and (os.clock() - lastSmsOutTime > 1.2) then
+            local task = table.remove(smsOutQueue, 1)
             sampSendChat("/sms " .. task.num .. " " .. task.text)
-            lastAttemptedGroupNum = task.num
-            lastAttemptedGroupId = task.groupId
-            lastGroupSmsTime = os.clock()
+            lastSmsOutTime = os.clock()
         end
 		
         if os.clock() - lastNickCheck > 1.0 then
@@ -1586,7 +1594,7 @@ function main()
                             needSortContacts = true
                             
                             if not phoneData[myNick] then
-                                phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
+                                phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
                                 local m_hist = {}
                                 for nick, _ in pairs(phoneData) do
                                     local sHist = load_chat_history(nick, "system")
@@ -1844,17 +1852,6 @@ function samp.onServerMessage(color, text)
             end
         end
     end
-	
-	if plain_text:find("Сообщение не отправлено%. Абонент вне зоны действия сети") then
-        if lastAttemptedGroupId and lastAttemptedGroupNum and (os.clock() - lastGroupSmsTime < 2.0) then
-            if profile.groups and profile.groups[lastAttemptedGroupId] then
-                profile.groups[lastAttemptedGroupId].members[lastAttemptedGroupNum] = nil
-                save_all_data()
-                showSystemNotification(u8"Номер " .. lastAttemptedGroupNum .. u8" удален из группы (недоступен).", 3)
-            end
-        end
-        return false
-    end
     
     local is_incoming = plain_text:match("^%s*%[Телефон%] Входящий вызов%.%.%.")
     local out_match = plain_text:match("^%s*%[Телефон%] Исходящий вызов (%d+)%.%.%.")
@@ -2044,63 +2041,19 @@ function samp.onServerMessage(color, text)
     end
     
     if inc_num and inc_text then
-		local cmd, payload = inc_text:match("^!(GRP_[A-Z]+)%|(.*)")
-        if cmd then
-            if cmd == "GRP_INV" then
-                local gId, gNums, gName = payload:match("^(%w+)%|([%d%,]+)%|(.*)")
-                if gId then
-                    if not profile.groups then profile.groups = {} end
-                    if not profile.groups[gId] then
-                        profile.groups[gId] = { name = gName, members = {}, history = {} }
-                        table.insert(profile.groups[gId].history, {sender = "them", msg = "[Система] Вас добавили в группу", timestamp = os.time()})
-                    end
-                    for n in gNums:gmatch("%d+") do
-                        profile.groups[gId].members[n] = true
-                    end
-                    profile.groups[gId].members[inc_num] = true
-                    save_all_data()
-                    needSortContacts = true
-                end
-            elseif cmd == "GRP_LV" then
-                local gId = payload:match("^(%w+)")
-                if gId and profile.groups and profile.groups[gId] then
-                    profile.groups[gId].members[inc_num] = nil
-                    save_all_data()
-                end
-            elseif cmd == "GRP_DEL" then
-                local gId = payload:match("^(%w+)")
-                if gId and profile.groups and profile.groups[gId] then
-                    profile.groups[gId] = nil
-                    profile.unread[gId] = nil
-                    if profile.muted then profile.muted[gId] = nil end
-                    if profile.drafts then profile.drafts[gId] = nil end
-                    if activeContact == gId then activeContact = nil end
-                    save_all_data()
-                    needSortContacts = true
-                end
-            end
-            return
-        end
-
         local is_dup = false
-        local gId, real_text = inc_text:match("^#(%w+) (.*)")
+        local plus_cont = inc_text:match("^%s*%+%s*(.+)")
 
         if is_unread then
             local targetHist = nil
-            local search_text = ""
-            
-            if gId and profile.groups and profile.groups[gId] then
-                targetHist = profile.groups[gId].history
-                search_text = real_text:gsub("%s*%.%.%.?%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
-            elseif profile.metadata and profile.metadata[inc_num] then
+            local search_text = (plus_cont or inc_text):gsub("%s*%.%.%.?%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+            if profile.metadata and profile.metadata[inc_num] then
                 targetHist = (myNick == actualPlayerNick and activeChatId == inc_num) and activeChatHistory or load_chat_history(actualPlayerNick, inc_num)
-                search_text = inc_text:gsub("%s*%.%.%.?%s*$", ""):gsub("^%s+", ""):gsub("%s+$", "")
             end
-            
             if targetHist then
                 for i = #targetHist, math.max(1, #targetHist - 100), -1 do
                     local h_text = targetHist[i].msg:gsub("^%s+", ""):gsub("%s+$", "")
-                    if h_text:sub(1, #search_text) == search_text then
+                    if h_text:find(search_text, 1, true) then
                         is_dup = true
                         break
                     end
@@ -2108,53 +2061,51 @@ function samp.onServerMessage(color, text)
             end
         end
 
-        if gId and profile.groups and profile.groups[gId] then
-            lastSmsPhone = inc_num
-            lastSmsGroupId = gId
-            lastSmsSysTime = os.clock()
-            lastSmsIsDup = is_dup
-            lastSmsIsUnread = is_unread
-            lastSmsIsOutgoingGroup = false
-            
-            if not is_dup then
-                table.insert(profile.groups[gId].history, {sender = inc_num, msg = real_text, timestamp = ts})
-                if myNick ~= actualPlayerNick or activeContact ~= gId or not UI.windowState[0] then
-                    profile.unread[gId] = (type(profile.unread[gId]) == "number" and profile.unread[gId] or 0) + 1
-                    if not profile.muted[gId] and globalSettings.useScreenNotifications and not globalSettings.dndMode then
-                        Sys.activeNotification = { number = gId, name = profile.groups[gId].name, text = real_text, time = os.clock() }
-                    end
-                end
-                save_all_data()
-                needSortContacts = true
-                if myNick == actualPlayerNick and activeContact == gId then UI.scrollToBottom = true end
-            end
-            
-            if is_unread and globalSettings.hideUnreadOnLogin then return false
-            elseif globalSettings.useScreenNotifications then return false 
-            else return end
-        end
-        
         lastSmsPhone = inc_num
         lastSmsIsUnread = is_unread
         lastSmsIsDup = is_dup
         lastSmsSysTime = os.clock()
-        lastSmsIsOutgoingGroup = false
         
         if not is_dup then
-            addSmsToHistory(profile, inc_num, "them", inc_text, ts)
-            syncGlobalVerified(inc_num)
-            needSortContacts = true
-            if myNick ~= actualPlayerNick or activeContact ~= inc_num or not UI.windowState[0] then
-                profile.unread[inc_num] = (type(profile.unread[inc_num]) == "number" and profile.unread[inc_num] or 0) + 1
-                if not profile.muted[inc_num] then
-                    if globalSettings.useScreenNotifications and not globalSettings.dndMode then
-                        local cName = profile.contacts[inc_num] or ""
-                        Sys.activeNotification = { number = inc_num, name = (cName == "" and inc_num or cName), text = inc_text, time = os.clock() }
+            local stitched = false
+            if plus_cont then
+                local targetHist = (myNick == actualPlayerNick and activeChatId == inc_num and activeChatHistory) and activeChatHistory or load_chat_history(actualPlayerNick, inc_num)
+                if targetHist and #targetHist > 0 then
+                    local lastMsg = targetHist[#targetHist]
+                    if lastMsg.sender == "them" and (lastMsg.msg:match("%+%s*$") or (ts - (lastMsg.timestamp or 0) <= 10)) then
+                        local baseMsg = lastMsg.msg:gsub("%s*%.%.%.?%s*$", ""):gsub("%s*%+%s*$", "")
+                        lastMsg.msg = baseMsg .. " " .. plus_cont
+                        lastMsg.bubbleSize = nil
+                        if myNick == actualPlayerNick and activeChatId == inc_num then activeChatHistory = targetHist end
+                        save_chat_data(actualPlayerNick, inc_num, targetHist)
+                        if not profile.metadata then profile.metadata = {} end
+                        profile.metadata[inc_num] = { sender = "them", text = lastMsg.msg, timestamp = lastMsg.timestamp }
+                        if Sys.activeNotification and Sys.activeNotification.number == inc_num then
+                            Sys.activeNotification.text = lastMsg.msg
+                        end
+                        save_all_data()
+                        needSortContacts = true
+                        if myNick == actualPlayerNick and activeContact == inc_num then UI.scrollToBottom = true end
+                        stitched = true
                     end
                 end
             end
-            save_all_data()
-            if myNick == actualPlayerNick and activeContact == inc_num then UI.scrollToBottom = true end
+            if not stitched then
+                addSmsToHistory(profile, inc_num, "them", inc_text, ts)
+                syncGlobalVerified(inc_num)
+                needSortContacts = true
+                if myNick ~= actualPlayerNick or activeContact ~= inc_num or not UI.windowState[0] then
+                    profile.unread[inc_num] = (type(profile.unread[inc_num]) == "number" and profile.unread[inc_num] or 0) + 1
+                    if not profile.muted[inc_num] then
+                        if globalSettings.useScreenNotifications and not globalSettings.dndMode then
+                            local cName = profile.contacts[inc_num] or ""
+                            Sys.activeNotification = { number = inc_num, name = (cName == "" and inc_num or cName), text = inc_text:gsub("%+$", ""), time = os.clock() }
+                        end
+                    end
+                end
+                save_all_data()
+                if myNick == actualPlayerNick and activeContact == inc_num then UI.scrollToBottom = true end
+            end
         end
         
         if is_unread and globalSettings.hideUnreadOnLogin then return false
@@ -2182,30 +2133,45 @@ function samp.onServerMessage(color, text)
     end
     
     if out_num and out_text then
-        local is_sys_grp = out_text:match("^!GRP_")
-        local gId = out_text:match("^#(%w+) ")
-        if is_sys_grp then return false end
-        
-        if gId and profile.groups and profile.groups[gId] then
-            lastSmsPhone = out_num
-            lastSmsGroupId = gId
-            lastSmsSysTime = os.clock()
-            lastSmsIsDup = false
-            lastSmsIsUnread = false
-            lastSmsIsOutgoingGroup = true
-            if globalSettings.useScreenNotifications then return false else return end
-        end
-
         lastSmsPhone = out_num
-        lastSmsGroupId = nil
         lastSmsIsUnread = false
         lastSmsIsDup = false
         lastSmsSysTime = os.clock()
-        lastSmsIsOutgoingGroup = false
-        addSmsToHistory(profile, out_num, "me", out_text, ts)
-        syncGlobalVerified(out_num)
-        needSortContacts = true
-        if myNick == actualPlayerNick and activeContact == out_num then UI.scrollToBottom = true end
+        
+        if pendingLocalSms[out_num] and pendingLocalSms[out_num].count > 0 and (os.clock() - pendingLocalSms[out_num].time < 15.0) then
+            pendingLocalSms[out_num].count = pendingLocalSms[out_num].count - 1
+            lastSmsWasSkipped = true
+        else
+            lastSmsWasSkipped = false
+            local plus_cont = out_text:match("^%s*%+%s*(.+)")
+            local stitched = false
+            if plus_cont then
+                local targetHist = (myNick == actualPlayerNick and activeChatId == out_num and activeChatHistory) and activeChatHistory or load_chat_history(actualPlayerNick, out_num)
+                if targetHist and #targetHist > 0 then
+                    local lastMsg = targetHist[#targetHist]
+                    if lastMsg.sender == "me" and (lastMsg.msg:match("%+%s*$") or (ts - (lastMsg.timestamp or 0) <= 10)) then
+                        local baseMsg = lastMsg.msg:gsub("%s*%.%.%.?%s*$", ""):gsub("%s*%+%s*$", "")
+                        lastMsg.msg = baseMsg .. " " .. plus_cont
+                        lastMsg.bubbleSize = nil
+                        if myNick == actualPlayerNick and activeChatId == out_num then activeChatHistory = targetHist end
+                        save_chat_data(actualPlayerNick, out_num, targetHist)
+                        if not profile.metadata then profile.metadata = {} end
+                        profile.metadata[out_num] = { sender = "me", text = lastMsg.msg, timestamp = lastMsg.timestamp }
+                        save_all_data()
+                        needSortContacts = true
+                        if myNick == actualPlayerNick and activeContact == out_num then UI.scrollToBottom = true end
+                        stitched = true
+                    end
+                end
+            end
+            
+            if not stitched then
+                addSmsToHistory(profile, out_num, "me", out_text, ts)
+                syncGlobalVerified(out_num)
+                needSortContacts = true
+                if myNick == actualPlayerNick and activeContact == out_num then UI.scrollToBottom = true end
+            end
+        end
         
         if globalSettings.useScreenNotifications then return false
         else
@@ -2227,35 +2193,19 @@ function samp.onServerMessage(color, text)
     local continued_text = plain_text:match("^%.%.%.?%s*(.*)")
     if continued_text then
         if lastSmsPhone and (os.clock() - lastSmsSysTime <= 0.5) then
-            if lastSmsIsOutgoingGroup then
-                if globalSettings.useScreenNotifications then return false end
-                return
-            end
-            
-            if not lastSmsIsDup then
-                local targetHist = nil
-                local isGroup = lastSmsGroupId and profile.groups and profile.groups[lastSmsGroupId]
-                if isGroup then
-                    targetHist = profile.groups[lastSmsGroupId].history
-                else
-                    targetHist = (myNick == actualPlayerNick and activeChatId == lastSmsPhone) and activeChatHistory or load_chat_history(actualPlayerNick, lastSmsPhone)
-                end
-                
+            if not lastSmsIsDup and not lastSmsWasSkipped then
+                local targetHist = (myNick == actualPlayerNick and activeChatId == lastSmsPhone) and activeChatHistory or load_chat_history(actualPlayerNick, lastSmsPhone)
                 if targetHist and #targetHist > 0 then
                     local prev_msg = targetHist[#targetHist].msg
                     prev_msg = prev_msg:gsub("%s*%.%.%.?%s*$", "")
                     targetHist[#targetHist].msg = prev_msg .. " " .. continued_text
                     targetHist[#targetHist].bubbleSize = nil 
-                    
-                    if not isGroup then
-                        save_chat_data(actualPlayerNick, lastSmsPhone, targetHist)
-                        if profile.metadata and profile.metadata[lastSmsPhone] then
-                            profile.metadata[lastSmsPhone].text = targetHist[#targetHist].msg
-                        end
+                    save_chat_data(actualPlayerNick, lastSmsPhone, targetHist)
+                    if profile.metadata and profile.metadata[lastSmsPhone] then
+                        profile.metadata[lastSmsPhone].text = targetHist[#targetHist].msg
                     end
                     save_all_data()
-                    local aContact = lastSmsGroupId or lastSmsPhone
-                    if myNick == actualPlayerNick and activeContact == aContact then UI.scrollToBottom = true end
+                    if myNick == actualPlayerNick and activeContact == lastSmsPhone then UI.scrollToBottom = true end
                 end
             end
             if lastSmsIsUnread and globalSettings.hideUnreadOnLogin then return false
@@ -2671,6 +2621,7 @@ local function DrawModals(scale)
                 profile.metadata[UI.contactToDelete] = nil
                 profile.calls[UI.contactToDelete] = nil
                 profile.unread[UI.contactToDelete] = nil
+                if profile.pinned then profile.pinned[UI.contactToDelete] = nil end
                 if profile.muted then profile.muted[UI.contactToDelete] = nil end
                 if profile.drafts then profile.drafts[UI.contactToDelete] = nil end
                 if activeContact == UI.contactToDelete then activeContact = nil activeChatId = nil activeChatHistory = nil end
@@ -2801,13 +2752,13 @@ local function DrawModals(scale)
             phoneData[myNick] = nil
             
             if myNick == actualNick and actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
-                phoneData[actualNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {} }
+                phoneData[actualNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
                 phoneData[actualNick].contacts["system"] = "Уведомления"
             else
                 if actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
                     myNick = actualNick
                     if not phoneData[myNick] then
-                        phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, groups = {}, blocked = {} }
+                        phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
                         phoneData[myNick].contacts["system"] = "Уведомления"
                     end
                 else
@@ -3356,6 +3307,11 @@ local function DrawContactsList(scale, profile, leftAvailW)
             end
         end
         table.sort(cachedSortedContacts, function(a, b)
+            local a_pin = profile.pinned and profile.pinned[a.num] or false
+            local b_pin = profile.pinned and profile.pinned[b.num] or false
+            if a_pin ~= b_pin then
+                return a_pin
+            end
             local mode = globalSettings.contactSortMode or 1
             if mode == 2 then
                 local a_saved = (a.name ~= "")
@@ -3445,6 +3401,14 @@ local function DrawContactsList(scale, profile, leftAvailW)
                 UI.requestFocus = true
             end
             if imgui.BeginPopupContextItem("ContactPopup_" .. num) then
+                local isPinned = profile.pinned and profile.pinned[num]
+                if imgui.Selectable(isPinned and u8"Открепить диалог" or u8"Закрепить диалог") then
+                    if not profile.pinned then profile.pinned = {} end
+                    if isPinned then profile.pinned[num] = nil else profile.pinned[num] = true end
+                    save_all_data()
+                    needSortContacts = true
+                end
+                imgui.Separator()
                 if profile.tagger and profile.tagger[num] then
                     if imgui.Selectable(u8"Открыть Nova (Social)") then
                         local url = "https://nova.gambit-rp.com/" .. profile.tagger[num]
@@ -3533,6 +3497,7 @@ local function DrawContactsList(scale, profile, leftAvailW)
                         profile.metadata[num] = nil
                         profile.calls[num] = nil
                         profile.unread[num] = nil
+                        if profile.pinned then profile.pinned[num] = nil end
                         if profile.muted then profile.muted[num] = nil end
                         if profile.drafts then profile.drafts[num] = nil end
                         if activeContact == num then activeContact = nil activeChatId = nil activeChatHistory = nil end
@@ -3585,10 +3550,12 @@ local function DrawContactsList(scale, profile, leftAvailW)
             end
             local time_w = imgui.CalcTextSize(time_str).x
             local badges_w = 0
+            local isPinned = profile.pinned and profile.pinned[num]
             local isVerified = (num == "banking" or num == "system" or (profile.verified and profile.verified[num]))
+            if isPinned then badges_w = badges_w + (20 * scale) end
             if isVerified then badges_w = badges_w + (22 * scale) end
-            if profile.muted and profile.muted[num] then badges_w = badges_w + imgui.CalcTextSize(u8" [Мут]").x end
-            if profile.blocked and profile.blocked[num] then badges_w = badges_w + imgui.CalcTextSize(u8" [ЧС]").x end
+            if profile.muted and profile.muted[num] then badges_w = badges_w + (20 * scale) end
+            if profile.blocked and profile.blocked[num] then badges_w = badges_w + (20 * scale) end
             if profile.nicknames and profile.nicknames[num] and onlinePlayers[profile.nicknames[num]] then badges_w = badges_w + (14 * scale) end
             
             local max_name_w = avail_w - time_w - badges_w - (30 * scale)
@@ -3610,17 +3577,42 @@ local function DrawContactsList(scale, profile, leftAvailW)
                 
                 nextOffset = nextOffset + (22 * scale)
             end
+            if isPinned then
+                local pin_center = imgui.ImVec2(p_min.x + nextOffset + (10 * scale), p_min.y + (6 * scale) + imgui.GetTextLineHeight() / 2)
+                DrawPinBadge(dl, pin_center, 6.0 * scale, scale)
+                
+                local old_pos = imgui.GetCursorScreenPos()
+                imgui.SetCursorScreenPos(imgui.ImVec2(pin_center.x - 6*scale, pin_center.y - 6*scale))
+                imgui.InvisibleButton("##PinTipList" .. num, imgui.ImVec2(12*scale, 12*scale))
+                if imgui.IsItemHovered() then imgui.SetTooltip(u8"Диалог закреплён") end
+                imgui.SetCursorScreenPos(old_pos)
+                
+                nextOffset = nextOffset + (20 * scale)
+            end
             if profile.muted and profile.muted[num] then
-                local mutedText = u8" [Мут]"
+                local mute_center = imgui.ImVec2(p_min.x + nextOffset + (10 * scale), p_min.y + (6 * scale) + imgui.GetTextLineHeight() / 2)
                 local mutedColor = active_theme_render.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0)
-                dl:AddText(imgui.ImVec2(p_min.x + nextOffset, p_min.y + 6), imgui.GetColorU32Vec4(mutedColor), mutedText)
-                nextOffset = nextOffset + imgui.CalcTextSize(mutedText).x
+                DrawMuteBadge(dl, mute_center, 6.0 * scale, scale, mutedColor)
+                
+                local old_pos = imgui.GetCursorScreenPos()
+                imgui.SetCursorScreenPos(imgui.ImVec2(mute_center.x - 6*scale, mute_center.y - 6*scale))
+                imgui.InvisibleButton("##MuteTipList" .. num, imgui.ImVec2(12*scale, 12*scale))
+                if imgui.IsItemHovered() then imgui.SetTooltip(u8"Уведомления отключены") end
+                imgui.SetCursorScreenPos(old_pos)
+                
+                nextOffset = nextOffset + (20 * scale)
             end
             if profile.blocked and profile.blocked[num] then
-                local blockedText = u8" [ЧС]"
-                local blockedColor = imgui.ImVec4(0.8, 0.2, 0.2, 1.0)
-                dl:AddText(imgui.ImVec2(p_min.x + nextOffset, p_min.y + 6), imgui.GetColorU32Vec4(blockedColor), blockedText)
-                nextOffset = nextOffset + imgui.CalcTextSize(blockedText).x
+                local block_center = imgui.ImVec2(p_min.x + nextOffset + (10 * scale), p_min.y + (6 * scale) + imgui.GetTextLineHeight() / 2)
+                DrawBlockBadge(dl, block_center, 6.0 * scale, scale)
+                
+                local old_pos = imgui.GetCursorScreenPos()
+                imgui.SetCursorScreenPos(imgui.ImVec2(block_center.x - 6*scale, block_center.y - 6*scale))
+                imgui.InvisibleButton("##BlockTipList" .. num, imgui.ImVec2(12*scale, 12*scale))
+                if imgui.IsItemHovered() then imgui.SetTooltip(u8"Контакт в чёрном списке") end
+                imgui.SetCursorScreenPos(old_pos)
+                
+                nextOffset = nextOffset + (20 * scale)
             end
             if profile.nicknames and profile.nicknames[num] then
                 local contactNick = profile.nicknames[num]
@@ -3696,14 +3688,45 @@ local function DrawChatHistory(scale, profile)
                 imgui.SetTooltip(u8"Этот контакт официально верифицирован.")
             end
         end
+        if profile.pinned and profile.pinned[activeContact] then
+            imgui.SameLine(0, 4 * scale)
+            local dl = imgui.GetWindowDrawList()
+            local c_pos = imgui.GetCursorScreenPos()
+            local b_radius = 6.5 * scale
+            local badge_center = imgui.ImVec2(c_pos.x + b_radius, c_pos.y + (imgui.GetTextLineHeight() / 2) + (2.0 * scale))
+            DrawPinBadge(dl, badge_center, b_radius, scale)
+            
+            imgui.InvisibleButton("PinHintHead", imgui.ImVec2(b_radius * 2, b_radius * 2))
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(u8"Диалог закреплён")
+            end
+        end
         if profile.muted and profile.muted[activeContact] then
             imgui.SameLine(0, 4 * scale)
+            local dl = imgui.GetWindowDrawList()
+            local c_pos = imgui.GetCursorScreenPos()
+            local b_radius = 6.5 * scale
+            local badge_center = imgui.ImVec2(c_pos.x + b_radius, c_pos.y + (imgui.GetTextLineHeight() / 2) + (2.0 * scale))
             local actTheme = GetActiveTheme()
-            imgui.TextColored(actTheme.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0), u8"[Мут]")
+            DrawMuteBadge(dl, badge_center, b_radius, scale, actTheme.muted or imgui.ImVec4(0.6, 0.6, 0.6, 1.0))
+            
+            imgui.InvisibleButton("MuteHintHead", imgui.ImVec2(b_radius * 2, b_radius * 2))
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(u8"Уведомления отключены")
+            end
         end
         if profile.blocked and profile.blocked[activeContact] then
             imgui.SameLine(0, 4 * scale)
-            imgui.TextColored(imgui.ImVec4(0.8, 0.2, 0.2, 1.0), u8"[Заблокирован]")
+            local dl = imgui.GetWindowDrawList()
+            local c_pos = imgui.GetCursorScreenPos()
+            local b_radius = 6.5 * scale
+            local badge_center = imgui.ImVec2(c_pos.x + b_radius, c_pos.y + (imgui.GetTextLineHeight() / 2) + (2.0 * scale))
+            DrawBlockBadge(dl, badge_center, b_radius, scale)
+            
+            imgui.InvisibleButton("BlockHintHead", imgui.ImVec2(b_radius * 2, b_radius * 2))
+            if imgui.IsItemHovered() then
+                imgui.SetTooltip(u8"Контакт в чёрном списке")
+            end
         end
         if not isSystemChat then
             local framePadX = imgui.GetStyle().FramePadding.x
@@ -3730,6 +3753,7 @@ local function DrawChatHistory(scale, profile)
             if imgui.Button(callHistBtnText) then
                 UI.showCallHistory = not UI.showCallHistory
                 UI.viewingCallIndex = 0
+                UI.callOpenedFromChat = false
                 UI.showMessageSearch = false
                 UI.showGallery[0] = false
             end
@@ -3892,6 +3916,7 @@ local function DrawChatHistory(scale, profile)
                         imgui.PushIDStr("callhist_"..i)
                         if imgui.Button(u8("Звонок от " .. dateStr .. durationStr) .. "##call" .. i, imgui.ImVec2(-1, 0)) then
                             UI.viewingCallIndex = i
+                            UI.callOpenedFromChat = false
                         end
                         if imgui.BeginPopupContextItem("CallCtx_" .. i) then
                             if imgui.Selectable(u8"Удалить") then
@@ -3907,8 +3932,15 @@ local function DrawChatHistory(scale, profile)
                     imgui.TextDisabled(u8"Нет записанных звонков с этим контактом.")
                 end
             else
-                if imgui.Button(u8"<- Назад к списку звонков") then
-                    UI.viewingCallIndex = 0
+                local backBtnLabel = UI.callOpenedFromChat and u8"<- Назад к диалогу" or u8"<- Назад к списку звонков"
+                if imgui.Button(backBtnLabel) then
+                    if UI.callOpenedFromChat then
+                        UI.showCallHistory = false
+                        UI.viewingCallIndex = 0
+                        UI.callOpenedFromChat = false
+                    else
+                        UI.viewingCallIndex = 0
+                    end
                 end
                 imgui.Separator()
                 local cCall = cCalls[UI.viewingCallIndex]
@@ -4026,9 +4058,24 @@ local function DrawChatHistory(scale, profile)
                 end
             end
             
-            local currentHistory = activeChatHistory
+            local currentHistory = activeChatHistory or {}
+            local cCalls = (profile.calls and profile.calls[activeContact]) or {}
             local deleteMsgIndex = nil
-            if currentHistory then
+            local timeline = {}
+            for idx, mData in ipairs(currentHistory) do
+                table.insert(timeline, { itemType = "sms", index = idx, data = mData, timestamp = mData.timestamp or 0 })
+            end
+            for idx, cData in ipairs(cCalls) do
+                table.insert(timeline, { itemType = "call", index = idx, data = cData, timestamp = cData.timestamp or 0 })
+            end
+            table.sort(timeline, function(a, b)
+                if a.timestamp == b.timestamp then
+                    if a.itemType ~= b.itemType then return a.itemType == "sms" end
+                    return a.index < b.index
+                end
+                return a.timestamp < b.timestamp
+            end)
+            if #timeline > 0 then
                 local last_date_str = ""
                 local active_theme = GetActiveTheme()
                 local scrollY = imgui.GetScrollY()
@@ -4036,15 +4083,65 @@ local function DrawChatHistory(scale, profile)
                 local culling_buffer = 200 * scale
                 local sMsgText = cp1251_lower(u8:decode(ffi.string(UI.inputSearchMessage)))
                 local isMsgSearching = UI.showMessageSearch and sMsgText ~= ""
-                for index, msgData in ipairs(currentHistory) do
-                    local skipMsg = false
-                    if isMsgSearching then
-                        local lowerMsg = cp1251_lower(msgData.msg)
-                        if not lowerMsg:find(sMsgText, 1, true) then
-                            skipMsg = true
+                for _, entry in ipairs(timeline) do
+                    if entry.itemType == "call" then
+                        if not isMsgSearching then
+                            local callData = entry.data
+                            local callIdx = entry.index
+                            local current_date_str = get_day_string(callData.timestamp)
+                            local has_date = (current_date_str ~= last_date_str)
+                            if has_date then
+                                imgui.Spacing()
+                                local tSize = imgui.CalcTextSize(u8(current_date_str)).x
+                                imgui.SetCursorPosX((imgui.GetWindowWidth() - tSize) / 2)
+                                imgui.TextDisabled(u8(current_date_str))
+                                imgui.Spacing()
+                                last_date_str = current_date_str
+                            end
+                            local calc_duration = 0
+                            local isOngoing = (CallState.active and CallState.number == activeContact and CallState.callIndex == callIdx)
+                            if isOngoing then
+                                calc_duration = os.time() - (CallState.startTime or os.time())
+                            elseif callData.duration and callData.duration > 0 then
+                                calc_duration = callData.duration
+                            elseif callData.messages and #callData.messages > 0 then
+                                calc_duration = callData.messages[#callData.messages].timestamp - callData.messages[1].timestamp
+                            end
+                            local callStr = isOngoing and ("Идёт звонок (" .. formatCallDuration(calc_duration) .. ")") or ("Звонок продлился " .. formatCallDuration(calc_duration))
+                            local callTextU8 = u8(callStr)
+                            imgui.Spacing()
+                            local tSize = imgui.CalcTextSize(callTextU8)
+                            local posX = (imgui.GetWindowWidth() - tSize.x) / 2
+                            local posY = imgui.GetCursorPosY()
+                            imgui.SetCursorPosX(posX)
+                            local isCallHover = false
+                            imgui.InvisibleButton("##chat_call_btn_" .. callIdx, imgui.ImVec2(tSize.x, tSize.y + 4 * scale))
+                            if imgui.IsItemHovered() then
+                                isCallHover = true
+                                imgui.SetMouseCursor(imgui.MouseCursor.Hand)
+                                imgui.SetTooltip(u8"Нажмите, чтобы открыть запись звонка")
+                                if imgui.IsMouseClicked(0) then
+                                    UI.showCallHistory = true
+                                    UI.viewingCallIndex = callIdx
+                                    UI.callOpenedFromChat = true
+                                end
+                            end
+                            imgui.SetCursorPos(imgui.ImVec2(posX, posY))
+                            local callCol = isCallHover and imgui.ImVec4(0.55, 0.82, 1.0, 1.0) or imgui.ImVec4(0.35, 0.68, 1.0, 1.0)
+                            imgui.TextColored(callCol, callTextU8)
+                            imgui.Spacing()
                         end
-                    end
-                    if not skipMsg then
+                    else
+                        local index = entry.index
+                        local msgData = entry.data
+                        local skipMsg = false
+                        if isMsgSearching then
+                            local lowerMsg = cp1251_lower(msgData.msg)
+                            if not lowerMsg:find(sMsgText, 1, true) then
+                                skipMsg = true
+                            end
+                        end
+                        if not skipMsg then
                         local text = u8(msgData.msg)
                         local urls = {}
                         local foundUrls = {}
@@ -4342,6 +4439,7 @@ local function DrawChatHistory(scale, profile)
                             imgui.TextColored(imgui.ImVec4(0.7, 0.7, 0.7, 0.8), timeText)
                             imgui.SetCursorPosY(bubble_start_y + bubbleSize.y + 6)
                         end
+                        end
                     end
                 end
                 if deleteMsgIndex then
@@ -4384,7 +4482,7 @@ local function DrawChatHistory(scale, profile)
                 local currentPaddingY = imgui.GetStyle().FramePadding.y
                 imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, imgui.ImVec2(10.0 * scale, currentPaddingY)) 
                 imgui.PushItemWidth(-80 * scale) 
-                if imgui.InputTextWithHint("##MessageInput", u8"Напишите сообщение...", UI.inputMessage, 512, imgui.InputTextFlags.EnterReturnsTrue) then
+                if imgui.InputTextWithHint("##MessageInput", u8"Напишите сообщение...", UI.inputMessage, 2048, imgui.InputTextFlags.EnterReturnsTrue) then
                     sendMessage(activeContact)
                 end
                 if UI.requestFocus then
@@ -4477,8 +4575,58 @@ local newFrame = imgui.OnFrame(
 
 function sendMessage(number)
     local text = u8:decode(ffi.string(UI.inputMessage))
+    text = text:gsub("[\r\n]+", " "):match("^%s*(.-)%s*$") or ""
     if text ~= "" then
-        sampSendChat("/sms " .. number .. " " .. text)
+        local prefixLen = 6 + #tostring(number)
+        local maxLen = 125 - prefixLen
+        if maxLen < 20 then maxLen = 20 end
+        
+        local chunks = {}
+        local rem = text
+        while #rem > 0 do
+            local isFirst = (#chunks == 0)
+            local leadPlus = isFirst and "" or "+"
+            local availLast = maxLen - #leadPlus
+            if #rem <= availLast then
+                table.insert(chunks, leadPlus .. rem)
+                break
+            else
+                local availMore = maxLen - #leadPlus - 1
+                local sub = rem:sub(1, availMore)
+                local lastSpace = sub:match("^.*()%s")
+                local part = ""
+                if lastSpace and lastSpace > 1 then
+                    part = rem:sub(1, lastSpace - 1):match("^(.-)%s*$")
+                    rem = rem:sub(lastSpace + 1):match("^%s*(.*)$")
+                else
+                    part = sub
+                    rem = rem:sub(availMore + 1):match("^%s*(.*)$")
+                end
+                table.insert(chunks, leadPlus .. part .. "+")
+            end
+        end
+        
+        local profile = phoneData[myNick]
+        if profile then
+            addSmsToHistory(profile, number, "me", text, os.time())
+            syncGlobalVerified(number)
+            needSortContacts = true
+        end
+        
+        if not pendingLocalSms[number] or (os.clock() - pendingLocalSms[number].time >= 15.0) then
+            pendingLocalSms[number] = { count = 0, time = os.clock() }
+        end
+        pendingLocalSms[number].count = pendingLocalSms[number].count + #chunks
+        pendingLocalSms[number].time = os.clock()
+        
+        for i, chunk in ipairs(chunks) do
+            if i == 1 and #smsOutQueue == 0 and (os.clock() - lastSmsOutTime > 1.2) then
+                sampSendChat("/sms " .. number .. " " .. chunk)
+                lastSmsOutTime = os.clock()
+            else
+                table.insert(smsOutQueue, { num = number, text = chunk })
+            end
+        end
         
         ClearDraft(number)
         UI.scrollToBottom = true
