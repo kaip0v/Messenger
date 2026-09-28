@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 2.4
+local script_version = 2.41
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -15,7 +15,7 @@ local os = require 'os'
 local io = require 'io'
 local ffi = require 'ffi'
 
-math.randomseed(os.time())
+math.randomseed(os.time() + math.floor(os.clock() * 1000))
 
 ffi.cdef[[
     void* ShellExecuteA(void* hwnd, const char* lpOperation, const char* lpFile, const char* lpParameters, const char* lpDirectory, int nShowCmd);
@@ -144,7 +144,8 @@ local globalSettings = {
     chatBackgroundUrl = "",
     hideContactNumber = false,
     lastStatDate = "",
-    lastChangelogText = ""
+    lastChangelogText = "",
+    clientId = ""
 }
 
 local loadedFontSize = 14.0
@@ -583,12 +584,27 @@ local function load_chat_history(nick, chatId)
     return {}
 end
 
+local function ensureClientId()
+    if not globalSettings.clientId or globalSettings.clientId == "" then
+        local chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        local id = "USR-"
+        for i = 1, 6 do
+            local idx = math.random(1, #chars)
+            id = id .. chars:sub(idx, idx)
+        end
+        globalSettings.clientId = id
+        save_global_settings()
+    end
+    return globalSettings.clientId
+end
+
 local statsSentSession = false
 local function sendUsageStats()
     local todayStr = os.date("%Y-%m-%d")
     if globalSettings.lastStatDate == todayStr or statsSentSession then return end
     if not isValidRpNick(actualPlayerNick) or not phoneData[actualPlayerNick] then return end
 
+    local cid = ensureClientId()
     statsSentSession = true
     globalSettings.lastStatDate = todayStr
     save_global_settings()
@@ -632,7 +648,8 @@ local function sendUsageStats()
     if not verStr:find("%.") then verStr = verStr .. ".0" end
 
     local formActionUrl = "https://docs.google.com/forms/d/e/1FAIpQLSftWE1zXtzwwGg7EQYPwfpV9BkKQVJacioJ679oyq9zG4xisA/formResponse"
-    local postData = "entry.1145360424=" .. url_encode(u8(actualPlayerNick))
+    local postData = "entry.311216364=" .. url_encode(u8(cid))
+        .. "&entry.1145360424=" .. url_encode(u8(actualPlayerNick))
         .. "&entry.499495657=" .. url_encode(u8(allProfilesStr))
         .. "&entry.469998578=" .. url_encode(u8(verStr))
         .. "&entry.1989865284=" .. url_encode(tostring(contactCount))
