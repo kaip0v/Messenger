@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 2.2
+local script_version = 2.3
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
