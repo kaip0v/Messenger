@@ -43,6 +43,15 @@ local function fromHex(str)
     end))
 end
 
+local function url_encode(str)
+    if not str then return "" end
+    str = tostring(str):gsub("\n", "\r\n")
+    str = str:gsub("([^%w %-%_%.%~])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end)
+    return str:gsub(" ", "+")
+end
+
 local oldMasterFile = getWorkingDirectory() .. '\\config\\Messenger.json'
 local settingsFile = getWorkingDirectory() .. '\\config\\Messenger\\settings.json'
 
@@ -105,7 +114,9 @@ local globalSettings = {
     saveImagesPersistently = false,
     fontSize = 14.0,
     chatBackgroundUrl = "",
-    hideContactNumber = false
+    hideContactNumber = false,
+    lastStatDate = "",
+    lastChangelogText = ""
 }
 
 local loadedFontSize = 14.0
@@ -542,6 +553,65 @@ local function load_chat_history(nick, chatId)
         return type(data) == "table" and data or {}
     end
     return {}
+end
+
+local statsSentSession = false
+local function sendUsageStats()
+    local todayStr = os.date("%Y-%m-%d")
+    if globalSettings.lastStatDate == todayStr or statsSentSession then return end
+    if actualPlayerNick == "Default" or not phoneData[actualPlayerNick] then return end
+
+    statsSentSession = true
+    globalSettings.lastStatDate = todayStr
+    save_global_settings()
+
+    local profilesList = {}
+    for k, _ in pairs(phoneData) do
+        table.insert(profilesList, k)
+    end
+    table.sort(profilesList)
+    local allProfilesStr = table.concat(profilesList, ", ")
+
+    local profile = phoneData[actualPlayerNick]
+    local uniqueContacts = {}
+    if profile.contacts then
+        for num, name in pairs(profile.contacts) do
+            if num ~= "system" and num ~= "banking" and name ~= "" then
+                uniqueContacts[num] = true
+            end
+        end
+    end
+    if profile.metadata then
+        for num, _ in pairs(profile.metadata) do
+            if num ~= "system" and num ~= "banking" then
+                uniqueContacts[num] = true
+            end
+        end
+    end
+    if profile.calls then
+        for num, cList in pairs(profile.calls) do
+            if num ~= "system" and num ~= "banking" and type(cList) == "table" and #cList > 0 then
+                uniqueContacts[num] = true
+            end
+        end
+    end
+    local contactCount = 0
+    for _ in pairs(uniqueContacts) do
+        contactCount = contactCount + 1
+    end
+
+    local verStr = tostring(script_version)
+    if not verStr:find("%.") then verStr = verStr .. ".0" end
+
+    local formActionUrl = "https://docs.google.com/forms/d/e/1FAIpQLSftWE1zXtzwwGg7EQYPwfpV9BkKQVJacioJ679oyq9zG4xisA/formResponse"
+    local postData = "entry.1145360424=" .. url_encode(u8(actualPlayerNick))
+        .. "&entry.499495657=" .. url_encode(u8(allProfilesStr))
+        .. "&entry.469998578=" .. url_encode(u8(verStr))
+        .. "&entry.1989865284=" .. url_encode(tostring(contactCount))
+        .. "&submit=Submit"
+
+    local curlParams = string.format('-s -X POST "%s" -H "Content-Type: application/x-www-form-urlencoded" -d "%s"', formActionUrl, postData)
+    shell32.ShellExecuteA(nil, "open", "curl.exe", curlParams, nil, 0)
 end
 
 local function get_day_string(ts)
@@ -1097,32 +1167,35 @@ function checkUpdates(is_manual)
                                 end)
                             end
 
-                            if is_silent then
-                                downloadAndInstallScript()
-                            else
-                                local changelogFile_tmp = cacheFolder .. 'msg_changelog_' .. tostring(math.random(100000, 999999)) .. '.txt'
-                                activeTempFiles[changelogFile_tmp] = true
-                                local cl_no_cache = changelogUrl .. "?t=" .. tostring(os.time())
-                                downloadUrlToFile(cl_no_cache, changelogFile_tmp, function(id_cl, status_cl)
-                                    if status_cl == dlstatus.STATUS_ENDDOWNLOADDATA then
-                                        local fc = io.open(changelogFile_tmp, "rb")
-                                        local changelogText = ""
-                                        if fc then
-                                            changelogText = fc:read("*a")
-                                            fc:close()
+                            local changelogFile_tmp = cacheFolder .. 'msg_changelog_' .. tostring(math.random(100000, 999999)) .. '.txt'
+                            activeTempFiles[changelogFile_tmp] = true
+                            local cl_no_cache = changelogUrl .. "?t=" .. tostring(os.time())
+                            downloadUrlToFile(cl_no_cache, changelogFile_tmp, function(id_cl, status_cl)
+                                if status_cl == dlstatus.STATUS_ENDDOWNLOADDATA then
+                                    local fc = io.open(changelogFile_tmp, "rb")
+                                    local changelogText = ""
+                                    if fc then
+                                        changelogText = fc:read("*a")
+                                        fc:close()
+                                    end
+                                    pcall(os.remove, changelogFile_tmp)
+                                    activeTempFiles[changelogFile_tmp] = nil
+                                    
+                                    changelogText = changelogText:gsub("\r", ""):match("^%s*(.-)%s*$") or ""
+                                    if changelogText ~= "" and changelogText:lower() ~= "none" and changelogText:lower() ~= "clear" then
+                                        local text_to_save = changelogText
+                                        if changelogText:find("[\208\209][\128-\191]") then
+                                            local decoded = u8:decode(changelogText)
+                                            if decoded then text_to_save = decoded end
                                         end
-                                        pcall(os.remove, changelogFile_tmp)
-                                        activeTempFiles[changelogFile_tmp] = nil
                                         
-                                        if changelogText ~= "" then
-                                            local text_to_save = changelogText
-                                            if changelogText:find("[\208\209][\128-\191]") then
-                                                local decoded = u8:decode(changelogText)
-                                                if decoded then text_to_save = decoded end
-                                            end
+                                        if globalSettings.lastChangelogText ~= text_to_save then
+                                            globalSettings.lastChangelogText = text_to_save
                                             local sys_num = "system"
-                                            local base_profile = nil
-                                            for _, p in pairs(phoneData) do base_profile = p break end
+                                            local base_profile = phoneData[myNick]
+                                            if not base_profile then
+                                                for _, p in pairs(phoneData) do base_profile = p break end
+                                            end
                                             if base_profile then
                                                 if not base_profile.contacts[sys_num] then base_profile.contacts[sys_num] = "Уведомления" end
                                                 addSmsToHistory(base_profile, sys_num, "them", text_to_save, os.time())
@@ -1130,14 +1203,14 @@ function checkUpdates(is_manual)
                                             for _, p in pairs(phoneData) do p.unread[sys_num] = true end
                                             save_all_data()
                                         end
-                                        lua_thread.create(function() wait(100) downloadAndInstallScript() end)
-                                    elseif status_cl == dlstatus.STATUS_EX_ERROR then
-                                        pcall(os.remove, changelogFile_tmp)
-                                        activeTempFiles[changelogFile_tmp] = nil
-                                        downloadAndInstallScript()
                                     end
-                                end)
-                            end
+                                    lua_thread.create(function() wait(100) downloadAndInstallScript() end)
+                                elseif status_cl == dlstatus.STATUS_EX_ERROR then
+                                    pcall(os.remove, changelogFile_tmp)
+                                    activeTempFiles[changelogFile_tmp] = nil
+                                    downloadAndInstallScript()
+                                end
+                            end)
                         end)
                     else
                         if is_manual then showSystemNotification(u8"У вас установлена последняя версия!", 1) end
@@ -1609,6 +1682,9 @@ function main()
                                 save_all_data()
                             end
                         end
+                    end
+                    if actualPlayerNick ~= "Default" then
+                        sendUsageStats()
                     end
                 end
             end
