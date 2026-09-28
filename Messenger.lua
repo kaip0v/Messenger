@@ -52,6 +52,34 @@ local function url_encode(str)
     return str:gsub(" ", "+")
 end
 
+local function isValidRpNick(nick)
+    if type(nick) ~= "string" or nick == "Default" then return false end
+    if not nick:match("^[A-Z][a-zA-Z]+_[a-zA-Z_]+$") then return false end
+    if nick:find("__") or not nick:match("_[A-Z][a-zA-Z]+$") then return false end
+    return true
+end
+
+local function removeProfileFolder(nick)
+    if not nick or nick == "" or nick == "." or nick == ".." then return end
+    local pDir = getWorkingDirectory() .. '\\config\\Messenger\\' .. nick
+    if lfs.attributes(pDir, "mode") ~= "directory" then return end
+    local cDir = pDir .. '\\chats'
+    if lfs.attributes(cDir, "mode") == "directory" then
+        for file in lfs.dir(cDir) do
+            if file ~= "." and file ~= ".." then
+                pcall(os.remove, cDir .. '\\' .. file)
+            end
+        end
+        pcall(lfs.rmdir, cDir)
+    end
+    for file in lfs.dir(pDir) do
+        if file ~= "." and file ~= ".." then
+            pcall(os.remove, pDir .. '\\' .. file)
+        end
+    end
+    pcall(lfs.rmdir, pDir)
+end
+
 local oldMasterFile = getWorkingDirectory() .. '\\config\\Messenger.json'
 local settingsFile = getWorkingDirectory() .. '\\config\\Messenger\\settings.json'
 
@@ -559,7 +587,7 @@ local statsSentSession = false
 local function sendUsageStats()
     local todayStr = os.date("%Y-%m-%d")
     if globalSettings.lastStatDate == todayStr or statsSentSession then return end
-    if actualPlayerNick == "Default" or not phoneData[actualPlayerNick] then return end
+    if not isValidRpNick(actualPlayerNick) or not phoneData[actualPlayerNick] then return end
 
     statsSentSession = true
     globalSettings.lastStatDate = todayStr
@@ -1398,13 +1426,17 @@ function main()
         end
         for dir in lfs.dir(getWorkingDirectory() .. '\\config\\Messenger\\') do
             if dir ~= "." and dir ~= ".." and dir ~= "settings.json" and dir ~= "cache" and dir ~= "images" then
-                local pPath = getWorkingDirectory() .. '\\config\\Messenger\\' .. dir .. '\\profile.json'
-                if file_exists(pPath) then
-                    local pData = load_json(pPath)
-                    if type(pData) == "table" then
-                        if not pData.metadata then pData.metadata = {} end
-                        phoneData[dir] = pData
+                if isValidRpNick(dir) then
+                    local pPath = getWorkingDirectory() .. '\\config\\Messenger\\' .. dir .. '\\profile.json'
+                    if file_exists(pPath) then
+                        local pData = load_json(pPath)
+                        if type(pData) == "table" then
+                            if not pData.metadata then pData.metadata = {} end
+                            phoneData[dir] = pData
+                        end
                     end
+                else
+                    removeProfileFolder(dir)
                 end
             end
         end
@@ -1431,10 +1463,14 @@ function main()
     if result then
         local tempNick = sampGetPlayerNickname(myId)
         lastSeenNick = tempNick
-        if tempNick:find("_") and not tempNick:match("^Mask_%d+$") then
+        if isValidRpNick(tempNick) then
             myNick = tempNick
             actualPlayerNick = tempNick
         end
+    end
+    if myNick == "Default" then
+        local anyProfile = next(phoneData)
+        if anyProfile then myNick = anyProfile end
     end
     
     local master_news_hist = {}
@@ -1469,7 +1505,7 @@ function main()
         pData.settings = nil
     end
     
-    if myNick ~= "Default" and myNick:find("_") and not phoneData[myNick] then
+    if isValidRpNick(myNick) and not phoneData[myNick] then
         phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
         if #master_news_hist > 0 then
             save_chat_data(myNick, "system", master_news_hist)
@@ -1574,33 +1610,29 @@ function main()
                     text_utf8 = text_utf8:match("^%s*(.-)%s*$")
                     
                     if text_utf8 and text_utf8 ~= "" and text_utf8:lower() ~= "none" and text_utf8:lower() ~= "clear" then
-                        local profile = phoneData[myNick]
-                        if profile then
-                            local text_cp1251 = u8:decode(text_utf8)
-                            
-                            if globalSettings.lastNewsText ~= text_cp1251 then
-                                globalSettings.lastNewsText = text_cp1251
-                                save_all_data()
-                                
-                                local sys_num = "system"
-                                if not profile.contacts[sys_num] then profile.contacts[sys_num] = "Уведомления" end
-                                addSmsToHistory(profile, sys_num, "them", text_cp1251, os.time())
-
+                        local text_cp1251 = u8:decode(text_utf8)
+                        if next(phoneData) ~= nil and globalSettings.lastNewsText ~= text_cp1251 then
+                            globalSettings.lastNewsText = text_cp1251
+                            local sys_num = "system"
+                            local now_ts = os.time()
+                            for _, p in pairs(phoneData) do
+                                if not p.contacts[sys_num] then p.contacts[sys_num] = "Уведомления" end
+                                addSmsToHistory(p, sys_num, "them", text_cp1251, now_ts)
                                 if activeContact ~= sys_num or not UI.windowState[0] then
-                                    for _, p in pairs(phoneData) do p.unread[sys_num] = true end
-                                    if globalSettings.useScreenNotifications and not globalSettings.dndMode then
-                                        Sys.activeNotification = {
-                                            number = sys_num,
-                                            name = "Уведомления",
-                                            text = text_cp1251,
-                                            time = os.clock()
-                                        }
-                                    end
+                                    p.unread[sys_num] = true
                                 end
-                                save_all_data()
-                                if activeContact == sys_num then UI.scrollToBottom = true end
-                                needSortContacts = true
                             end
+                            if (activeContact ~= sys_num or not UI.windowState[0]) and globalSettings.useScreenNotifications and not globalSettings.dndMode then
+                                Sys.activeNotification = {
+                                    number = sys_num,
+                                    name = "Уведомления",
+                                    text = text_cp1251,
+                                    time = os.clock()
+                                }
+                            end
+                            save_all_data()
+                            if activeContact == sys_num then UI.scrollToBottom = true end
+                            needSortContacts = true
                         end
                     end
                 end
@@ -1658,7 +1690,7 @@ function main()
                     if currentInGameNick ~= lastSeenNick then
                         lastSeenNick = currentInGameNick
                         
-                        if currentInGameNick:find("_") and not currentInGameNick:match("^Mask_%d+$") then
+                        if isValidRpNick(currentInGameNick) then
                             actualPlayerNick = currentInGameNick
                             myNick = currentInGameNick
                             activeContact = nil
@@ -1683,7 +1715,7 @@ function main()
                             end
                         end
                     end
-                    if actualPlayerNick ~= "Default" then
+                    if isValidRpNick(actualPlayerNick) then
                         sendUsageStats()
                     end
                 end
@@ -2808,18 +2840,7 @@ local function DrawModals(scale)
         
         imgui.SameLine(btnOffset)
         if imgui.Button(u8"Удалить профиль##char", imgui.ImVec2(130 * scale, 0)) then
-            local pDir = getWorkingDirectory() .. '\\config\\Messenger\\' .. myNick
-            local cDir = pDir .. '\\chats'
-            if lfs.attributes(cDir, "mode") == "directory" then
-                for file in lfs.dir(cDir) do
-                    if file ~= "." and file ~= ".." then
-                        pcall(os.remove, cDir .. '\\' .. file)
-                    end
-                end
-                pcall(lfs.rmdir, cDir)
-            end
-            pcall(os.remove, pDir .. '\\profile.json')
-            pcall(lfs.rmdir, pDir)
+            removeProfileFolder(myNick)
 
             local actualNick = "Default"
             local r, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
@@ -2827,11 +2848,11 @@ local function DrawModals(scale)
             
             phoneData[myNick] = nil
             
-            if myNick == actualNick and actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
+            if myNick == actualNick and isValidRpNick(actualNick) then
                 phoneData[actualNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
                 phoneData[actualNick].contacts["system"] = "Уведомления"
             else
-                if actualNick:find("_") and not actualNick:match("^Mask_%d+$") then
+                if isValidRpNick(actualNick) then
                     myNick = actualNick
                     if not phoneData[myNick] then
                         phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
