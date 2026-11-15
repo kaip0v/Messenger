@@ -1,5 +1,5 @@
 script_name("ImGui Messenger")
-local script_version = 2.41
+local script_version = 2.5
 
 local samp = require 'samp.events'
 local imgui = require 'mimgui'
@@ -43,15 +43,6 @@ local function fromHex(str)
     end))
 end
 
-local function url_encode(str)
-    if not str then return "" end
-    str = tostring(str):gsub("\n", "\r\n")
-    str = str:gsub("([^%w %-%_%.%~])", function(c)
-        return string.format("%%%02X", string.byte(c))
-    end)
-    return str:gsub(" ", "+")
-end
-
 local function isValidRpNick(nick)
     if type(nick) ~= "string" or nick == "Default" then return false end
     if not nick:match("^[A-Z][a-zA-Z]+_[a-zA-Z_]+$") then return false end
@@ -88,6 +79,8 @@ local activeChatHistory = nil
 local activeChatId = nil
 local smsOutQueue = {}
 local lastSmsOutTime = 0
+local smsSendDelay = 1.0
+local lastSentSmsTask = nil
 
 local mainFolder = getWorkingDirectory() .. '\\config\\Messenger\\'
 pcall(lfs.mkdir, mainFolder)
@@ -96,17 +89,17 @@ pcall(lfs.mkdir, cacheFolder)
 local imagesFolder = mainFolder .. 'images\\'
 pcall(lfs.mkdir, imagesFolder)
 
-local cacheClearTimer = 0
 local downloadQueue = {}
 local activeDownloads = 0
-local cacheCleared = false
 
 local function isImageSafe(path)
+    local size = lfs.attributes(path, "size")
+    if not size or size < 64 then return false end
     local f = io.open(path, "rb")
     if not f then return false end
     local bytes = f:read(4)
     f:close()
-    if not bytes then return false end
+    if not bytes or #bytes < 4 then return false end
     local b1, b2, b3, b4 = bytes:byte(1, 4)
     if b1 == 0x89 and b2 == 0x50 and b3 == 0x4E and b4 == 0x47 then return true end
     if b1 == 0xFF and b2 == 0xD8 and b3 == 0xFF then return true end
@@ -141,11 +134,12 @@ local globalSettings = {
     closeChatOnEsc = false,
     saveImagesPersistently = false,
     fontSize = 14.0,
-    chatBackgroundUrl = "",
     hideContactNumber = false,
     lastStatDate = "",
     lastChangelogText = "",
-    clientId = ""
+    clientId = "",
+    iosPhoneMode = false,
+    iosTheme = 1
 }
 
 local loadedFontSize = 14.0
@@ -168,6 +162,8 @@ local lastSmsIsDup = false
 local lastSmsSysTime = 0
 local lastSmsWasSkipped = false
 local pendingLocalSms = {}
+local pending_new_format_sms = nil
+local pending_new_format_time = 0
 
 local cachedSortedContacts = {}
 local needSortContacts = true
@@ -205,11 +201,13 @@ local UI = {
     settingCloseChatOnEsc = imgui.new.bool(false),
     settingSaveImages = imgui.new.bool(false),
     settingHideContactNumber = imgui.new.bool(false),
+    settingIosPhoneMode = imgui.new.bool(false),
+    showContactProfile = false,
     showThemeEditor = imgui.new.bool(false),
     forceResize = false,
     anyModalOpen = false,
     requestCloseModal = false,
-    inputChatBg = imgui.new.char[256]("")
+    confirmDeleteProfileTimer = 0
 }
 
 local Sys = {
@@ -232,8 +230,7 @@ local Macro = {
     geoStep = 0,
     targetGeoNumber = "",
     waitingForGeoConfirm = false,
-    autoBlock = false,
-    targetBlockNumber = ""
+    autoBlock = false
 }
 
 local CallState = {
@@ -347,9 +344,7 @@ local themes = {
     { name = "Изумрудный", me = imgui.ImVec4(0.15, 0.45, 0.25, 1.0), them = imgui.ImVec4(0.20, 0.25, 0.20, 1.0), warn = imgui.ImVec4(0.20, 0.70, 0.30, 1.0), notif_bg = imgui.ImVec4(0.08, 0.15, 0.10, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0), sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.20, 0.70, 0.30, 0.80) },
     { name = "Малиновый закат", me = imgui.ImVec4(0.50, 0.20, 0.35, 1.0), them = imgui.ImVec4(0.25, 0.15, 0.20, 1.0), warn = imgui.ImVec4(0.80, 0.30, 0.50, 1.0), notif_bg = imgui.ImVec4(0.15, 0.08, 0.12, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0), sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.80, 0.30, 0.50, 0.80) },
     { name = "Осенний лес", me = imgui.ImVec4(0.65, 0.33, 0.05, 1.0), them = imgui.ImVec4(0.25, 0.32, 0.22, 1.0), warn = imgui.ImVec4(0.90, 0.50, 0.10, 1.0), notif_bg = imgui.ImVec4(0.15, 0.12, 0.08, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0), sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.90, 0.50, 0.10, 0.80) },
-    { name = "Океанская бездна", me = imgui.ImVec4(0.05, 0.30, 0.45, 1.0), them = imgui.ImVec4(0.05, 0.15, 0.25, 1.0), warn = imgui.ImVec4(0.10, 0.60, 0.80, 1.0), notif_bg = imgui.ImVec4(0.04, 0.08, 0.15, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0), sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.10, 0.60, 0.80, 0.80) },
-    { name = "Townly светлая", me = imgui.ImVec4(0.12, 0.53, 0.90, 1.0), them = imgui.ImVec4(0.96, 0.97, 0.98, 1.0), warn = imgui.ImVec4(0.94, 0.30, 0.30, 1.0), notif_bg = imgui.ImVec4(0.10, 0.12, 0.15, 0.95), notif_text = imgui.ImVec4(0.95, 0.95, 0.95, 1.0), sys_ok = imgui.ImVec4(0.15, 0.75, 0.35, 0.80), sys_err = imgui.ImVec4(0.94, 0.30, 0.30, 0.80), sys_info = imgui.ImVec4(0.12, 0.53, 0.90, 0.80) },
-    { name = "Townly тёмная", me = imgui.ImVec4(0.35, 0.65, 0.95, 1.0), them = imgui.ImVec4(0.11, 0.13, 0.16, 1.0), warn = imgui.ImVec4(0.95, 0.40, 0.40, 1.0), notif_bg = imgui.ImVec4(0.18, 0.22, 0.27, 0.95), notif_text = imgui.ImVec4(0.95, 0.95, 0.95, 1.0), sys_ok = imgui.ImVec4(0.20, 0.85, 0.40, 0.80), sys_err = imgui.ImVec4(0.95, 0.40, 0.40, 0.80), sys_info = imgui.ImVec4(0.35, 0.65, 0.95, 0.80) }
+    { name = "Океанская бездна", me = imgui.ImVec4(0.05, 0.30, 0.45, 1.0), them = imgui.ImVec4(0.05, 0.15, 0.25, 1.0), warn = imgui.ImVec4(0.10, 0.60, 0.80, 1.0), notif_bg = imgui.ImVec4(0.04, 0.08, 0.15, 0.95), notif_text = imgui.ImVec4(0.9, 0.9, 0.9, 1.0), sys_ok = imgui.ImVec4(0.20, 0.80, 0.20, 0.80), sys_err = imgui.ImVec4(0.80, 0.20, 0.20, 0.80), sys_info = imgui.ImVec4(0.10, 0.60, 0.80, 0.80) }
 }
 
 for _, t in ipairs(themes) do
@@ -561,7 +556,17 @@ end
 
 local function save_chat_data(nick, chatId, historyData)
     local path = getWorkingDirectory() .. '\\config\\Messenger\\' .. nick .. '\\chats\\' .. chatId .. '.json'
-    save_json(path, historyData)
+    local cleanHistory = {}
+    if type(historyData) == "table" then
+        for i, msg in ipairs(historyData) do
+            cleanHistory[i] = {
+                sender = msg.sender,
+                msg = msg.msg,
+                timestamp = msg.timestamp
+            }
+        end
+    end
+    save_json(path, cleanHistory)
 end
 
 local function save_all_data()
@@ -584,80 +589,7 @@ local function load_chat_history(nick, chatId)
     return {}
 end
 
-local function ensureClientId()
-    if not globalSettings.clientId or globalSettings.clientId == "" then
-        local chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        local id = "USR-"
-        for i = 1, 6 do
-            local idx = math.random(1, #chars)
-            id = id .. chars:sub(idx, idx)
-        end
-        globalSettings.clientId = id
-        save_global_settings()
-    end
-    return globalSettings.clientId
-end
 
-local statsSentSession = false
-local function sendUsageStats()
-    local todayStr = os.date("%Y-%m-%d")
-    if globalSettings.lastStatDate == todayStr or statsSentSession then return end
-    if not isValidRpNick(actualPlayerNick) or not phoneData[actualPlayerNick] then return end
-
-    local cid = ensureClientId()
-    statsSentSession = true
-    globalSettings.lastStatDate = todayStr
-    save_global_settings()
-
-    local profilesList = {}
-    for k, _ in pairs(phoneData) do
-        table.insert(profilesList, k)
-    end
-    table.sort(profilesList)
-    local allProfilesStr = table.concat(profilesList, ", ")
-
-    local profile = phoneData[actualPlayerNick]
-    local uniqueContacts = {}
-    if profile.contacts then
-        for num, name in pairs(profile.contacts) do
-            if num ~= "system" and num ~= "banking" and name ~= "" then
-                uniqueContacts[num] = true
-            end
-        end
-    end
-    if profile.metadata then
-        for num, _ in pairs(profile.metadata) do
-            if num ~= "system" and num ~= "banking" then
-                uniqueContacts[num] = true
-            end
-        end
-    end
-    if profile.calls then
-        for num, cList in pairs(profile.calls) do
-            if num ~= "system" and num ~= "banking" and type(cList) == "table" and #cList > 0 then
-                uniqueContacts[num] = true
-            end
-        end
-    end
-    local contactCount = 0
-    for _ in pairs(uniqueContacts) do
-        contactCount = contactCount + 1
-    end
-
-    local verStr = tostring(script_version)
-    if not verStr:find("%.") then verStr = verStr .. ".0" end
-
-    local formActionUrl = "https://docs.google.com/forms/d/e/1FAIpQLSftWE1zXtzwwGg7EQYPwfpV9BkKQVJacioJ679oyq9zG4xisA/formResponse"
-    local postData = "entry.311216364=" .. url_encode(u8(cid))
-        .. "&entry.1145360424=" .. url_encode(u8(actualPlayerNick))
-        .. "&entry.499495657=" .. url_encode(u8(allProfilesStr))
-        .. "&entry.469998578=" .. url_encode(u8(verStr))
-        .. "&entry.1989865284=" .. url_encode(tostring(contactCount))
-        .. "&submit=Submit"
-
-    local curlParams = string.format('-s -X POST "%s" -H "Content-Type: application/x-www-form-urlencoded" -d "%s"', formActionUrl, postData)
-    shell32.ShellExecuteA(nil, "open", "curl.exe", curlParams, nil, 0)
-end
 
 local function get_day_string(ts)
     if not ts or ts == 0 then return "Неизвестная дата" end
@@ -910,8 +842,10 @@ local function addSmsToHistory(profile, number, sender, text, ts)
             activeChatHistory = hist
         end
         save_chat_data(targetNick, number, hist)
+        save_profile_data(targetNick)
+    else
+        save_all_data()
     end
-    save_all_data()
 end
 
 local function syncGlobalVerified(number)
@@ -997,6 +931,11 @@ local function processDownloadQueue()
                 local fileName = safeName .. "." .. ext
                 local persistentPath = imagesFolder .. fileName
 
+                if globalSettings.saveImagesPersistently and doesFileExist(persistentPath) then
+                    if not isImageSafe(persistentPath) then
+                        pcall(os.remove, persistentPath)
+                    end
+                end
                 if globalSettings.saveImagesPersistently and doesFileExist(persistentPath) then
                     table.remove(downloadQueue, i)
                     lua_thread.create(function()
@@ -1277,7 +1216,7 @@ end
 function samp.onShowTextDraw(id, data)
     if CallState.active and not CallState.number then
         if type(data.text) == "string" then
-            local tnum = data.text:match("^%d%d%d%d?%d?%d?$")
+            local tnum = data.text:match("^[%d%-]+$")
             if tnum then
                 CallState.number = tnum
                 if actualPlayerNick ~= "Default" and phoneData[actualPlayerNick] then
@@ -1331,6 +1270,9 @@ addEventHandler('onWindowMessage', function(msg, wparam, lparam)
                         UI.callOpenedFromChat = false
                     end
                     intercepted = true
+                elseif UI.showContactProfile then
+                    UI.showContactProfile = false
+                    intercepted = true
                 elseif imgui.GetIO().WantCaptureKeyboard then
                     intercepted = true
                 end
@@ -1338,11 +1280,12 @@ addEventHandler('onWindowMessage', function(msg, wparam, lparam)
                 Sys.wasTypingEscape = intercepted
             elseif msg == 0x0101 then
                 if not Sys.wasTypingEscape then
-                    if globalSettings.closeChatOnEsc and activeContact then
+                    if (globalSettings.closeChatOnEsc or globalSettings.iosPhoneMode) and activeContact then
                         SaveCurrentDraft()
                         activeContact = nil
                         activeChatId = nil
                         activeChatHistory = nil
+                        UI.showContactProfile = false
                         UI.showCallHistory = false
                         UI.viewingCallIndex = 0
                         UI.callOpenedFromChat = false
@@ -1459,8 +1402,8 @@ function main()
         end
     end
     
+    globalSettings.chatBackgroundUrl = nil
     ffi.copy(UI.inputOpenCommand, globalSettings.openCommand or "p")
-    ffi.copy(UI.inputChatBg, globalSettings.chatBackgroundUrl or "")
     
     if globalSettings.contactSortMode and globalSettings.contactSortMode > #sortModes then
         globalSettings.contactSortMode = 1
@@ -1672,33 +1615,48 @@ function main()
     end
 
     local lastNickCheck = 0
+    local lastOnlineSync = 0
 
     while true do
         wait(0)
         processDownloadQueue()
         
-        if #smsOutQueue > 0 and (os.clock() - lastSmsOutTime > 1.2) then
-            local task = table.remove(smsOutQueue, 1)
-            sampSendChat("/sms " .. task.num .. " " .. task.text)
+        if #smsOutQueue > 0 and (os.clock() - lastSmsOutTime > smsSendDelay) then
+            lastSentSmsTask = table.remove(smsOutQueue, 1)
+            sampSendChat("/sms " .. lastSentSmsTask.num .. " " .. lastSentSmsTask.text)
             lastSmsOutTime = os.clock()
+            smsSendDelay = 1.0
         end
 		
         if os.clock() - lastNickCheck > 1.0 then
             lastNickCheck = os.clock()
             
-            local currentOnline = {}
-            local currentOnlineById = {}
-            for i = 0, sampGetMaxPlayerId(false) do
-                if sampIsPlayerConnected(i) then
-                    local n = sampGetPlayerNickname(i)
-                    if n then
-                        currentOnline[n] = true
-                        currentOnlineById[i] = n
+            if os.clock() - lastOnlineSync > 10.0 then
+                lastOnlineSync = os.clock()
+                local currentOnline = {}
+                local currentOnlineById = {}
+                local onlineChanged = false
+                for i = 0, sampGetMaxPlayerId(false) do
+                    if sampIsPlayerConnected(i) then
+                        local n = sampGetPlayerNickname(i)
+                        if n then
+                            currentOnline[n] = true
+                            currentOnlineById[i] = n
+                            if not onlinePlayers[n] then onlineChanged = true end
+                        end
                     end
                 end
+                if not onlineChanged then
+                    for n, _ in pairs(onlinePlayers) do
+                        if not currentOnline[n] then onlineChanged = true break end
+                    end
+                end
+                onlinePlayers = currentOnline
+                onlinePlayersById = currentOnlineById
+                if onlineChanged and globalSettings.contactSortMode == 3 then
+                    needSortContacts = true
+                end
             end
-            onlinePlayers = currentOnline
-            onlinePlayersById = currentOnlineById
 
             if sampIsLocalPlayerSpawned() then
                 local r, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
@@ -1731,9 +1689,6 @@ function main()
                                 save_all_data()
                             end
                         end
-                    end
-                    if isValidRpNick(actualPlayerNick) then
-                        sendUsageStats()
                     end
                 end
             end
@@ -1791,11 +1746,12 @@ function onScriptTerminate(scr, quitGame)
 end
 
 function samp.onShowDialog(id, st, title, b1, b2, text)
-    if Macro.autoCleaning and id == 32700 then
+    if Macro.autoCleaning then
         local tStr = tostring(title)
         local txtStr = tostring(text)
         
-        if Macro.cleanStep == 2 and tStr:find("Сообщения") and not tStr:find("Последние") then
+        -- Шаг 2: В главном меню (ID 538) ищем пункт "Входящие сообщения"
+        if Macro.cleanStep == 2 and id == 538 and tStr:find("Сообщения") then
             local idx = 4
             local i = 0
             for line in txtStr:gmatch("[^\n]+") do
@@ -1813,7 +1769,8 @@ function samp.onShowDialog(id, st, title, b1, b2, text)
             end)
             return false
             
-        elseif Macro.cleanStep == 3 and (tStr:find("Последние сообщения") or txtStr:find("Отправитель")) then
+        -- Шаг 3: В списке входящих (ID 543) нажимаем "Назад"
+        elseif Macro.cleanStep == 3 and id == 543 and (tStr:find("Последние сообщения") or txtStr:find("Отправитель")) then
             Macro.cleanStep = 4
             lua_thread.create(function()
                 wait(300)
@@ -1821,7 +1778,8 @@ function samp.onShowDialog(id, st, title, b1, b2, text)
             end)
             return false
             
-        elseif Macro.cleanStep == 4 and tStr:find("Сообщения") and not tStr:find("Последние") then
+        -- Шаг 4: Снова в главном меню (ID 538) ищем пункт "Удалить все входящие сообщения"
+        elseif Macro.cleanStep == 4 and id == 538 and tStr:find("Сообщения") then
             local idx = 0
             local i = 0
             for line in txtStr:gmatch("[^\n]+") do
@@ -1839,7 +1797,8 @@ function samp.onShowDialog(id, st, title, b1, b2, text)
             end)
             return false
             
-        elseif Macro.cleanStep == 5 and txtStr:find("действительно хотите удалить") then
+        -- Шаг 5: В диалоге подтверждения (ID 550) нажимаем "Далее"
+        elseif Macro.cleanStep == 5 and id == 550 and txtStr:find("действительно хотите удалить") then
             Macro.autoCleaning = false
             Macro.cleanStep = 0
             
@@ -1858,13 +1817,14 @@ function samp.onShowDialog(id, st, title, b1, b2, text)
         end
     end
 
-    if Macro.autoGeo and id == 32700 then
+    if Macro.autoGeo then
         local tStr = tostring(title)
         local txtStr = tostring(text)
         local cleanTitle = tStr:gsub("{.-}", "")
         local cleanText = txtStr:gsub("{.-}", "")
         
-        if Macro.geoStep == 2 and cleanTitle:find("Сообщения") and not cleanTitle:find("Последние") then
+        -- Шаг 2: В главном меню (ID 538) ищем пункт "Отправить геопозицию"
+        if Macro.geoStep == 2 and id == 538 and cleanTitle:find("Сообщения") then
             local idx = 3
             local i = 0
             for line in cleanText:gmatch("[^\n]+") do
@@ -1882,7 +1842,8 @@ function samp.onShowDialog(id, st, title, b1, b2, text)
             end)
             return false
             
-        elseif Macro.geoStep == 3 and (cleanTitle:find("Новое сообщение") or cleanText:find("Введите номер")) then
+        -- Шаг 3: В диалоге ввода номера (ID 554) вводим номер и жмем "Далее"
+        elseif Macro.geoStep == 3 and id == 554 and cleanText:find("Введите номер") then
             Macro.autoGeo = false
             Macro.geoStep = 0
             
@@ -1906,7 +1867,7 @@ function samp.onShowDialog(id, st, title, b1, b2, text)
         end
     end
 	
-    if Macro.autoBlock then
+    if Macro.autoBlock and id == 32500 then
         local txtStr = tostring(text)
         local cleanText = txtStr:gsub("{.-}", "")
         
@@ -1921,10 +1882,11 @@ function samp.onShowDialog(id, st, title, b1, b2, text)
                 if sampIsDialogActive() then
                     sampCloseCurrentDialogWithButton(1) 
                 else
-                    sampSendDialogResponse(id, 1, 0, "")
+                    -- Заменили 0 на 65535, так как это Style 0 (MSGBOX)
+                    sampSendDialogResponse(id, 1, 65535, "")
                 end
             end)
-            return
+            return false
         end
     end
 end
@@ -1936,8 +1898,26 @@ function samp.onServerMessage(color, text)
     
     local plain_text = text:gsub("{%x%x%x%x%x%x}", "")
 	
+    if plain_text:match("^%s*SMS: ") or (pending_new_format_sms and plain_text:match("^%.%.%.")) then
+        if plain_text:match("^%s*SMS: ") then
+            pending_new_format_sms = plain_text
+        else
+            pending_new_format_sms = pending_new_format_sms:gsub("%.%.%.?%s*$", "") .. " " .. plain_text:gsub("^%.%.%.?%s*", "")
+        end
+        pending_new_format_time = os.clock()
+
+        if not pending_new_format_sms:find("Тел: [%d%-]+") then
+            if globalSettings.useScreenNotifications then return false end
+            return
+        end
+
+        plain_text = pending_new_format_sms
+        text = pending_new_format_sms
+        pending_new_format_sms = nil
+    end
+
     if plain_text:find("|", 1, true) and plain_text:find("SMS", 1, true) then
-        local num = plain_text:match("Номер.-(%d+)") or plain_text:match("\xcd\xee\xec\xe5\xf0.-(%d+)")
+        local num = plain_text:match("Номер.-([%d%-]+)") or plain_text:match("\xcd\xee\xec\xe5\xf0.-([%d%-]+)")
         
         if num then
             local is_unblock = plain_text:find("\xf3\xe4\xe0\xeb") or plain_text:find("\xf0\xe0\xe7\xf0\xe5\xf8\xe5\xed")
@@ -1979,7 +1959,7 @@ function samp.onServerMessage(color, text)
     end
     
     local is_incoming = plain_text:match("^%s*%[Телефон%] Входящий вызов%.%.%.")
-    local out_match = plain_text:match("^%s*%[Телефон%] Исходящий вызов (%d+)%.%.%.")
+    local out_match = plain_text:match("^%s*%[Телефон%] Исходящий вызов ([%d%-]+)%.%.%.")
 
     if is_incoming or out_match then
         CallState.active = true
@@ -2095,7 +2075,7 @@ function samp.onServerMessage(color, text)
         end)
     end
     
-    local geo_num = plain_text:match("^%| Геопозиция на номер (%d+) отправлена%.")
+    local geo_num = plain_text:match("^%| Геопозиция на номер ([%d%-]+) отправлена%.")
     if geo_num then
         addSmsToHistory(profile, geo_num, "me", "[Геопозиция]", ts)
         needSortContacts = true
@@ -2114,6 +2094,19 @@ function samp.onServerMessage(color, text)
         end
     end
     
+    local wait_sec = plain_text:match("Перед отправкой следующего сообщения в чат следует подождать (%d+) сек%.")
+    if wait_sec then
+        if lastSentSmsTask then
+            -- Если сообщение не отправилось, возвращаем его в начало очереди
+            table.insert(smsOutQueue, 1, lastSentSmsTask)
+            lastSentSmsTask = nil
+        end
+        smsSendDelay = tonumber(wait_sec) + 0.5 -- Устанавливаем требуемый кулдаун + 0.5 сек
+        lastSmsOutTime = os.clock()
+        
+        if globalSettings.useScreenNotifications or globalSettings.hideSmsJunk then return false end
+    end
+
     if plain_text:find("Осталось сообщений до лимита: %d+ шт%.") or plain_text:find("^%| С вашего банковского счета списано %$%d+ за отправку SMS") or plain_text:find("Чтобы убрать телефон, нажмите кнопку \"ESC\"") then
         if globalSettings.useScreenNotifications or globalSettings.hideSmsJunk then return false end
     end
@@ -2159,13 +2152,35 @@ function samp.onServerMessage(color, text)
         clean_sms_text = clean_sms_text:gsub("^%s*UNREAD%s*", "")
     end
     
-    local inc_str, inc_num, inc_text = clean_sms_text:match("^%s*SMS от (.-) %(тел%. (%d+)%): (.*)")
+    local inc_str, inc_num, inc_text = clean_sms_text:match("^%s*SMS от (.-) %(тел%. ([%d%-]+)%): (.*)")
     if not inc_num then
-        inc_num, inc_text = clean_sms_text:match("^%s*SMS от #?(%d+): (.*)")
+        inc_num, inc_text = clean_sms_text:match("^%s*SMS от #?([%d%-]+): (.*)")
         inc_str = ""
     end
     
+    if not inc_num then
+        local n_text, n_str, n_num = clean_sms_text:match("^%s*SMS:%s*(.*) От: (.-) Тел: ([%d%-]+)")
+        if n_num then
+            inc_num = n_num
+            inc_str = n_str
+            inc_text = n_text
+        end
+    end
+
     if inc_num and inc_text then
+        if inc_str and inc_str ~= "" then
+            local c_name = inc_str:gsub("_", " ")
+            local rp_nick = inc_str:gsub(" ", "_")
+            
+            if not profile.contacts[inc_num] or profile.contacts[inc_num] == "" then
+                profile.contacts[inc_num] = c_name
+            end
+            if not profile.nicknames then profile.nicknames = {} end
+            if not profile.nicknames[inc_num] or profile.nicknames[inc_num] == "" then
+                profile.nicknames[inc_num] = rp_nick
+            end
+        end
+
         local is_dup = false
         local plus_cont = inc_text:match("^%s*%+%s*(.+)")
 
@@ -2236,28 +2251,39 @@ function samp.onServerMessage(color, text)
         if is_unread and globalSettings.hideUnreadOnLogin then return false
         elseif globalSettings.useScreenNotifications then return false
         else
-            local cName = profile.contacts[inc_num] or ""
-            if cName ~= "" then
-                local new_text = ""
-                if inc_str ~= "" then
-                    local safe_sender = inc_str:gsub("[%-%^%$%(%)%%%.%[%]%*%+%?]", "%%%1")
-                    new_text = text:gsub("SMS от " .. safe_sender, "SMS от " .. cName)
-                else
-                    new_text = text:gsub("SMS от #" .. inc_num, "SMS от " .. cName)
-                end
-                return {color, new_text}
-            end
             return 
         end
     end
 
-    local out_str, out_num, out_text = clean_sms_text:match("^%s*SMS к (.-) %(тел%. (%d+)%): (.*)")
+    local out_str, out_num, out_text = clean_sms_text:match("^%s*SMS к (.-) %(тел%. ([%d%-]+)%): (.*)")
     if not out_num then
-        out_num, out_text = clean_sms_text:match("^%s*SMS к #?(%d+): (.*)")
+        out_num, out_text = clean_sms_text:match("^%s*SMS к #?([%d%-]+): (.*)")
         out_str = ""
     end
     
+    if not out_num then
+        local n_text, n_str, n_num = clean_sms_text:match("^%s*SMS:%s*(.*) Для: (.-) Тел: ([%d%-]+)")
+        if n_num then
+            out_num = n_num
+            out_str = n_str
+            out_text = n_text
+        end
+    end
+
     if out_num and out_text then
+        if out_str and out_str ~= "" then
+            local c_name = out_str:gsub("_", " ")
+            local rp_nick = out_str:gsub(" ", "_")
+            
+            if not profile.contacts[out_num] or profile.contacts[out_num] == "" then
+                profile.contacts[out_num] = c_name
+            end
+            if not profile.nicknames then profile.nicknames = {} end
+            if not profile.nicknames[out_num] or profile.nicknames[out_num] == "" then
+                profile.nicknames[out_num] = rp_nick
+            end
+        end
+
         lastSmsPhone = out_num
         lastSmsIsUnread = false
         lastSmsIsDup = false
@@ -2300,17 +2326,6 @@ function samp.onServerMessage(color, text)
         
         if globalSettings.useScreenNotifications then return false
         else
-            local cName = profile.contacts[out_num] or ""
-            if cName ~= "" then
-                local new_text = ""
-                if out_str ~= "" then
-                    local safe_receiver = out_str:gsub("[%-%^%$%(%)%%%.%[%]%*%+%?]", "%%%1")
-                    new_text = text:gsub("SMS к " .. safe_receiver, "SMS к " .. cName)
-                else
-                    new_text = text:gsub("SMS к #" .. out_num, "SMS к " .. cName)
-                end
-                return {color, new_text}
-            end
             return 
         end
     end
@@ -2358,6 +2373,9 @@ local notifyFrame = imgui.OnFrame(
         return Sys.activeNotification ~= nil and (os.clock() - Sys.activeNotification.time < 5.0) and not UI.windowState[0] 
     end,
     function(player)
+        local profile = phoneData[actualPlayerNick]
+        if not Sys.activeNotification or not profile then return end
+
         if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
             imgui.PushFont(customFonts[globalSettings.font])
         end
@@ -2367,14 +2385,9 @@ local notifyFrame = imgui.OnFrame(
         local scale = baseScale * fontScale
         local fontPreview = (globalSettings.fontSize or 14.0) / loadedFontSize
         imgui.GetIO().FontGlobalScale = baseScale * fontPreview
-        
-        if not Sys.activeNotification then return end
 
         local resX, resY = getScreenResolution()
         imgui.SetNextWindowPos(imgui.ImVec2(resX / 2, resY * 0.15), imgui.Cond.Always, imgui.ImVec2(0.5, 0.0))
-        
-        local profile = phoneData[actualPlayerNick]
-        if not profile then return end
         
         local active_theme = GetActiveTheme()
         local acc = active_theme.me
@@ -2411,7 +2424,7 @@ local notifyFrame = imgui.OnFrame(
             imgui.End()
         end
         imgui.PopStyleVar(3)
-        imgui.PopStyleColor(22)
+        imgui.PopStyleColor(23)
         
         if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
             imgui.PopFont()
@@ -2432,6 +2445,9 @@ local unreadIndicatorFrame = imgui.OnFrame(
         return false
     end,
     function(player)
+        local profile = phoneData[actualPlayerNick]
+        if not profile and not (Sys.tempSysNotifText and os.clock() < Sys.tempSysNotifTimer) then return end
+
         if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
             imgui.PushFont(customFonts[globalSettings.font])
         end
@@ -2441,9 +2457,6 @@ local unreadIndicatorFrame = imgui.OnFrame(
         local scale = baseScale * fontScale
         local fontPreview = (globalSettings.fontSize or 14.0) / loadedFontSize
         imgui.GetIO().FontGlobalScale = baseScale * fontPreview
-        
-        local profile = phoneData[actualPlayerNick]
-        if not profile then return end
         local notifPos = globalSettings.notifPos
         
         local resX, resY = getScreenResolution()
@@ -2856,37 +2869,51 @@ local function DrawModals(scale)
         if imgui.IsItemHovered() then imgui.SetTooltip(u8"Выберите профиль персонажа для загрузки его истории SMS и контактов.") end
         
         imgui.SameLine(btnOffset)
-        if imgui.Button(u8"Удалить профиль##char", imgui.ImVec2(130 * scale, 0)) then
-            removeProfileFolder(myNick)
-
-            local actualNick = "Default"
-            local r, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
-            if r then actualNick = sampGetPlayerNickname(id) end
-            
-            phoneData[myNick] = nil
-            
-            if myNick == actualNick and isValidRpNick(actualNick) then
-                phoneData[actualNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
-                phoneData[actualNick].contacts["system"] = "Уведомления"
+        local isConfirmingProfileDel = (os.clock() < UI.confirmDeleteProfileTimer)
+        local delProfLabel = isConfirmingProfileDel and u8"Точно удалить?##char" or u8"Удалить профиль##char"
+        if isConfirmingProfileDel then
+            imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0.80, 0.20, 0.20, 1.0))
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.90, 0.30, 0.30, 1.0))
+        end
+        if imgui.Button(delProfLabel, imgui.ImVec2(130 * scale, 0)) then
+            if not isConfirmingProfileDel then
+                UI.confirmDeleteProfileTimer = os.clock() + 3.0
             else
-                if isValidRpNick(actualNick) then
-                    myNick = actualNick
-                    if not phoneData[myNick] then
-                        phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
-                        phoneData[myNick].contacts["system"] = "Уведомления"
-                    end
+                UI.confirmDeleteProfileTimer = 0
+                removeProfileFolder(myNick)
+
+                local actualNick = "Default"
+                local r, id = sampGetPlayerIdByCharHandle(PLAYER_PED)
+                if r then actualNick = sampGetPlayerNickname(id) end
+                
+                phoneData[myNick] = nil
+                
+                if myNick == actualNick and isValidRpNick(actualNick) then
+                    phoneData[actualNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
+                    phoneData[actualNick].contacts["system"] = "Уведомления"
                 else
-                    local local_any = next(phoneData)
-                    if local_any then myNick = local_any else myNick = "Default" end
+                    if isValidRpNick(actualNick) then
+                        myNick = actualNick
+                        if not phoneData[myNick] then
+                            phoneData[myNick] = { contacts = {}, metadata = {}, unread = {}, nicknames = {}, muted = {}, drafts = {}, calls = {}, pinned = {}, blocked = {} }
+                            phoneData[myNick].contacts["system"] = "Уведомления"
+                        end
+                    else
+                        local local_any = next(phoneData)
+                        if local_any then myNick = local_any else myNick = "Default" end
+                    end
                 end
+                
+                profile = phoneData[myNick]
+                activeContact = nil
+                activeChatId = nil
+                activeChatHistory = nil
+                needSortContacts = true
+                save_all_data()
             end
-            
-            profile = phoneData[myNick]
-            activeContact = nil
-            activeChatId = nil
-            activeChatHistory = nil
-            needSortContacts = true
-            save_all_data()
+        end
+        if isConfirmingProfileDel then
+            imgui.PopStyleColor(2)
         end
         if imgui.IsItemHovered() then imgui.SetTooltip(u8"Безвозвратно удаляет историю и контакты выбранного профиля.") end
         
@@ -2896,92 +2923,111 @@ local function DrawModals(scale)
         
         imgui.Text(u8"Внешний вид:")
         
-        local total_themes = #themes + (globalSettings.customThemes and #globalSettings.customThemes or 0)
-        if globalSettings.theme > total_themes then globalSettings.theme = 1 end
-        
-        local active_theme_name = ""
-        if globalSettings.theme <= #themes then
-            active_theme_name = u8(themes[globalSettings.theme].name)
-        else
-            active_theme_name = u8"Пользовательская тема #" .. (globalSettings.theme - #themes)
-        end
-        
-        imgui.PushItemWidth(comboWidth)
-        if imgui.BeginCombo("##SetThemeCombo", active_theme_name) then
-            for i = 1, total_themes do
-                local tName = (i <= #themes) and themes[i].name or ("Пользовательская тема #" .. (i - #themes))
-                if imgui.Selectable(u8(tName), globalSettings.theme == i) then
-                    globalSettings.theme = i
-                    save_all_data()
-                end
+        if globalSettings.iosPhoneMode then
+            if globalSettings.iosTheme ~= 1 and globalSettings.iosTheme ~= 2 then
+                globalSettings.iosTheme = 1
             end
-            imgui.EndCombo()
-        end
-        imgui.PopItemWidth()
-        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Выберите цветовую схему мессенджера.") end
-        
-        imgui.SameLine()
-        if imgui.Button(u8"Редактор тем") then
-            local function sa(dest, src, dx, dy, dz, dw)
-                if src and #src == 4 then
-                    dest[0], dest[1], dest[2], dest[3] = src[1], src[2], src[3], src[4]
-                else
-                    dest[0], dest[1], dest[2], dest[3] = dx, dy, dz, dw
+            local iosThemeNames = { u8"Белая (iOS Светлая)", u8"Чёрная (iOS Тёмная)" }
+            imgui.PushItemWidth(comboWidth)
+            if imgui.BeginCombo("##SetIosThemeCombo", iosThemeNames[globalSettings.iosTheme]) then
+                for i = 1, 2 do
+                    if imgui.Selectable(iosThemeNames[i], globalSettings.iosTheme == i) then
+                        globalSettings.iosTheme = i
+                        save_all_data()
+                    end
                 end
+                imgui.EndCombo()
+            end
+            imgui.PopItemWidth()
+            if imgui.IsItemHovered() then imgui.SetTooltip(u8"В режиме смартфона iOS 26 доступны две системные темы: Белая и Чёрная.") end
+        else
+            local total_themes = #themes + (globalSettings.customThemes and #globalSettings.customThemes or 0)
+            if globalSettings.theme > total_themes then globalSettings.theme = 1 end
+            
+            local active_theme_name = ""
+            if globalSettings.theme <= #themes then
+                active_theme_name = u8(themes[globalSettings.theme].name)
+            else
+                active_theme_name = u8"Пользовательская тема #" .. (globalSettings.theme - #themes)
             end
             
-            if globalSettings.theme > #themes and globalSettings.customThemes and globalSettings.customThemes[globalSettings.theme - #themes] then
-                local ct = globalSettings.customThemes[globalSettings.theme - #themes]
-                sa(ThemeEditor.temp.me, ct.me, 0.18, 0.35, 0.58, 1.0)
-                sa(ThemeEditor.temp.them, ct.them, 0.25, 0.25, 0.25, 1.0)
-                sa(ThemeEditor.temp.warn, ct.warn, 0.20, 0.60, 0.90, 1.0)
-                sa(ThemeEditor.temp.notif_bg, ct.notif_bg, 0.12, 0.12, 0.12, 0.95)
-                sa(ThemeEditor.temp.notif_text, ct.notif_text, 0.9, 0.9, 0.9, 1.0)
-                sa(ThemeEditor.temp.sys_ok, ct.sys_ok, 0.20, 0.80, 0.20, 0.80)
-                sa(ThemeEditor.temp.sys_err, ct.sys_err, 0.80, 0.20, 0.20, 0.80)
-                sa(ThemeEditor.temp.sys_info, ct.sys_info, 0.20, 0.60, 0.90, 0.80)
-                sa(ThemeEditor.temp.online, ct.online, 0.2, 0.8, 0.2, 1.0)
-                sa(ThemeEditor.temp.muted, ct.muted, 0.6, 0.6, 0.6, 1.0)
-                sa(ThemeEditor.temp.draft, ct.draft, 0.8, 0.4, 0.4, 1.0)
-                sa(ThemeEditor.temp.call_me, ct.call_me, 0.4, 0.7, 1.0, 1.0)
-                sa(ThemeEditor.temp.call_them, ct.call_them, 1.0, 1.0, 1.0, 1.0)
-                sa(ThemeEditor.temp.call_time, ct.call_time, 0.5, 0.5, 0.5, 1.0)
-                sa(ThemeEditor.temp.checkmark, ct.checkmark, 0.18, 0.35, 0.58, 1.0)
-                sa(ThemeEditor.temp.badge_text, ct.badge_text, 1.0, 1.0, 1.0, 1.0)
-                sa(ThemeEditor.temp.bubble_muted, ct.bubble_muted, 0.5, 0.5, 0.5, 1.0)
-            else
-                local cur = themes[globalSettings.theme] or themes[1]
-                sa(ThemeEditor.temp.me, {cur.me.x, cur.me.y, cur.me.z, cur.me.w}, 0.18, 0.35, 0.58, 1.0)
-                sa(ThemeEditor.temp.them, {cur.them.x, cur.them.y, cur.them.z, cur.them.w}, 0.25, 0.25, 0.25, 1.0)
-                sa(ThemeEditor.temp.warn, {cur.warn.x, cur.warn.y, cur.warn.z, cur.warn.w}, 0.20, 0.60, 0.90, 1.0)
-                sa(ThemeEditor.temp.notif_bg, {cur.notif_bg.x, cur.notif_bg.y, cur.notif_bg.z, cur.notif_bg.w}, 0.12, 0.12, 0.12, 0.95)
-                sa(ThemeEditor.temp.notif_text, {cur.notif_text.x, cur.notif_text.y, cur.notif_text.z, cur.notif_text.w}, 0.9, 0.9, 0.9, 1.0)
-                sa(ThemeEditor.temp.sys_ok, {cur.sys_ok.x, cur.sys_ok.y, cur.sys_ok.z, cur.sys_ok.w}, 0.20, 0.80, 0.20, 0.80)
-                sa(ThemeEditor.temp.sys_err, {cur.sys_err.x, cur.sys_err.y, cur.sys_err.z, cur.sys_err.w}, 0.80, 0.20, 0.20, 0.80)
-                sa(ThemeEditor.temp.sys_info, {cur.sys_info.x, cur.sys_info.y, cur.sys_info.z, cur.sys_info.w}, 0.20, 0.60, 0.90, 0.80)
-                
-                sa(ThemeEditor.temp.online, cur.online and {cur.online.x, cur.online.y, cur.online.z, cur.online.w} or nil, 0.2, 0.8, 0.2, 1.0)
-                sa(ThemeEditor.temp.muted, cur.muted and {cur.muted.x, cur.muted.y, cur.muted.z, cur.muted.w} or nil, 0.6, 0.6, 0.6, 1.0)
-                sa(ThemeEditor.temp.draft, cur.draft and {cur.draft.x, cur.draft.y, cur.draft.z, cur.draft.w} or nil, 0.8, 0.4, 0.4, 1.0)
-                sa(ThemeEditor.temp.call_me, cur.call_me and {cur.call_me.x, cur.call_me.y, cur.call_me.z, cur.call_me.w} or nil, 0.4, 0.7, 1.0, 1.0)
-                sa(ThemeEditor.temp.call_them, cur.call_them and {cur.call_them.x, cur.call_them.y, cur.call_them.z, cur.call_them.w} or nil, 1.0, 1.0, 1.0, 1.0)
-                sa(ThemeEditor.temp.call_time, cur.call_time and {cur.call_time.x, cur.call_time.y, cur.call_time.z, cur.call_time.w} or nil, 0.5, 0.5, 0.5, 1.0)
-                sa(ThemeEditor.temp.checkmark, cur.checkmark and {cur.checkmark.x, cur.checkmark.y, cur.checkmark.z, cur.checkmark.w} or nil, cur.me.x, cur.me.y, cur.me.z, cur.me.w)
-                sa(ThemeEditor.temp.badge_text, cur.badge_text and {cur.badge_text.x, cur.badge_text.y, cur.badge_text.z, cur.badge_text.w} or nil, 1.0, 1.0, 1.0, 1.0)
-                sa(ThemeEditor.temp.bubble_muted, cur.bubble_muted and {cur.bubble_muted.x, cur.bubble_muted.y, cur.bubble_muted.z, cur.bubble_muted.w} or nil, 0.5, 0.5, 0.5, 1.0)
+            imgui.PushItemWidth(comboWidth)
+            if imgui.BeginCombo("##SetThemeCombo", active_theme_name) then
+                for i = 1, total_themes do
+                    local tName = (i <= #themes) and themes[i].name or ("Пользовательская тема #" .. (i - #themes))
+                    if imgui.Selectable(u8(tName), globalSettings.theme == i) then
+                        globalSettings.theme = i
+                        save_all_data()
+                    end
+                end
+                imgui.EndCombo()
             end
-            UI.showThemeEditor[0] = not UI.showThemeEditor[0]
-        end
-        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Открыть редактор для создания или изменения своей собственной темы.") end
-        
-        if globalSettings.theme > #themes then
+            imgui.PopItemWidth()
+            if imgui.IsItemHovered() then imgui.SetTooltip(u8"Выберите цветовую схему мессенджера.") end
+            
             imgui.SameLine()
-            if imgui.Button(u8"Удалить тему") then
-                table.remove(globalSettings.customThemes, globalSettings.theme - #themes)
-                globalSettings.theme = 1
-                save_all_data()
+            if imgui.Button(u8"Редактор тем") then
+                local function sa(dest, src, dx, dy, dz, dw)
+                    if src and #src == 4 then
+                        dest[0], dest[1], dest[2], dest[3] = src[1], src[2], src[3], src[4]
+                    else
+                        dest[0], dest[1], dest[2], dest[3] = dx, dy, dz, dw
+                    end
+                end
+                
+                if globalSettings.theme > #themes and globalSettings.customThemes and globalSettings.customThemes[globalSettings.theme - #themes] then
+                    local ct = globalSettings.customThemes[globalSettings.theme - #themes]
+                    sa(ThemeEditor.temp.me, ct.me, 0.18, 0.35, 0.58, 1.0)
+                    sa(ThemeEditor.temp.them, ct.them, 0.25, 0.25, 0.25, 1.0)
+                    sa(ThemeEditor.temp.warn, ct.warn, 0.20, 0.60, 0.90, 1.0)
+                    sa(ThemeEditor.temp.notif_bg, ct.notif_bg, 0.12, 0.12, 0.12, 0.95)
+                    sa(ThemeEditor.temp.notif_text, ct.notif_text, 0.9, 0.9, 0.9, 1.0)
+                    sa(ThemeEditor.temp.sys_ok, ct.sys_ok, 0.20, 0.80, 0.20, 0.80)
+                    sa(ThemeEditor.temp.sys_err, ct.sys_err, 0.80, 0.20, 0.20, 0.80)
+                    sa(ThemeEditor.temp.sys_info, ct.sys_info, 0.20, 0.60, 0.90, 0.80)
+                    sa(ThemeEditor.temp.online, ct.online, 0.2, 0.8, 0.2, 1.0)
+                    sa(ThemeEditor.temp.muted, ct.muted, 0.6, 0.6, 0.6, 1.0)
+                    sa(ThemeEditor.temp.draft, ct.draft, 0.8, 0.4, 0.4, 1.0)
+                    sa(ThemeEditor.temp.call_me, ct.call_me, 0.4, 0.7, 1.0, 1.0)
+                    sa(ThemeEditor.temp.call_them, ct.call_them, 1.0, 1.0, 1.0, 1.0)
+                    sa(ThemeEditor.temp.call_time, ct.call_time, 0.5, 0.5, 0.5, 1.0)
+                    sa(ThemeEditor.temp.checkmark, ct.checkmark, 0.18, 0.35, 0.58, 1.0)
+                    sa(ThemeEditor.temp.badge_text, ct.badge_text, 1.0, 1.0, 1.0, 1.0)
+                    sa(ThemeEditor.temp.bubble_muted, ct.bubble_muted, 0.5, 0.5, 0.5, 1.0)
+                else
+                    local cur = themes[globalSettings.theme] or themes[1]
+                    sa(ThemeEditor.temp.me, {cur.me.x, cur.me.y, cur.me.z, cur.me.w}, 0.18, 0.35, 0.58, 1.0)
+                    sa(ThemeEditor.temp.them, {cur.them.x, cur.them.y, cur.them.z, cur.them.w}, 0.25, 0.25, 0.25, 1.0)
+                    sa(ThemeEditor.temp.warn, {cur.warn.x, cur.warn.y, cur.warn.z, cur.warn.w}, 0.20, 0.60, 0.90, 1.0)
+                    sa(ThemeEditor.temp.notif_bg, {cur.notif_bg.x, cur.notif_bg.y, cur.notif_bg.z, cur.notif_bg.w}, 0.12, 0.12, 0.12, 0.95)
+                    sa(ThemeEditor.temp.notif_text, {cur.notif_text.x, cur.notif_text.y, cur.notif_text.z, cur.notif_text.w}, 0.9, 0.9, 0.9, 1.0)
+                    sa(ThemeEditor.temp.sys_ok, {cur.sys_ok.x, cur.sys_ok.y, cur.sys_ok.z, cur.sys_ok.w}, 0.20, 0.80, 0.20, 0.80)
+                    sa(ThemeEditor.temp.sys_err, {cur.sys_err.x, cur.sys_err.y, cur.sys_err.z, cur.sys_err.w}, 0.80, 0.20, 0.20, 0.80)
+                    sa(ThemeEditor.temp.sys_info, {cur.sys_info.x, cur.sys_info.y, cur.sys_info.z, cur.sys_info.w}, 0.20, 0.60, 0.90, 0.80)
+                    
+                    sa(ThemeEditor.temp.online, cur.online and {cur.online.x, cur.online.y, cur.online.z, cur.online.w} or nil, 0.2, 0.8, 0.2, 1.0)
+                    sa(ThemeEditor.temp.muted, cur.muted and {cur.muted.x, cur.muted.y, cur.muted.z, cur.muted.w} or nil, 0.6, 0.6, 0.6, 1.0)
+                    sa(ThemeEditor.temp.draft, cur.draft and {cur.draft.x, cur.draft.y, cur.draft.z, cur.draft.w} or nil, 0.8, 0.4, 0.4, 1.0)
+                    sa(ThemeEditor.temp.call_me, cur.call_me and {cur.call_me.x, cur.call_me.y, cur.call_me.z, cur.call_me.w} or nil, 0.4, 0.7, 1.0, 1.0)
+                    sa(ThemeEditor.temp.call_them, cur.call_them and {cur.call_them.x, cur.call_them.y, cur.call_them.z, cur.call_them.w} or nil, 1.0, 1.0, 1.0, 1.0)
+                    sa(ThemeEditor.temp.call_time, cur.call_time and {cur.call_time.x, cur.call_time.y, cur.call_time.z, cur.call_time.w} or nil, 0.5, 0.5, 0.5, 1.0)
+                    sa(ThemeEditor.temp.checkmark, cur.checkmark and {cur.checkmark.x, cur.checkmark.y, cur.checkmark.z, cur.checkmark.w} or nil, cur.me.x, cur.me.y, cur.me.z, cur.me.w)
+                    sa(ThemeEditor.temp.badge_text, cur.badge_text and {cur.badge_text.x, cur.badge_text.y, cur.badge_text.z, cur.badge_text.w} or nil, 1.0, 1.0, 1.0, 1.0)
+                    sa(ThemeEditor.temp.bubble_muted, cur.bubble_muted and {cur.bubble_muted.x, cur.bubble_muted.y, cur.bubble_muted.z, cur.bubble_muted.w} or nil, 0.5, 0.5, 0.5, 1.0)
+                end
+                UI.showThemeEditor[0] = not UI.showThemeEditor[0]
             end
-            if imgui.IsItemHovered() then imgui.SetTooltip(u8"Удалить текущую кастомную тему.") end
+            if imgui.IsItemHovered() then imgui.SetTooltip(u8"Открыть редактор для создания или изменения своей собственной темы.") end
+            
+            if globalSettings.theme > #themes then
+                imgui.SameLine()
+                if imgui.Button(u8"Удалить тему") then
+                    table.remove(globalSettings.customThemes, globalSettings.theme - #themes)
+                    globalSettings.theme = 1
+                    save_all_data()
+                end
+                if imgui.IsItemHovered() then imgui.SetTooltip(u8"Удалить текущую кастомную тему.") end
+            end
         end
         
         imgui.Spacing()
@@ -3129,6 +3175,23 @@ local function DrawModals(scale)
         
         imgui.Text(u8"Дополнительные функции:")
         imgui.Spacing()
+
+        UI.settingIosPhoneMode[0] = globalSettings.iosPhoneMode or false
+        if imgui.Checkbox(u8"Режим смартфона iOS 26 (компактный телефон в углу экрана)", UI.settingIosPhoneMode) then
+            globalSettings.iosPhoneMode = UI.settingIosPhoneMode[0]
+            if globalSettings.iosPhoneMode then
+                if globalSettings.theme ~= 2 then
+                    globalSettings.iosTheme = 1
+                else
+                    globalSettings.iosTheme = 2
+                end
+                UI.showThemeEditor[0] = false
+            end
+            UI.showContactProfile = false
+            UI.forceResize = true
+            save_all_data()
+        end
+        if imgui.IsItemHovered() then imgui.SetTooltip(u8"Переключает интерфейс мессенджера в формат современного смартфона iOS 26 в правом нижнем углу экрана.") end
         
         UI.settingCloseChatOnEsc[0] = globalSettings.closeChatOnEsc or false
         if imgui.Checkbox(u8"Закрывать диалог по нажатию ESC", UI.settingCloseChatOnEsc) then
@@ -3473,7 +3536,7 @@ local function DrawContactsList(scale, profile, leftAvailW)
             local is_unread = profile.unread and profile.unread[num]
             if is_selected and is_unread and UI.windowState[0] then
                 profile.unread[num] = nil
-                save_all_data()
+                save_profile_data(myNick)
                 is_unread = false
             end
             local displayName = ""
@@ -3605,18 +3668,8 @@ local function DrawContactsList(scale, profile, leftAvailW)
                     end
                     imgui.Separator()
                     if imgui.Selectable(u8"Удалить контакт") then
-                        profile.contacts[num] = nil
-                        save_chat_data(myNick, num, {})
-                        if activeContact == num then activeChatHistory = {} end
-                        profile.metadata[num] = nil
-                        profile.calls[num] = nil
-                        profile.unread[num] = nil
-                        if profile.pinned then profile.pinned[num] = nil end
-                        if profile.muted then profile.muted[num] = nil end
-                        if profile.drafts then profile.drafts[num] = nil end
-                        if activeContact == num then activeContact = nil activeChatId = nil activeChatHistory = nil end
-                        save_all_data()
-                        needSortContacts = true
+                        UI.contactToDelete = num
+                        UI.requestDeletePopup = true
                     end
                 end
                 imgui.EndPopup()
@@ -3896,7 +3949,7 @@ local function DrawChatHistory(scale, profile)
             
             imgui.SameLine(0, spaceX)
             if imgui.Button(geoBtnText) then
-                    Macro.targetGeoNumber = tostring(activeContact):match("%d+")
+                    Macro.targetGeoNumber = tostring(activeContact):match("[%d%-]+")
                     if Macro.targetGeoNumber then
                         UI.windowState[0] = false 
                         Macro.autoGeo = true
@@ -4260,8 +4313,6 @@ local function DrawChatHistory(scale, profile)
                         local urls = {}
                         local foundUrls = {}
                         local textToDisplay = text
-                        local sName = nil
-                        local isVer = false
                         for word in text:gmatch("%S+") do
                             local isUrl = false
                             if word:match("^https?://[a-zA-Z0-9_%-%.%?%.:/%+=&]+") then
@@ -4300,7 +4351,7 @@ local function DrawChatHistory(scale, profile)
                                 loadedStr = loadedStr .. url .. "manual"
                             end
                         end
-                        if not msgData.bubbleSize or msgData.urlsStr ~= urlsStr or msgData.loadedStr ~= loadedStr then
+                        if not msgData.bubbleSize or msgData.cachedScale ~= scale or msgData.urlsStr ~= urlsStr or msgData.loadedStr ~= loadedStr then
                             local msgTextSize = imgui.ImVec2(0, 0)
                             if textToDisplay ~= "" then
                                 msgTextSize = imgui.CalcTextSize(textToDisplay, nil, false, wrap_width)
@@ -4311,18 +4362,9 @@ local function DrawChatHistory(scale, profile)
                             if textToDisplay ~= "" then
                                 b_width = msgTextSize.x
                             end
-                            local nameTextSize = imgui.ImVec2(0, 0)
-                            if sName then
-                                nameTextSize = imgui.CalcTextSize(u8(tostring(sName)))
-                                if isVer then nameTextSize.x = nameTextSize.x + 16 * scale end
-                                b_width = math.max(b_width, nameTextSize.x)
-                            end
                             local b_height = padding.y * 1.5 + timeSize.y
                             if textToDisplay ~= "" then
                                 b_height = b_height + msgTextSize.y + 5
-                            end
-                            if sName then
-                                b_height = b_height + nameTextSize.y + 2 * scale
                             end
                             for _, url in ipairs(urls) do
                                 local isImg = false
@@ -4353,6 +4395,7 @@ local function DrawChatHistory(scale, profile)
                             b_width = math.max(b_width, timeSize.x + 10)
                             msgData.bubbleSize = {x = b_width + padding.x * 2, y = b_height}
                             msgData.timeSize = {x = timeSize.x, y = timeSize.y}
+                            msgData.cachedScale = scale
                             msgData.urls = urls
                             msgData.urlsStr = urlsStr
                             msgData.loadedStr = loadedStr
@@ -4412,28 +4455,6 @@ local function DrawChatHistory(scale, profile)
                                 imgui.SetTooltip(u8"ПКМ - управление сообщением")
                             end
                             local currentOffset = bubble_start_y + padding.y
-                            if sName then
-                                imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
-                                local hash = 0
-                                for i = 1, #msgData.sender do hash = (hash + msgData.sender:byte(i)) % 5 end
-                                local colors = {
-                                    imgui.ImVec4(0.9, 0.35, 0.35, 1.0),
-                                    imgui.ImVec4(0.25, 0.75, 0.45, 1.0),
-                                    imgui.ImVec4(0.35, 0.55, 0.95, 1.0),
-                                    imgui.ImVec4(0.8, 0.4, 0.8, 1.0),
-                                    imgui.ImVec4(0.95, 0.65, 0.25, 1.0)
-                                }
-                                imgui.TextColored(colors[hash + 1], u8(tostring(sName)))
-                                if isVer then
-                                    imgui.SameLine(0, 4 * scale)
-                                    local dl = imgui.GetWindowDrawList()
-                                    local c_pos = imgui.GetCursorScreenPos()
-                                    local b_radius = 5.5 * scale
-                                    local badge_center = imgui.ImVec2(c_pos.x + b_radius, c_pos.y + (imgui.GetTextLineHeight() / 2))
-                                    DrawVerificationBadge(dl, badge_center, b_radius, scale)
-                                end
-                                currentOffset = currentOffset + imgui.GetTextLineHeight() + 2 * scale
-                            end
                             if msgData.textToDisplay ~= "" then
                                 imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
                                 local isGeo = (msgData.textToDisplay == "[Геопозиция]" or msgData.textToDisplay == u8"[Геопозиция]")
@@ -4621,9 +4642,1751 @@ local function DrawChatHistory(scale, profile)
     end
 end
 
+local function getContactInitials(num, rawName)
+    if num == "banking" then return "B"
+    elseif num == "system" then return "!" end
+    if rawName and rawName ~= "" then
+        local uName = u8(rawName)
+        local firstChar = uName:match("^([%z\1-\127\194-\244][\128-\191]*)")
+        if firstChar then return firstChar end
+    end
+    return "#"
+end
+
+local function getAvatarColor(str, alpha)
+    alpha = alpha or 1.0
+    local h = 0
+    local s = tostring(str or "")
+    for i = 1, #s do h = (h * 31 + s:byte(i)) % 6 end
+    local palette = {
+        imgui.ImVec4(0.28, 0.52, 0.88, alpha),
+        imgui.ImVec4(0.22, 0.68, 0.50, alpha),
+        imgui.ImVec4(0.80, 0.38, 0.55, alpha),
+        imgui.ImVec4(0.88, 0.54, 0.25, alpha),
+        imgui.ImVec4(0.55, 0.42, 0.85, alpha),
+        imgui.ImVec4(0.24, 0.66, 0.78, alpha)
+    }
+    return palette[h + 1]
+end
+
+local function DrawSmoothRoundedRect(dl, p_min, p_max, colU32, r)
+    local x1, y1 = p_min.x, p_min.y
+    local x2, y2 = p_max.x, p_max.y
+    r = math.min(r, (x2 - x1) / 2, (y2 - y1) / 2)
+    if r <= 0 then
+        dl:AddRectFilled(p_min, p_max, colU32, 0.0)
+        return
+    end
+    dl:AddCircleFilled(imgui.ImVec2(x1 + r, y1 + r), r, colU32, 48)
+    dl:AddCircleFilled(imgui.ImVec2(x2 - r, y1 + r), r, colU32, 48)
+    dl:AddCircleFilled(imgui.ImVec2(x1 + r, y2 - r), r, colU32, 48)
+    dl:AddCircleFilled(imgui.ImVec2(x2 - r, y2 - r), r, colU32, 48)
+    dl:AddRectFilled(imgui.ImVec2(x1 + r, y1), imgui.ImVec2(x2 - r, y2), colU32, 0.0)
+    dl:AddRectFilled(imgui.ImVec2(x1, y1 + r), imgui.ImVec2(x1 + r, y2 - r), colU32, 0.0)
+    dl:AddRectFilled(imgui.ImVec2(x2 - r, y1 + r), imgui.ImVec2(x2, y2 - r), colU32, 0.0)
+end
+
+local function DrawSmoothRoundedTop(dl, p_min, p_max, colU32, r)
+    local x1, y1 = p_min.x, p_min.y
+    local x2, y2 = p_max.x, p_max.y
+    r = math.min(r, (x2 - x1) / 2, y2 - y1)
+    dl:AddCircleFilled(imgui.ImVec2(x1 + r, y1 + r), r, colU32, 48)
+    dl:AddCircleFilled(imgui.ImVec2(x2 - r, y1 + r), r, colU32, 48)
+    dl:AddRectFilled(imgui.ImVec2(x1 + r, y1), imgui.ImVec2(x2 - r, y1 + r), colU32, 0.0)
+    dl:AddRectFilled(imgui.ImVec2(x1, y1 + r), imgui.ImVec2(x2, y2), colU32, 0.0)
+end
+
+local function GetIosPalette()
+    if globalSettings.iosTheme ~= 1 and globalSettings.iosTheme ~= 2 then
+        globalSettings.iosTheme = 1
+    end
+    if globalSettings.iosTheme == 1 then
+        return {
+            isLight = true,
+            bgMain = imgui.ImVec4(0.949, 0.949, 0.969, 1.0),
+            bgChat = imgui.ImVec4(1.000, 1.000, 1.000, 1.0),
+            headerBg = imgui.ImVec4(0.965, 0.965, 0.980, 1.0),
+            cardBg = imgui.ImVec4(1.000, 1.000, 1.000, 1.0),
+            cardHover = imgui.ImVec4(0.910, 0.915, 0.940, 1.0),
+            popupBg = imgui.ImVec4(0.980, 0.980, 0.995, 0.98),
+            glassBtn = imgui.ImVec4(0.890, 0.895, 0.925, 1.0),
+            glassBtnHover = imgui.ImVec4(0.825, 0.835, 0.875, 1.0),
+            glassBorder = imgui.ImVec4(0.0, 0.0, 0.0, 0.08),
+            textPrimary = imgui.ImVec4(0.06, 0.06, 0.08, 1.0),
+            textSecondary = imgui.ImVec4(0.50, 0.50, 0.55, 1.0),
+            bubbleMe = imgui.ImVec4(0.000, 0.478, 1.000, 1.0),
+            bubbleMeText = imgui.ImVec4(1.000, 1.000, 1.000, 1.0),
+            bubbleMeTime = imgui.ImVec4(0.85, 0.92, 1.0, 0.85),
+            bubbleThem = imgui.ImVec4(0.914, 0.914, 0.929, 1.0),
+            bubbleThemText = imgui.ImVec4(0.06, 0.06, 0.08, 1.0),
+            bubbleThemTime = imgui.ImVec4(0.45, 0.45, 0.50, 0.85),
+            inputBg = imgui.ImVec4(0.910, 0.910, 0.930, 1.0),
+            separator = imgui.ImVec4(0.0, 0.0, 0.0, 0.10),
+            accent = imgui.ImVec4(0.000, 0.478, 1.000, 1.0),
+            homeBar = imgui.ImVec4(0.15, 0.15, 0.18, 0.45),
+            frameOuter = imgui.ImVec4(0.76, 0.78, 0.82, 1.0),
+            frameBezel = imgui.ImVec4(0.08, 0.08, 0.10, 1.0)
+        }
+    else
+        return {
+            isLight = false,
+            bgMain = imgui.ImVec4(0.000, 0.000, 0.000, 1.0),
+            bgChat = imgui.ImVec4(0.000, 0.000, 0.000, 1.0),
+            headerBg = imgui.ImVec4(0.075, 0.075, 0.085, 1.0),
+            cardBg = imgui.ImVec4(0.110, 0.110, 0.120, 1.0),
+            cardHover = imgui.ImVec4(0.175, 0.175, 0.190, 1.0),
+            popupBg = imgui.ImVec4(0.140, 0.140, 0.155, 0.98),
+            glassBtn = imgui.ImVec4(0.175, 0.175, 0.190, 1.0),
+            glassBtnHover = imgui.ImVec4(0.245, 0.245, 0.265, 1.0),
+            glassBorder = imgui.ImVec4(1.0, 1.0, 1.0, 0.12),
+            textPrimary = imgui.ImVec4(1.000, 1.000, 1.000, 1.0),
+            textSecondary = imgui.ImVec4(0.56, 0.56, 0.59, 1.0),
+            bubbleMe = imgui.ImVec4(0.039, 0.518, 1.000, 1.0),
+            bubbleMeText = imgui.ImVec4(1.000, 1.000, 1.000, 1.0),
+            bubbleMeTime = imgui.ImVec4(0.85, 0.92, 1.0, 0.80),
+            bubbleThem = imgui.ImVec4(0.150, 0.150, 0.165, 1.0),
+            bubbleThemText = imgui.ImVec4(1.000, 1.000, 1.000, 1.0),
+            bubbleThemTime = imgui.ImVec4(0.65, 0.65, 0.70, 0.80),
+            inputBg = imgui.ImVec4(0.115, 0.115, 0.125, 1.0),
+            separator = imgui.ImVec4(1.0, 1.0, 1.0, 0.12),
+            accent = imgui.ImVec4(0.039, 0.518, 1.000, 1.0),
+            homeBar = imgui.ImVec4(1.0, 1.0, 1.0, 0.45),
+            frameOuter = imgui.ImVec4(0.32, 0.34, 0.37, 1.0),
+            frameBezel = imgui.ImVec4(0.04, 0.04, 0.05, 1.0)
+        }
+    end
+end
+
+local function triggerAutoCleanMacro()
+    UI.windowState[0] = false
+    Macro.autoCleaning = true
+    Macro.cleanStep = 1
+    showSystemNotification(u8"Запуск очистки памяти...", 0)
+    sampSendChat("/phone")
+    lua_thread.create(function()
+        local swiped = false
+        for i = 1, 50 do
+            wait(100)
+            for td = 0, 2304 do
+                if sampTextdrawIsExists(td) then
+                    local txt = sampTextdrawGetString(td)
+                    if type(txt) == "string" then
+                        local cleanText = txt:gsub("~.-~", ""):upper()
+                        if cleanText:find("SWIPE UP TO UNLOCK") and not swiped then
+                            sampSendClickTextdraw(td)
+                            swiped = true
+                            break
+                        end
+                    end
+                end
+            end
+            if swiped then break end
+        end
+        if not swiped then
+            showSystemNotification(u8"Ошибка: не найден экран блокировки телефона.", 2)
+            Macro.autoCleaning = false
+            UI.windowState[0] = true
+            return
+        end
+        local appFound = false
+        for i = 1, 50 do
+            wait(50)
+            for td = 2304, 0, -1 do
+                if sampTextdrawIsExists(td) then
+                    local posX, posY = sampTextdrawGetPos(td)
+                    if posX >= 529.0 and posX <= 533.0 and posY >= 407.0 and posY <= 411.0 then
+                        sampSendClickTextdraw(td)
+                        appFound = true
+                        break
+                    end
+                end
+            end
+            if appFound then break end
+        end
+        if not appFound then
+            showSystemNotification(u8"Ошибка: иконка сообщений не появилась.", 2)
+            Macro.autoCleaning = false
+            UI.windowState[0] = true
+            return
+        end
+        Macro.cleanStep = 2
+        wait(10000)
+        if Macro.autoCleaning then
+            Macro.autoCleaning = false
+            Macro.cleanStep = 0
+            showSystemNotification(u8"Ошибка: Таймаут. Сервер не ответил на диалоги.", 2)
+            sampSendClickTextdraw(65535)
+            sampSendChat("/untd 2")
+            UI.windowState[0] = true
+        end
+    end)
+end
+
+local function triggerAutoGeoMacro(targetContact)
+    Macro.targetGeoNumber = tostring(targetContact):match("[%d%-]+")
+    if Macro.targetGeoNumber then
+        UI.windowState[0] = false
+        Macro.autoGeo = true
+        Macro.geoStep = 1
+        showSystemNotification(u8"Запуск отправки геопозиции...", 0)
+        sampSendChat("/phone")
+        lua_thread.create(function()
+            local swiped = false
+            for i = 1, 50 do
+                wait(100)
+                for td = 0, 2304 do
+                    if sampTextdrawIsExists(td) then
+                        local txt = sampTextdrawGetString(td)
+                        if type(txt) == "string" then
+                            local cleanText = txt:gsub("~.-~", ""):upper()
+                            if cleanText:find("SWIPE UP TO UNLOCK") and not swiped then
+                                sampSendClickTextdraw(td)
+                                swiped = true
+                                break
+                            end
+                        end
+                    end
+                end
+                if swiped then break end
+            end
+            if not swiped then
+                showSystemNotification(u8"Ошибка: не найден экран блокировки телефона.", 2)
+                Macro.autoGeo = false
+                UI.windowState[0] = true
+                return
+            end
+            local appFound = false
+            for i = 1, 50 do
+                wait(50)
+                for td = 2304, 0, -1 do
+                    if sampTextdrawIsExists(td) then
+                        local posX, posY = sampTextdrawGetPos(td)
+                        if posX >= 529.0 and posX <= 533.0 and posY >= 407.0 and posY <= 411.0 then
+                            sampSendClickTextdraw(td)
+                            appFound = true
+                            break
+                        end
+                    end
+                end
+                if appFound then break end
+            end
+            if not appFound then
+                showSystemNotification(u8"Ошибка: иконка сообщений не появилась.", 2)
+                Macro.autoGeo = false
+                UI.windowState[0] = true
+                return
+            end
+            Macro.geoStep = 2
+            wait(10000)
+            if Macro.autoGeo then
+                Macro.autoGeo = false
+                Macro.geoStep = 0
+                showSystemNotification(u8"Ошибка: Таймаут. Сервер не ответил на диалоги.", 2)
+                sampSendClickTextdraw(65535)
+                sampSendChat("/untd 2")
+                UI.windowState[0] = true
+            end
+        end)
+    else
+        showSystemNotification(u8"Ошибка: неверный номер телефона.", 2)
+    end
+end
+
+local function DrawIosVectorBtn(id, iconType, radius, bgCol, hoverCol, iconCol, borderCol, scale)
+    local pos = imgui.GetCursorScreenPos()
+    local d = radius * 2
+    local clicked = imgui.InvisibleButton(id, imgui.ImVec2(d, d))
+    local hovered = imgui.IsItemHovered()
+    local dl = imgui.GetWindowDrawList()
+    local center = imgui.ImVec2(pos.x + radius, pos.y + radius)
+    local fill = hovered and hoverCol or bgCol
+
+    dl:AddCircleFilled(center, radius, imgui.GetColorU32Vec4(fill), 36)
+    if borderCol then
+        dl:AddCircle(center, radius, imgui.GetColorU32Vec4(borderCol), 36, 1.0)
+    end
+
+    local fg = imgui.GetColorU32Vec4(iconCol)
+    local r = radius * 0.44
+    local th = 2.0 * scale
+
+    if iconType == "back" then
+        dl:AddLine(imgui.ImVec2(center.x + r * 0.35, center.y - r * 0.85), imgui.ImVec2(center.x - r * 0.45, center.y), fg, th)
+        dl:AddLine(imgui.ImVec2(center.x - r * 0.45, center.y), imgui.ImVec2(center.x + r * 0.35, center.y + r * 0.85), fg, th)
+    elseif iconType == "close" then
+        dl:AddLine(imgui.ImVec2(center.x - r * 0.65, center.y - r * 0.65), imgui.ImVec2(center.x + r * 0.65, center.y + r * 0.65), fg, th)
+        dl:AddLine(imgui.ImVec2(center.x + r * 0.65, center.y - r * 0.65), imgui.ImVec2(center.x - r * 0.65, center.y + r * 0.65), fg, th)
+    elseif iconType == "plus" then
+        dl:AddLine(imgui.ImVec2(center.x - r * 0.75, center.y), imgui.ImVec2(center.x + r * 0.75, center.y), fg, th)
+        dl:AddLine(imgui.ImVec2(center.x, center.y - r * 0.75), imgui.ImVec2(center.x, center.y + r * 0.75), fg, th)
+    elseif iconType == "send" then
+        dl:AddLine(imgui.ImVec2(center.x, center.y + r * 0.80), imgui.ImVec2(center.x, center.y - r * 0.80), fg, th * 1.1)
+        dl:AddLine(imgui.ImVec2(center.x - r * 0.65, center.y - r * 0.15), imgui.ImVec2(center.x, center.y - r * 0.80), fg, th * 1.1)
+        dl:AddLine(imgui.ImVec2(center.x + r * 0.65, center.y - r * 0.15), imgui.ImVec2(center.x, center.y - r * 0.80), fg, th * 1.1)
+    elseif iconType == "settings" then
+        for i = -1, 1 do
+            local y = center.y + i * (r * 0.65)
+            dl:AddLine(imgui.ImVec2(center.x - r * 0.80, y), imgui.ImVec2(center.x + r * 0.80, y), fg, 1.6 * scale)
+            local kx = center.x + (i == 0 and r * 0.35 or -r * 0.35)
+            dl:AddCircleFilled(imgui.ImVec2(kx, y), 2.4 * scale, fg, 12)
+        end
+    elseif iconType == "clean" then
+        dl:AddLine(imgui.ImVec2(center.x - r * 0.75, center.y - r * 0.55), imgui.ImVec2(center.x + r * 0.75, center.y - r * 0.55), fg, 1.8 * scale)
+        dl:AddLine(imgui.ImVec2(center.x - r * 0.30, center.y - r * 0.80), imgui.ImVec2(center.x + r * 0.30, center.y - r * 0.80), fg, 1.8 * scale)
+        dl:AddRect(imgui.ImVec2(center.x - r * 0.55, center.y - r * 0.50), imgui.ImVec2(center.x + r * 0.55, center.y + r * 0.80), fg, 2.0 * scale)
+    elseif iconType == "call" then
+        dl:AddCircleFilled(imgui.ImVec2(center.x - r * 0.45, center.y - r * 0.45), 2.8 * scale, fg, 12)
+        dl:AddCircleFilled(imgui.ImVec2(center.x + r * 0.45, center.y + r * 0.45), 2.8 * scale, fg, 12)
+        dl:AddLine(imgui.ImVec2(center.x - r * 0.55, center.y - r * 0.35), imgui.ImVec2(center.x - r * 0.10, center.y + r * 0.25), fg, 2.4 * scale)
+        dl:AddLine(imgui.ImVec2(center.x - r * 0.10, center.y + r * 0.25), imgui.ImVec2(center.x + r * 0.35, center.y + r * 0.55), fg, 2.4 * scale)
+    elseif iconType == "msg" then
+        dl:AddRectFilled(imgui.ImVec2(center.x - r * 0.85, center.y - r * 0.65), imgui.ImVec2(center.x + r * 0.85, center.y + r * 0.45), fg, 4.5 * scale)
+        dl:AddTriangleFilled(
+            imgui.ImVec2(center.x - r * 0.35, center.y + r * 0.40),
+            imgui.ImVec2(center.x - r * 0.65, center.y + r * 0.85),
+            imgui.ImVec2(center.x + r * 0.05, center.y + r * 0.40),
+            fg
+        )
+    elseif iconType == "geo" then
+        dl:AddTriangleFilled(
+            imgui.ImVec2(center.x + r * 0.75, center.y - r * 0.75),
+            imgui.ImVec2(center.x - r * 0.80, center.y - r * 0.05),
+            imgui.ImVec2(center.x + r * 0.05, center.y + r * 0.80),
+            fg
+        )
+    elseif iconType == "bell_on" or iconType == "bell_off" then
+        dl:AddCircleFilled(imgui.ImVec2(center.x, center.y - r * 0.18), r * 0.55, fg, 18)
+        dl:AddRectFilled(imgui.ImVec2(center.x - r * 0.55, center.y - r * 0.18), imgui.ImVec2(center.x + r * 0.55, center.y + r * 0.38), fg, 1.0 * scale)
+        dl:AddRectFilled(imgui.ImVec2(center.x - r * 0.75, center.y + r * 0.25), imgui.ImVec2(center.x + r * 0.75, center.y + r * 0.45), fg, 1.5 * scale)
+        dl:AddCircleFilled(imgui.ImVec2(center.x, center.y + r * 0.68), 2.2 * scale, fg, 10)
+        if iconType == "bell_off" then
+            local strikeCol = imgui.GetColorU32Vec4(imgui.ImVec4(0.95, 0.30, 0.30, 1.0))
+            dl:AddLine(imgui.ImVec2(center.x - r * 0.85, center.y - r * 0.85), imgui.ImVec2(center.x + r * 0.85, center.y + r * 0.85), strikeCol, 2.2 * scale)
+        end
+    end
+
+    if hovered then imgui.SetMouseCursor(imgui.MouseCursor.Hand) end
+    return clicked, hovered
+end
+
+local function DrawIosCardRow(id, leftTitle, leftSub, rightText, titleCol, width, height, pal, scale)
+    local pos = imgui.GetCursorScreenPos()
+    local clicked = imgui.InvisibleButton(id, imgui.ImVec2(width, height))
+    local hovered = imgui.IsItemHovered()
+    local dl = imgui.GetWindowDrawList()
+    local bg = hovered and pal.cardHover or pal.cardBg
+    DrawSmoothRoundedRect(dl, pos, imgui.ImVec2(pos.x + width, pos.y + height), imgui.GetColorU32Vec4(bg), 10.0 * scale)
+
+    local padX = 12 * scale
+    local tCol = imgui.GetColorU32Vec4(titleCol or pal.textPrimary)
+    local sCol = imgui.GetColorU32Vec4(pal.textSecondary)
+
+    if leftSub and leftSub ~= "" then
+        dl:AddText(imgui.ImVec2(pos.x + padX, pos.y + 6 * scale), tCol, leftTitle)
+        dl:AddText(imgui.ImVec2(pos.x + padX, pos.y + height - imgui.GetTextLineHeight() - 5 * scale), sCol, leftSub)
+    else
+        local ty = pos.y + (height - imgui.GetTextLineHeight()) / 2
+        dl:AddText(imgui.ImVec2(pos.x + padX, ty), tCol, leftTitle)
+    end
+
+    if rightText and rightText ~= "" then
+        local rSz = imgui.CalcTextSize(rightText)
+        local ry = pos.y + (height - rSz.y) / 2
+        dl:AddText(imgui.ImVec2(pos.x + width - rSz.x - padX, ry), sCol, rightText)
+    end
+
+    if hovered then imgui.SetMouseCursor(imgui.MouseCursor.Hand) end
+    return clicked
+end
+
+local function DrawIosPhoneContent(scale, profile)
+    local dl = imgui.GetWindowDrawList()
+    local winPos = imgui.GetWindowPos()
+    local winSize = imgui.GetWindowSize()
+    local pal = GetIosPalette()
+
+    -- Сброс висящего фокуса, если поле ввода сейчас не отрисовывается
+    local isSystemChat = (activeContact == "banking" or activeContact == "system")
+    if not activeContact or isSystemChat or UI.showContactProfile or UI.showCallHistory then
+        UI.requestFocus = false
+    end
+
+    -- 1. Идеально гладкий корпус и экран телефона (48 сегментов на каждый угол)
+    local outerMin = winPos
+    local outerMax = imgui.ImVec2(winPos.x + winSize.x, winPos.y + winSize.y)
+    local bezelMin = imgui.ImVec2(winPos.x + 2.5 * scale, winPos.y + 2.5 * scale)
+    local bezelMax = imgui.ImVec2(winPos.x + winSize.x - 2.5 * scale, winPos.y + winSize.y - 2.5 * scale)
+    local screenMin = imgui.ImVec2(winPos.x + 6.0 * scale, winPos.y + 6.0 * scale)
+    local screenMax = imgui.ImVec2(winPos.x + winSize.x - 6.0 * scale, winPos.y + winSize.y - 6.0 * scale)
+
+    DrawSmoothRoundedRect(dl, outerMin, outerMax, imgui.GetColorU32Vec4(pal.frameOuter), 34.0 * scale)
+    DrawSmoothRoundedRect(dl, bezelMin, bezelMax, imgui.GetColorU32Vec4(pal.frameBezel), 31.5 * scale)
+
+    local baseScreenBg = (activeContact and not UI.showContactProfile and not UI.showCallHistory) and pal.bgChat or pal.bgMain
+    DrawSmoothRoundedRect(dl, screenMin, screenMax, imgui.GetColorU32Vec4(baseScreenBg), 28.0 * scale)
+
+    -- 2. Бесшовная верхняя заливка в карточке контакта
+    if activeContact and UI.showContactProfile and not UI.showCallHistory then
+        local rawAv = getAvatarColor(activeContact, 1.0)
+        local mix = pal.isLight and 0.35 or 0.42
+        local topSolid = imgui.ImVec4(
+            pal.bgMain.x * (1 - mix) + rawAv.x * mix,
+            pal.bgMain.y * (1 - mix) + rawAv.y * mix,
+            pal.bgMain.z * (1 - mix) + rawAv.z * mix,
+            1.0
+        )
+        local topSolidU32 = imgui.GetColorU32Vec4(topSolid)
+        local bgMainU32 = imgui.GetColorU32Vec4(pal.bgMain)
+        local capBottomY = screenMin.y + 32 * scale
+        DrawSmoothRoundedTop(dl, screenMin, imgui.ImVec2(screenMax.x, capBottomY), topSolidU32, 28.0 * scale)
+        dl:AddRectFilledMultiColor(
+            imgui.ImVec2(screenMin.x, capBottomY),
+            imgui.ImVec2(screenMax.x, screenMin.y + 225 * scale),
+            topSolidU32, topSolidU32, bgMainU32, bgMainU32
+        )
+    elseif activeContact and not UI.showContactProfile and not UI.showCallHistory then
+        local headerBottomY = winPos.y + 94 * scale
+        local headerU32 = imgui.GetColorU32Vec4(pal.headerBg)
+        DrawSmoothRoundedTop(dl, screenMin, imgui.ImVec2(screenMax.x, headerBottomY), headerU32, 28.0 * scale)
+        dl:AddLine(imgui.ImVec2(screenMin.x, headerBottomY), imgui.ImVec2(screenMax.x, headerBottomY), imgui.GetColorU32Vec4(pal.separator), 1.0)
+    end
+
+    -- 3. Dynamic Island (Фронталка) — закрытие по клику
+    local islandW, islandH = 94 * scale, 22 * scale
+    local islandX = winPos.x + (winSize.x - islandW) / 2
+    local islandY = screenMin.y + 6 * scale
+    DrawSmoothRoundedRect(dl, imgui.ImVec2(islandX, islandY), imgui.ImVec2(islandX + islandW, islandY + islandH), imgui.GetColorU32Vec4(imgui.ImVec4(0.03, 0.03, 0.04, 1.0)), 11.0 * scale)
+    dl:AddCircleFilled(imgui.ImVec2(islandX + islandW - 14 * scale, islandY + islandH / 2), 4.2 * scale, imgui.GetColorU32Vec4(imgui.ImVec4(0.08, 0.13, 0.25, 1.0)), 16)
+    dl:AddCircleFilled(imgui.ImVec2(islandX + islandW - 15 * scale, islandY + islandH / 2 - 1 * scale), 1.3 * scale, imgui.GetColorU32Vec4(imgui.ImVec4(0.35, 0.55, 0.90, 0.7)), 12)
+
+    imgui.SetCursorScreenPos(imgui.ImVec2(islandX, islandY))
+    if imgui.InvisibleButton("##ios_island_close", imgui.ImVec2(islandW, islandH)) then
+        SaveCurrentDraft()
+        UI.windowState[0] = false
+    end
+    if imgui.IsItemHovered() then imgui.SetMouseCursor(imgui.MouseCursor.Hand) end
+
+    -- Часы и иконки статус-бара
+    local statusColor = imgui.GetColorU32Vec4(pal.textPrimary)
+    local clockStr = os.date("%H:%M")
+    dl:AddText(imgui.ImVec2(screenMin.x + 18 * scale, islandY + (islandH - imgui.GetTextLineHeight()) / 2), statusColor, clockStr)
+
+    local batX = screenMax.x - 36 * scale
+    local batY = islandY + 5.5 * scale
+    dl:AddRect(imgui.ImVec2(batX, batY), imgui.ImVec2(batX + 19 * scale, batY + 10.5 * scale), statusColor, 2.5 * scale)
+    dl:AddRectFilled(imgui.ImVec2(batX + 2 * scale, batY + 2 * scale), imgui.ImVec2(batX + 15.5 * scale, batY + 8.5 * scale), statusColor, 1.2 * scale)
+    for b = 1, 4 do
+        local bh = (2 + b * 2) * scale
+        local bx = batX - (22 - b * 4.2) * scale
+        local by = batY + 10.5 * scale - bh
+        dl:AddRectFilled(imgui.ImVec2(bx, by), imgui.ImVec2(bx + 2.5 * scale, batY + 10.5 * scale), statusColor, 1.0 * scale)
+    end
+
+    -- 4. Нижняя полоска закрытия (Home Indicator)
+    local homeW, homeH = 115 * scale, 4.5 * scale
+    local homeX = winPos.x + (winSize.x - homeW) / 2
+    local homeY = screenMax.y - 10 * scale
+    imgui.SetCursorScreenPos(imgui.ImVec2(homeX - 10 * scale, homeY - 6 * scale))
+    local homeClicked = imgui.InvisibleButton("##ios_home_bar_close", imgui.ImVec2(homeW + 20 * scale, 15 * scale))
+    local homeHovered = imgui.IsItemHovered()
+    local homeCol = homeHovered and pal.accent or pal.homeBar
+    dl:AddRectFilled(imgui.ImVec2(homeX, homeY), imgui.ImVec2(homeX + homeW, homeY + homeH), imgui.GetColorU32Vec4(homeCol), 2.5 * scale)
+    if homeHovered then imgui.SetMouseCursor(imgui.MouseCursor.Hand) end
+    if homeClicked then
+        SaveCurrentDraft()
+        UI.windowState[0] = false
+        return
+    end
+
+    -- Стилизация всех элементов, скроллбара и всплывающих меню под тему iOS
+    imgui.PushStyleColor(imgui.Col.Text, pal.textPrimary)
+    imgui.PushStyleColor(imgui.Col.PopupBg, pal.popupBg)
+    imgui.PushStyleColor(imgui.Col.Border, pal.separator)
+    imgui.PushStyleColor(imgui.Col.FrameBg, pal.inputBg)
+    imgui.PushStyleColor(imgui.Col.FrameBgHovered, pal.cardHover)
+    imgui.PushStyleColor(imgui.Col.FrameBgActive, pal.inputBg)
+    imgui.PushStyleColor(imgui.Col.Header, pal.cardHover)
+    imgui.PushStyleColor(imgui.Col.HeaderHovered, pal.cardHover)
+    imgui.PushStyleColor(imgui.Col.HeaderActive, pal.cardHover)
+    imgui.PushStyleColor(imgui.Col.ScrollbarBg, imgui.ImVec4(0, 0, 0, 0))
+    imgui.PushStyleVarFloat(imgui.StyleVar.ScrollbarSize, 3.0 * scale)
+    imgui.PushStyleVarFloat(imgui.StyleVar.PopupBorderSize, 1.0)
+
+    local function popIosStyles()
+        imgui.PopStyleVar(2)
+        imgui.PopStyleColor(10)
+    end
+
+    -- =========================================================================
+    -- ЭКРАН 1: СПИСОК СООБЩЕНИЙ И ЗАКРЕПЛЁННЫЕ (iOS 26)
+    -- =========================================================================
+    if not activeContact then
+        imgui.SetCursorPos(imgui.ImVec2(16 * scale, 38 * scale))
+        local cClick, cHov = DrawIosVectorBtn("##ios_clean", "clean", 15 * scale, pal.glassBtn, pal.glassBtnHover, pal.textPrimary, pal.glassBorder, scale)
+        if cHov then imgui.SetTooltip(u8"Сброс лимита SMS") end
+        if cClick then triggerAutoCleanMacro() end
+
+        imgui.SetCursorPos(imgui.ImVec2(52 * scale, 38 * scale))
+        local sClick, sHov = DrawIosVectorBtn("##ios_settings", "settings", 15 * scale, pal.glassBtn, pal.glassBtnHover, pal.textPrimary, pal.glassBorder, scale)
+        if sHov then imgui.SetTooltip(u8"Настройки") end
+        if sClick then imgui.OpenPopup("SettingsModal") end
+
+        local titleStr = u8"Сообщения"
+        local titleW = imgui.CalcTextSize(titleStr).x
+        imgui.SetCursorPos(imgui.ImVec2((winSize.x - titleW) / 2, 43 * scale))
+        imgui.Text(titleStr)
+
+        imgui.SetCursorPos(imgui.ImVec2(winSize.x - 46 * scale, 38 * scale))
+        local addClick, addHov = DrawIosVectorBtn("##ios_add_contact", "plus", 15 * scale, pal.accent, pal.accent, imgui.ImVec4(1, 1, 1, 1), nil, scale)
+        if addHov then imgui.SetTooltip(u8"Новый контакт") end
+        if addClick then
+            UI.inputContactName[0] = 0
+            UI.inputContactNumber[0] = 0
+            UI.inputContactNick[0] = 0
+            UI.requestContactModal = true
+        end
+
+        if needSortContacts then
+            cachedSortedContacts = {}
+            local uniqueNumbers = {}
+            for num, _ in pairs(profile.contacts) do uniqueNumbers[num] = true end
+            if profile.metadata then
+                for num, _ in pairs(profile.metadata) do uniqueNumbers[num] = true end
+            end
+            if profile.calls then
+                for num, _ in pairs(profile.calls) do uniqueNumbers[num] = true end
+            end
+            if profile.metadata and profile.metadata["banking"] then uniqueNumbers["banking"] = true end
+            if profile.metadata and profile.metadata["system"] then uniqueNumbers["system"] = true end
+            for num, _ in pairs(uniqueNumbers) do
+                local name = profile.contacts[num] or ""
+                local hasName = (name ~= "")
+                local meta = profile.metadata and profile.metadata[num]
+                local hasHistory = (meta ~= nil)
+                local calls = profile.calls and profile.calls[num]
+                local hasCalls = (calls and #calls > 0)
+                local isSystem = (num == "banking" or num == "system")
+                if hasName or hasHistory or hasCalls or isSystem then
+                    local last_ts = 0
+                    if hasHistory then last_ts = meta.timestamp or 0 end
+                    if hasCalls then
+                        local last_call_ts = calls[#calls].timestamp or 0
+                        if last_call_ts > last_ts then last_ts = last_call_ts end
+                    end
+                    table.insert(cachedSortedContacts, {num = num, name = name, last_ts = last_ts})
+                end
+            end
+            table.sort(cachedSortedContacts, function(a, b)
+                local a_pin = profile.pinned and profile.pinned[a.num] or false
+                local b_pin = profile.pinned and profile.pinned[b.num] or false
+                if a_pin ~= b_pin then return a_pin end
+                local mode = globalSettings.contactSortMode or 1
+                if mode == 2 then
+                    local a_saved = (a.name ~= "")
+                    local b_saved = (b.name ~= "")
+                    if a_saved ~= b_saved then return a_saved end
+                elseif mode == 3 then
+                    local a_nick = profile.nicknames and profile.nicknames[a.num]
+                    local b_nick = profile.nicknames and profile.nicknames[b.num]
+                    local a_online = a_nick and onlinePlayers[a_nick] or false
+                    local b_online = b_nick and onlinePlayers[b_nick] or false
+                    if a_online ~= b_online then return a_online and not b_online end
+                end
+                return a.last_ts > b.last_ts
+            end)
+            needSortContacts = false
+        end
+
+        imgui.SetCursorPos(imgui.ImVec2(0, 76 * scale))
+        imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(0,0))
+        -- Опускаем высоту списка, чтобы контакты скроллились ровно под полем поиска
+        imgui.BeginChild("IosContactsScroll", imgui.ImVec2(winSize.x, winSize.y - 100 * scale), false)
+        imgui.PopStyleVar()
+
+        local sContactText = cp1251_lower(u8:decode(ffi.string(UI.inputSearchContact)))
+        local cdl = imgui.GetWindowDrawList()
+        local listAvailW = winSize.x
+
+        -- Полное контекстное меню быстрых действий по ПКМ
+
+        -- Полное контекстное меню быстрых действий по ПКМ
+        local function drawContactContextMenu(num, name)
+            if imgui.BeginPopupContextItem("IosContactPopup_" .. num) then
+                if num ~= "system" and num ~= "banking" then
+                    if imgui.Selectable(u8"Карточка контакта") then
+                        activeContact = num
+                        activeChatId = num
+                        activeChatHistory = load_chat_history(myNick, num)
+                        UI.showContactProfile = true
+                    end
+                    imgui.Separator()
+                end
+                local isPinned = profile.pinned and profile.pinned[num]
+                if imgui.Selectable(isPinned and u8"Открепить диалог" or u8"Закрепить диалог") then
+                    if not profile.pinned then profile.pinned = {} end
+                    if isPinned then profile.pinned[num] = nil else profile.pinned[num] = true end
+                    save_all_data()
+                    needSortContacts = true
+                end
+                if profile.tagger and profile.tagger[num] then
+                    if imgui.Selectable(u8"Открыть Nova (Social)") then
+                        local url = "https://nova.gambit-rp.com/" .. profile.tagger[num]
+                        shell32.ShellExecuteA(nil, "open", url, nil, nil, 1)
+                    end
+                end
+                if num == "system" then
+                    imgui.Separator()
+                    if imgui.Selectable(u8"Очистить историю") then
+                        save_chat_data(myNick, num, {})
+                        profile.metadata[num] = nil
+                        for _, p in pairs(phoneData) do
+                            if p.unread then p.unread[num] = nil end
+                            if p.muted then p.muted[num] = nil end
+                            if p.drafts then p.drafts[num] = nil end
+                        end
+                        save_all_data()
+                        needSortContacts = true
+                    end
+                elseif num == "banking" then
+                    local muteText = profile.muted and profile.muted[num] and u8"Включить уведомления" or u8"Отключить уведомления"
+                    if imgui.Selectable(muteText) then
+                        if not profile.muted then profile.muted = {} end
+                        profile.muted[num] = not profile.muted[num]
+                        save_all_data()
+                    end
+                    imgui.Separator()
+                    if imgui.Selectable(u8"Очистить историю") then
+                        save_chat_data(myNick, num, {})
+                        profile.metadata[num] = nil
+                        profile.unread[num] = nil
+                        save_all_data()
+                        needSortContacts = true
+                    end
+                else
+                    if imgui.Selectable(u8"Изменить") then
+                        ffi.copy(UI.inputContactNumber, num)
+                        ffi.copy(UI.inputContactName, u8(name))
+                        local nick = (profile.nicknames and profile.nicknames[num]) and profile.nicknames[num] or ""
+                        ffi.copy(UI.inputContactNick, nick)
+                        UI.requestContactModal = true
+                    end
+                    if imgui.Selectable(u8"Позвонить") then
+                        sampSendChat("/call " .. num)
+                        UI.windowState[0] = false
+                    end
+                    local muteText = profile.muted and profile.muted[num] and u8"Включить уведомления" or u8"Отключить уведомления"
+                    if imgui.Selectable(muteText) then
+                        if not profile.muted then profile.muted = {} end
+                        profile.muted[num] = not profile.muted[num]
+                        save_all_data()
+                    end
+                    local isBlocked = profile.blocked and profile.blocked[num]
+                    if imgui.Selectable(isBlocked and u8"Разблокировать" or u8"Заблокировать") then
+                        Macro.autoBlock = true
+                        sampSendChat("/blocknum " .. num)
+                    end
+                    imgui.Separator()
+                    if imgui.Selectable(u8"Очистить историю") then
+                        save_chat_data(myNick, num, {})
+                        profile.metadata[num] = nil
+                        profile.calls[num] = nil
+                        profile.unread[num] = nil
+                        save_all_data()
+                        needSortContacts = true
+                    end
+                    if imgui.Selectable(u8"Удалить контакт") then
+                        UI.contactToDelete = num
+                        UI.requestDeletePopup = true
+                    end
+                end
+                imgui.EndPopup()
+            end
+        end
+
+        local function openChatWithContact(num)
+            SaveCurrentDraft()
+            activeContact = num
+            activeChatId = num
+            activeChatHistory = load_chat_history(myNick, num)
+            UI.showContactProfile = false
+            UI.showCallHistory = false
+            UI.viewingCallIndex = 0
+            LoadDraft(num)
+            UI.showMessageSearch = false
+            UI.inputSearchMessage[0] = 0
+            if profile.unread and profile.unread[num] then
+                profile.unread[num] = nil
+                save_profile_data(myNick)
+            end
+            UI.scrollToBottom = true
+            UI.requestFocus = true
+        end
+
+        local pinnedContacts = {}
+        local regularContacts = {}
+        for _, c in ipairs(cachedSortedContacts) do
+            local num = c.num
+            local name = c.name
+            local skip = false
+            if sContactText ~= "" then
+                local lowerName = cp1251_lower(name)
+                local lowerNum = cp1251_lower(num)
+                local localDisplay = (num == "banking" and cp1251_lower(u8:decode(u8"Банк")))
+                    or (num == "system" and cp1251_lower(u8:decode(u8"Уведомления")))
+                    or (lowerName == "" and ("#" .. lowerNum) or (lowerName .. " (" .. lowerNum .. ")"))
+                if not localDisplay:find(sContactText, 1, true) then skip = true end
+            end
+
+            if not skip then
+                if profile.pinned and profile.pinned[num] and sContactText == "" then
+                    table.insert(pinnedContacts, c)
+                else
+                    table.insert(regularContacts, c)
+                end
+            end
+        end
+
+        local screenPad = 6 * scale
+        local listInnerW = winSize.x - screenPad * 2
+
+        if #pinnedContacts > 0 then
+            local cols = 3
+            local cellW = listInnerW / cols
+            local pinR = 25 * scale
+            local rowStartY = imgui.GetCursorPosY() + 2 * scale
+            local totalPinned = #pinnedContacts
+
+            for idx, c in ipairs(pinnedContacts) do
+                local colIdx = (idx - 1) % cols
+                if idx > 1 and colIdx == 0 then
+                    rowStartY = rowStartY + 76 * scale
+                end
+                local rowIndex = math.floor((idx - 1) / cols)
+                local itemsInThisRow = math.min(cols, totalPinned - rowIndex * cols)
+                local rowOffsetX = (listInnerW - itemsInThisRow * cellW) / 2
+                local cellX = screenPad + rowOffsetX + colIdx * cellW
+
+                imgui.SetCursorPos(imgui.ImVec2(cellX, rowStartY))
+                local sPos = imgui.GetCursorScreenPos()
+
+                imgui.PushIDStr("ios_pin_" .. c.num)
+                local clicked = imgui.InvisibleButton("pin_btn_" .. c.num, imgui.ImVec2(cellW, 72 * scale))
+                local hovered = imgui.IsItemHovered()
+                drawContactContextMenu(c.num, c.name)
+                if clicked then openChatWithContact(c.num) end
+                if hovered then imgui.SetMouseCursor(imgui.MouseCursor.Hand) end
+
+                local avCenter = imgui.ImVec2(sPos.x + cellW / 2, sPos.y + pinR + 4 * scale)
+                if hovered then
+                    cdl:AddCircleFilled(avCenter, pinR + 2.5 * scale, imgui.GetColorU32Vec4(pal.accent), 36)
+                end
+                
+                local drawnAv = false
+                if globalVerified[c.num] and globalVerified[c.num].avatar_url and globalVerified[c.num].avatar_url ~= "" then
+                    local url = globalVerified[c.num].avatar_url
+                    if not imageCache[url] then
+                        if globalSettings.autoDownloadMedia then downloadImageToCache(url) else imageCache[url] = { status = 4 } end
+                    end
+                    if imageCache[url] and imageCache[url].status == 2 then
+                        cdl:AddImageRounded(imageCache[url].tex, imgui.ImVec2(avCenter.x - pinR, avCenter.y - pinR), imgui.ImVec2(avCenter.x + pinR, avCenter.y + pinR), imgui.ImVec2(0,0), imgui.ImVec2(1,1), imgui.GetColorU32Vec4(imgui.ImVec4(1,1,1,1)), pinR)
+                        
+                        imgui.SetCursorScreenPos(imgui.ImVec2(avCenter.x - pinR, avCenter.y - pinR))
+                        if imgui.InvisibleButton("ios_av_pin_" .. c.num, imgui.ImVec2(pinR * 2, pinR * 2)) then
+                            UI.viewingImage = url
+                        end
+                        if imgui.IsItemHovered() then imgui.SetMouseCursor(imgui.MouseCursor.Hand) end
+                        
+                        drawnAv = true
+                    end
+                end
+                
+                if not drawnAv then
+                    cdl:AddCircleFilled(avCenter, pinR, imgui.GetColorU32Vec4(getAvatarColor(c.num, 1.0)), 36)
+                    local initStr = getContactInitials(c.num, c.name)
+                    local initSz = imgui.CalcTextSize(initStr)
+                    cdl:AddText(imgui.ImVec2(avCenter.x - initSz.x / 2, avCenter.y - initSz.y / 2), imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 1)), initStr)
+                end
+
+                if profile.nicknames and profile.nicknames[c.num] and onlinePlayers[profile.nicknames[c.num]] then
+                    local onCenter = imgui.ImVec2(avCenter.x + pinR * 0.72, avCenter.y + pinR * 0.72)
+                    cdl:AddCircleFilled(onCenter, 5.5 * scale, imgui.GetColorU32Vec4(pal.bgMain), 16)
+                    cdl:AddCircleFilled(onCenter, 4.2 * scale, imgui.GetColorU32Vec4(imgui.ImVec4(0.20, 0.82, 0.35, 1.0)), 16)
+                end
+
+                local is_unread = profile.unread and profile.unread[c.num]
+                if is_unread then
+                    local uCount = type(is_unread) == "number" and is_unread or 1
+                    local bStr = tostring(uCount)
+                    local bSz = imgui.CalcTextSize(bStr)
+                    local bW = math.max(bSz.x + 8 * scale, 16 * scale)
+                    local bH = 16 * scale
+                    local bx = avCenter.x + pinR * 0.38
+                    local by = avCenter.y - pinR * 0.90
+                    cdl:AddRectFilled(imgui.ImVec2(bx, by), imgui.ImVec2(bx + bW, by + bH), imgui.GetColorU32Vec4(pal.accent), 8 * scale)
+                    cdl:AddText(imgui.ImVec2(bx + (bW - bSz.x) / 2, by + (bH - bSz.y) / 2), imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 1)), bStr)
+                end
+
+                local shortPinName = (c.num == "banking" and u8"Банк")
+                    or (c.num == "system" and u8"Уведомления")
+                    or (c.name ~= "" and u8(c.name) or ("#" .. c.num))
+                local truncPin = truncateText(shortPinName, cellW - 8 * scale)
+                local pNameW = imgui.CalcTextSize(truncPin).x
+                cdl:AddText(
+                    imgui.ImVec2(sPos.x + (cellW - pNameW) / 2, avCenter.y + pinR + 4 * scale),
+                    imgui.GetColorU32Vec4(is_unread and pal.textPrimary or pal.textSecondary),
+                    truncPin
+                )
+                imgui.PopID()
+            end
+
+            imgui.SetCursorPosY(rowStartY + 76 * scale)
+            imgui.Dummy(imgui.ImVec2(0, 5 * scale))
+        end
+
+        for _, c in ipairs(regularContacts) do
+            local num = c.num
+            local name = c.name
+
+            imgui.PushIDStr("ios_c_" .. num)
+            local is_unread = profile.unread and profile.unread[num]
+            local is_muted = profile.muted and profile.muted[num]
+            local is_pinned = profile.pinned and profile.pinned[num]
+
+            local displayName = ""
+            if num == "banking" then displayName = u8"Банк"
+            elseif num == "system" then displayName = u8"Уведомления"
+            else
+                if name == "" then displayName = "#" .. num
+                elseif globalSettings.hideContactNumber then displayName = u8(name)
+                else displayName = u8(name) .. " (" .. num .. ")" end
+            end
+
+            local cursorPos = imgui.GetCursorScreenPos()
+            local item_h = 66 * scale
+            local p_min = imgui.ImVec2(winPos.x + screenPad, cursorPos.y)
+            local p_max = imgui.ImVec2(winPos.x + winSize.x - screenPad, cursorPos.y + item_h)
+
+            imgui.SetCursorPosX(screenPad)
+            local is_clicked = imgui.InvisibleButton("ios_cbtn_" .. num, imgui.ImVec2(winSize.x - screenPad * 2, item_h))
+            local is_hovered = imgui.IsItemHovered()
+            drawContactContextMenu(num, name)
+            if is_clicked then openChatWithContact(num) end
+            if is_hovered then
+                imgui.SetMouseCursor(imgui.MouseCursor.Hand)
+                cdl:AddRectFilled(p_min, p_max, imgui.GetColorU32Vec4(pal.cardHover), 12.0 * scale)
+            end
+
+            local avRadius = 24 * scale
+            local avCenter = imgui.ImVec2(p_min.x + 10 * scale + avRadius, p_min.y + item_h / 2)
+
+            local drawnAv = false
+            if globalVerified[num] and globalVerified[num].avatar_url and globalVerified[num].avatar_url ~= "" then
+                local url = globalVerified[num].avatar_url
+                if not imageCache[url] then
+                    if globalSettings.autoDownloadMedia then downloadImageToCache(url) else imageCache[url] = { status = 4 } end
+                end
+                if imageCache[url] and imageCache[url].status == 2 then
+                    cdl:AddImageRounded(imageCache[url].tex, imgui.ImVec2(avCenter.x - avRadius, avCenter.y - avRadius), imgui.ImVec2(avCenter.x + avRadius, avCenter.y + avRadius), imgui.ImVec2(0,0), imgui.ImVec2(1,1), imgui.GetColorU32Vec4(imgui.ImVec4(1,1,1,1)), avRadius)
+                    
+                    imgui.SetCursorScreenPos(imgui.ImVec2(avCenter.x - avRadius, avCenter.y - avRadius))
+                    if imgui.InvisibleButton("ios_av_reg_" .. num, imgui.ImVec2(avRadius * 2, avRadius * 2)) then
+                        UI.viewingImage = url
+                    end
+                    if imgui.IsItemHovered() then imgui.SetMouseCursor(imgui.MouseCursor.Hand) end
+                    
+                    drawnAv = true
+                end
+            end
+            
+            if not drawnAv then
+                cdl:AddCircleFilled(avCenter, avRadius, imgui.GetColorU32Vec4(getAvatarColor(num, 1.0)), 32)
+                local initStr = getContactInitials(num, name)
+                local initSize = imgui.CalcTextSize(initStr)
+                cdl:AddText(imgui.ImVec2(avCenter.x - initSize.x / 2, avCenter.y - initSize.y / 2), imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 1)), initStr)
+            end
+
+            if profile.nicknames and profile.nicknames[num] and onlinePlayers[profile.nicknames[num]] then
+                local onCenter = imgui.ImVec2(avCenter.x + avRadius * 0.75, avCenter.y + avRadius * 0.75)
+                cdl:AddCircleFilled(onCenter, 6.5 * scale, imgui.GetColorU32Vec4(pal.bgMain), 16)
+                cdl:AddCircleFilled(onCenter, 4.5 * scale, imgui.GetColorU32Vec4(imgui.ImVec4(0.20, 0.82, 0.35, 1.0)), 16)
+            end
+
+            local textLeftX = p_min.x + 10 * scale + avRadius * 2 + 12 * scale
+            local meta = profile.metadata and profile.metadata[num]
+            local calls = profile.calls and profile.calls[num]
+            local last_sms_ts = meta and meta.timestamp or 0
+            local last_call_ts = (calls and #calls > 0) and calls[#calls].timestamp or 0
+            local time_str = ""
+            local snippet = ""
+            if last_sms_ts > 0 or last_call_ts > 0 then
+                if last_sms_ts >= last_call_ts then
+                    time_str = formatMessageTime(last_sms_ts)
+                    if num == "banking" then snippet = u8"Выписка из банка"
+                    else
+                        local prefix = (meta.sender == "me") and u8"Вы: " or ""
+                        snippet = prefix .. u8(meta.text):gsub("\n", " ")
+                    end
+                else
+                    time_str = formatMessageTime(last_call_ts)
+                    snippet = u8"[Звонок]"
+                end
+            else
+                snippet = u8"Нет сообщений"
+            end
+
+            local time_w = imgui.CalcTextSize(time_str).x
+            cdl:AddText(imgui.ImVec2(p_max.x - time_w - 10 * scale, p_min.y + 10 * scale), imgui.GetColorU32Vec4(is_unread and pal.accent or pal.textSecondary), time_str)
+
+            local badges_w = 0
+            local isVerified = (num == "banking" or num == "system" or (profile.verified and profile.verified[num]))
+            if isVerified then badges_w = badges_w + 18 * scale end
+            if is_muted then badges_w = badges_w + 16 * scale end
+            if is_pinned then badges_w = badges_w + 16 * scale end
+
+            local maxNameW = (p_max.x - textLeftX) - time_w - badges_w - 16 * scale
+            local truncName = truncateText(displayName, maxNameW)
+            cdl:AddText(imgui.ImVec2(textLeftX, p_min.y + 10 * scale), imgui.GetColorU32Vec4(pal.textPrimary), truncName)
+
+            local badgeX = textLeftX + imgui.CalcTextSize(truncName).x + 8 * scale
+            local badgeY = p_min.y + 10 * scale + imgui.GetTextLineHeight() / 2
+            
+            if isVerified then
+                DrawVerificationBadge(cdl, imgui.ImVec2(badgeX, badgeY), 5.5 * scale, scale)
+                badgeX = badgeX + 16 * scale
+            end
+            if is_pinned then
+                DrawPinBadge(cdl, imgui.ImVec2(badgeX, badgeY), 5.0 * scale, scale)
+                badgeX = badgeX + 16 * scale
+            end
+            if is_muted then
+                DrawMuteBadge(cdl, imgui.ImVec2(badgeX, badgeY), 5.0 * scale, scale, pal.textSecondary)
+            end
+
+            local rightReserve = 10 * scale
+            if is_unread then
+                local unreadCount = type(is_unread) == "number" and is_unread or 1
+                local badgeTxt = tostring(unreadCount)
+                local bSz = imgui.CalcTextSize(badgeTxt)
+                local bW = math.max(bSz.x + 10 * scale, 18 * scale)
+                local bH = 16 * scale
+                local bx = p_max.x - bW - 10 * scale
+                local by = p_min.y + 35 * scale
+                local bCol = is_muted and pal.textSecondary or pal.accent
+                cdl:AddRectFilled(imgui.ImVec2(bx, by), imgui.ImVec2(bx + bW, by + bH), imgui.GetColorU32Vec4(bCol), 8.0 * scale)
+                cdl:AddText(imgui.ImVec2(bx + (bW - bSz.x) / 2, by + (bH - bSz.y) / 2), imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 1)), badgeTxt)
+                rightReserve = bW + 18 * scale
+            end
+
+            local has_draft = profile.drafts and profile.drafts[num] and profile.drafts[num] ~= ""
+            local snipMaxW = (p_max.x - textLeftX) - rightReserve
+            if has_draft then
+                local dText = u8"Черновик: " .. u8(profile.drafts[num]):gsub("\n", " ")
+                cdl:AddText(imgui.ImVec2(textLeftX, p_min.y + 35 * scale), imgui.GetColorU32Vec4(imgui.ImVec4(0.88, 0.32, 0.32, 1.0)), truncateToLastWord(dText, snipMaxW))
+            else
+                local snipCol = is_unread and pal.textPrimary or pal.textSecondary
+                cdl:AddText(imgui.ImVec2(textLeftX, p_min.y + 35 * scale), imgui.GetColorU32Vec4(snipCol), truncateToLastWord(snippet, snipMaxW))
+            end
+
+            cdl:AddLine(imgui.ImVec2(textLeftX, p_max.y), imgui.ImVec2(p_max.x - 10 * scale, p_max.y), imgui.GetColorU32Vec4(pal.separator), 1.0)
+
+            imgui.PopID()
+        end
+        
+        -- Задаем большой отступ (пустышку), чтобы последний контакт в списке гарантированно поднимался ВЫШЕ наложенной строки поиска
+        imgui.Dummy(imgui.ImVec2(0, 160 * scale)) 
+        imgui.EndChild()
+        -- PopStyleVar убран, так как мы переместили его в начало под BeginChild
+
+        local searchW = winSize.x - 32 * scale
+        local searchH = 38 * scale
+        local searchY = winSize.y - searchH - 24 * scale
+
+        imgui.SetCursorPos(imgui.ImVec2(16 * scale, searchY))
+        -- Используем BeginChild вместо отдельного окна, чтобы поиск не пропадал при перетаскивании телефона
+        imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(0,0))
+        if imgui.BeginChild("IosSearchBox", imgui.ImVec2(searchW, searchH), false, imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoBackground) then
+            
+            -- Отрисовываем полупрозрачную подложку поиска
+            local sdl = imgui.GetWindowDrawList()
+            sdl:AddRectFilled(imgui.ImVec2(winPos.x + 16 * scale, winPos.y + searchY), imgui.ImVec2(winPos.x + 16 * scale + searchW, winPos.y + searchY + searchH), imgui.GetColorU32Vec4(imgui.ImVec4(pal.inputBg.x, pal.inputBg.y, pal.inputBg.z, 0.85)), 12.0 * scale)
+
+            imgui.PushItemWidth(searchW)
+            imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 12.0 * scale)
+            imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, imgui.ImVec2(12 * scale, (searchH - imgui.GetTextLineHeight()) / 2))
+            imgui.PushStyleColor(imgui.Col.FrameBg, imgui.ImVec4(0,0,0,0))
+            
+            imgui.InputTextWithHint("##IosSearchContact", u8"Поиск", UI.inputSearchContact, 256)
+            
+            imgui.PopStyleColor()
+            imgui.PopStyleVar(2)
+            imgui.PopItemWidth()
+            
+            imgui.EndChild()
+        end
+        imgui.PopStyleVar()
+        popIosStyles()
+        return
+    end
+
+    -- Подготовка данных выбранного контакта
+    local rawName = profile.contacts[activeContact] or ""
+    local shortTitle = ""
+    if activeContact == "banking" then shortTitle = u8"Банк"
+    elseif activeContact == "system" then shortTitle = u8"Уведомления"
+    else shortTitle = (rawName ~= "" and u8(rawName) or ("#" .. activeContact)) end
+    local isVerifiedChat = (isSystemChat or (profile.verified and profile.verified[activeContact]))
+
+    -- =========================================================================
+    -- ЭКРАН 3: КАРТОЧКА КОНТАКТА iOS 26
+    -- =========================================================================
+    if UI.showContactProfile and not UI.showCallHistory then
+        imgui.SetCursorPos(imgui.ImVec2(16 * scale, 38 * scale))
+        local bClick = DrawIosVectorBtn("##ios_prof_back", "back", 15 * scale, pal.glassBtn, pal.glassBtnHover, pal.textPrimary, pal.glassBorder, scale)
+        if bClick then UI.showContactProfile = false end
+
+        if not isSystemChat then
+            local editLabel = u8"Изм."
+            local editW = imgui.CalcTextSize(editLabel).x + 22 * scale
+            imgui.SetCursorPos(imgui.ImVec2(winSize.x - editW - 16 * scale, 38 * scale))
+            imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 15.0 * scale)
+            imgui.PushStyleColor(imgui.Col.Button, pal.glassBtn)
+            imgui.PushStyleColor(imgui.Col.ButtonHovered, pal.glassBtnHover)
+            imgui.PushStyleColor(imgui.Col.Text, pal.textPrimary)
+            if imgui.Button(editLabel, imgui.ImVec2(editW, 30 * scale)) then
+                ffi.copy(UI.inputContactNumber, activeContact)
+                ffi.copy(UI.inputContactName, u8(rawName))
+                local nick = (profile.nicknames and profile.nicknames[activeContact]) and profile.nicknames[activeContact] or ""
+                ffi.copy(UI.inputContactNick, nick)
+                UI.requestContactModal = true
+            end
+            imgui.PopStyleColor(3)
+            imgui.PopStyleVar(1)
+        end
+
+        -- Большой круглый аватар по центру
+        local bigR = 36 * scale
+        local avCenter = imgui.ImVec2(winPos.x + winSize.x / 2, winPos.y + 100 * scale)
+        
+        local drawnAv = false
+        if globalVerified[activeContact] and globalVerified[activeContact].avatar_url and globalVerified[activeContact].avatar_url ~= "" then
+            local url = globalVerified[activeContact].avatar_url
+            if not imageCache[url] then
+                if globalSettings.autoDownloadMedia then downloadImageToCache(url) else imageCache[url] = { status = 4 } end
+            end
+            if imageCache[url] and imageCache[url].status == 2 then
+                dl:AddImageRounded(imageCache[url].tex, imgui.ImVec2(avCenter.x - bigR, avCenter.y - bigR), imgui.ImVec2(avCenter.x + bigR, avCenter.y + bigR), imgui.ImVec2(0,0), imgui.ImVec2(1,1), imgui.GetColorU32Vec4(imgui.ImVec4(1,1,1,1)), bigR)
+                
+                -- Кнопка просмотра перенесена сюда в карточку контакта
+                imgui.SetCursorScreenPos(imgui.ImVec2(avCenter.x - bigR, avCenter.y - bigR))
+                if imgui.InvisibleButton("ios_av_prof", imgui.ImVec2(bigR * 2, bigR * 2)) then
+                    UI.viewingImage = url
+                end
+                if imgui.IsItemHovered() then imgui.SetMouseCursor(imgui.MouseCursor.Hand) end
+                
+                drawnAv = true
+            end
+        end
+        
+        if not drawnAv then
+            dl:AddCircleFilled(avCenter, bigR, imgui.GetColorU32Vec4(getAvatarColor(activeContact, 1.0)), 48)
+            dl:AddCircle(avCenter, bigR, imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 0.50)), 48, 1.8 * scale)
+            local initChar = getContactInitials(activeContact, rawName)
+            local initSz = imgui.CalcTextSize(initChar)
+            dl:AddText(imgui.ImVec2(avCenter.x - initSz.x / 2, avCenter.y - initSz.y / 2), imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 1)), initChar)
+        end
+
+        local cNick = (profile.nicknames and profile.nicknames[activeContact]) and profile.nicknames[activeContact] or nil
+        local isOnline = cNick and onlinePlayers[cNick] or false
+        local subStr = isSystemChat and u8"СИСТЕМНЫЙ КОНТАКТ" or ("#" .. tostring(activeContact) .. (cNick and ("  |  " .. cNick) or ""))
+        local subW = imgui.CalcTextSize(subStr).x
+        dl:AddText(imgui.ImVec2(winPos.x + (winSize.x - subW) / 2, winPos.y + 144 * scale), imgui.GetColorU32Vec4(pal.textSecondary), subStr)
+
+        -- Идеально отцентрированное имя + галочка верификации
+        local nameSz = imgui.CalcTextSize(shortTitle)
+        local totalNameW = nameSz.x + (isVerifiedChat and (18 * scale) or 0)
+        local nameStartX = winPos.x + (winSize.x - totalNameW) / 2
+        local nameY = winPos.y + 163 * scale
+        dl:AddText(imgui.ImVec2(nameStartX, nameY), imgui.GetColorU32Vec4(pal.textPrimary), shortTitle)
+        if isVerifiedChat then
+            DrawVerificationBadge(dl, imgui.ImVec2(nameStartX + nameSz.x + 10 * scale, nameY + nameSz.y / 2), 6.2 * scale, scale)
+        end
+
+        local nextY = 186 * scale
+        if isOnline then
+            local onTxt = u8"В сети"
+            local onW = imgui.CalcTextSize(onTxt).x
+            dl:AddText(imgui.ImVec2(winPos.x + (winSize.x - onW) / 2, winPos.y + 183 * scale), imgui.GetColorU32Vec4(imgui.ImVec4(0.18, 0.78, 0.32, 1.0)), onTxt)
+            nextY = 204 * scale
+        end
+
+        -- Ряд из 4 круглых кнопок с описанием по наведению
+        if not isSystemChat then
+            local btnR = 19 * scale
+            local gap = 20 * scale
+            local totalRowW = (btnR * 2) * 4 + gap * 3
+            local startX = (winSize.x - totalRowW) / 2
+
+            local isMuted = profile.muted and profile.muted[activeContact]
+            local actions = {
+                { id = "##act_msg", icon = "msg", label = u8"СМС", tip = u8"Перейти к диалогу" },
+                { id = "##act_call", icon = "call", label = u8"Вызов", tip = u8"Позвонить контакту" },
+                { id = "##act_geo", icon = "geo", label = u8"Гео", tip = u8"Отправить геопозицию" },
+                { id = "##act_mute", icon = isMuted and "bell_off" or "bell_on", label = u8"Звук", tip = isMuted and u8"Включить уведомления" or u8"Отключить уведомления" }
+            }
+
+            for i, act in ipairs(actions) do
+                local bx = startX + (i - 1) * (btnR * 2 + gap)
+                imgui.SetCursorPos(imgui.ImVec2(bx, nextY))
+                local click, hov = DrawIosVectorBtn(act.id, act.icon, btnR, pal.cardBg, pal.cardHover, pal.accent, pal.glassBorder, scale)
+                if hov then imgui.SetTooltip(act.tip) end
+                if click then
+                    if i == 1 then
+                        UI.showContactProfile = false
+                    elseif i == 2 then
+                        sampSendChat("/call " .. activeContact)
+                        UI.windowState[0] = false
+                    elseif i == 3 then
+                        triggerAutoGeoMacro(activeContact)
+                    elseif i == 4 then
+                        if not profile.muted then profile.muted = {} end
+                        profile.muted[activeContact] = not profile.muted[activeContact]
+                        save_all_data()
+                    end
+                end
+                local lblW = imgui.CalcTextSize(act.label).x
+                dl:AddText(imgui.ImVec2(winPos.x + bx + btnR - lblW / 2, winPos.y + nextY + btnR * 2 + 3 * scale), imgui.GetColorU32Vec4(pal.textSecondary), act.label)
+            end
+            nextY = nextY + btnR * 2 + 24 * scale
+        end
+
+        -- Аккуратные карточки действий в стиле iOS
+        imgui.SetCursorPos(imgui.ImVec2(14 * scale, nextY))
+        imgui.BeginChild("IosContactDetailsScroll", imgui.ImVec2(winSize.x - 28 * scale, winSize.y - nextY - 22 * scale), false)
+        local cardW = imgui.GetContentRegionAvail().x
+        local cCalls = (profile.calls and profile.calls[activeContact]) or {}
+
+        if not isSystemChat then
+            local latestCall = (#cCalls > 0) and cCalls[#cCalls] or nil
+            if latestCall then
+                local cDate = os.date("%d.%m.%Y в %H:%M", latestCall.timestamp)
+                local dur = latestCall.duration or 0
+                if dur == 0 and latestCall.messages and #latestCall.messages > 0 then
+                    dur = latestCall.messages[#latestCall.messages].timestamp - latestCall.messages[1].timestamp
+                end
+                if DrawIosCardRow("##last_call_card", u8"Последний звонок", cDate, u8(formatCallDuration(dur) .. "  >"), nil, cardW, 44 * scale, pal, scale) then
+                    UI.showCallHistory = true
+                    UI.viewingCallIndex = #cCalls
+                    UI.callOpenedFromChat = false
+                end
+                imgui.Dummy(imgui.ImVec2(0, 4 * scale))
+            end
+
+            if DrawIosCardRow("##open_call_hist", u8"История звонков", nil, tostring(#cCalls) .. "  >", nil, cardW, 34 * scale, pal, scale) then
+                UI.showCallHistory = true
+                UI.viewingCallIndex = 0
+                UI.callOpenedFromChat = false
+            end
+            imgui.Dummy(imgui.ImVec2(0, 8 * scale))
+        end
+
+        if profile.tagger and profile.tagger[activeContact] then
+            if DrawIosCardRow("##open_nova", u8"Профиль Nova (Social)", nil, "@" .. tostring(profile.tagger[activeContact]) .. "  >", pal.accent, cardW, 34 * scale, pal, scale) then
+                local url = "https://nova.gambit-rp.com/" .. profile.tagger[activeContact]
+                shell32.ShellExecuteA(nil, "open", url, nil, nil, 1)
+            end
+            imgui.Dummy(imgui.ImVec2(0, 8 * scale))
+        end
+
+        local isPinned = profile.pinned and profile.pinned[activeContact]
+        if DrawIosCardRow("##pin_row", isPinned and u8"Открепить диалог" or u8"Закрепить диалог", nil, nil, nil, cardW, 34 * scale, pal, scale) then
+            if not profile.pinned then profile.pinned = {} end
+            if isPinned then profile.pinned[activeContact] = nil else profile.pinned[activeContact] = true end
+            save_all_data()
+            needSortContacts = true
+        end
+        imgui.Dummy(imgui.ImVec2(0, 4 * scale))
+
+        if not isSystemChat then
+            local isBlocked = profile.blocked and profile.blocked[activeContact]
+            if DrawIosCardRow("##block_row", isBlocked and u8"Разблокировать номер" or u8"Заблокировать номер", nil, nil, nil, cardW, 34 * scale, pal, scale) then
+                Macro.autoBlock = true
+                sampSendChat("/blocknum " .. activeContact)
+            end
+            imgui.Dummy(imgui.ImVec2(0, 4 * scale))
+        end
+
+        if DrawIosCardRow("##clear_row", u8"Очистить историю сообщений", nil, nil, nil, cardW, 34 * scale, pal, scale) then
+            save_chat_data(myNick, activeContact, {})
+            activeChatHistory = {}
+            profile.metadata[activeContact] = nil
+            profile.calls[activeContact] = nil
+            profile.unread[activeContact] = nil
+            save_all_data()
+            needSortContacts = true
+            UI.showContactProfile = false
+        end
+
+        if not isSystemChat then
+            imgui.Dummy(imgui.ImVec2(0, 8 * scale))
+            if DrawIosCardRow("##del_row", u8"Удалить контакт", nil, nil, imgui.ImVec4(0.92, 0.25, 0.25, 1.0), cardW, 34 * scale, pal, scale) then
+                UI.contactToDelete = activeContact
+                UI.requestDeletePopup = true
+            end
+        end
+
+        imgui.EndChild()
+        popIosStyles()
+        return
+    end
+
+    -- =========================================================================
+    -- ЭКРАН 4: ИСТОРИЯ ЗВОНКОВ iOS 26
+    -- =========================================================================
+    if UI.showCallHistory then
+        imgui.SetCursorPos(imgui.ImVec2(16 * scale, 38 * scale))
+        local closeClick = DrawIosVectorBtn("##ios_call_close", UI.viewingCallIndex > 0 and "back" or "close", 15 * scale, pal.glassBtn, pal.glassBtnHover, pal.textPrimary, pal.glassBorder, scale)
+        if closeClick then
+            if UI.viewingCallIndex > 0 and not UI.callOpenedFromChat then
+                UI.viewingCallIndex = 0
+            else
+                UI.showCallHistory = false
+                UI.viewingCallIndex = 0
+                UI.callOpenedFromChat = false
+            end
+        end
+
+        local chTitle = UI.viewingCallIndex == 0 and u8"История звонков" or u8"Запись разговора"
+        local chW = imgui.CalcTextSize(chTitle).x
+        imgui.SetCursorPos(imgui.ImVec2((winSize.x - chW) / 2, 43 * scale))
+        imgui.Text(chTitle)
+
+        imgui.SetCursorPos(imgui.ImVec2(14 * scale, 78 * scale))
+        imgui.BeginChild("IosCallHistoryCard", imgui.ImVec2(winSize.x - 28 * scale, winSize.y - 98 * scale), false)
+        local cCalls = profile.calls and profile.calls[activeContact] or {}
+        local deleteCallIndex = nil
+        local cardW = imgui.GetContentRegionAvail().x
+
+        if UI.viewingCallIndex == 0 then
+            if #cCalls > 0 then
+                for i = #cCalls, 1, -1 do
+                    local callData = cCalls[i]
+                    local dateStr = os.date("%d.%m.%Y в %H:%M", callData.timestamp)
+                    local calc_duration = callData.duration or 0
+                    if calc_duration == 0 and callData.messages and #callData.messages > 0 then
+                        calc_duration = callData.messages[#callData.messages].timestamp - callData.messages[1].timestamp
+                    end
+                    imgui.PushIDStr("ios_call_" .. i)
+                    if DrawIosCardRow("##call_item_" .. i, u8"Телефонный вызов", dateStr, u8(formatCallDuration(calc_duration) .. "  >"), nil, cardW, 44 * scale, pal, scale) then
+                        UI.viewingCallIndex = i
+                        UI.callOpenedFromChat = false
+                    end
+                    if imgui.BeginPopupContextItem("IosCallCtx_" .. i) then
+                        if imgui.Selectable(u8"Удалить запись") then deleteCallIndex = i end
+                        imgui.EndPopup()
+                    end
+                    imgui.Dummy(imgui.ImVec2(0, 4 * scale))
+                    imgui.PopID()
+                end
+            else
+                imgui.TextColored(pal.textSecondary, u8"Нет записанных звонков.")
+            end
+        else
+            local cCall = cCalls[UI.viewingCallIndex]
+            if cCall and cCall.messages and #cCall.messages > 0 then
+                for i, msgData in ipairs(cCall.messages) do
+                    local isMe = (msgData.sender == "me")
+                    local color = isMe and pal.accent or pal.textPrimary
+                    local prefix = isMe and u8"Вы: " or u8"Собеседник: "
+                    local timeStr = os.date("%H:%M:%S", msgData.timestamp)
+                    imgui.TextColored(pal.textSecondary, "[" .. timeStr .. "] ")
+                    imgui.SameLine()
+                    imgui.PushStyleColor(imgui.Col.Text, color)
+                    imgui.PushTextWrapPos(cardW - 8 * scale)
+                    imgui.Text(prefix .. u8(msgData.msg))
+                    imgui.PopTextWrapPos()
+                    imgui.PopStyleColor()
+                    if imgui.BeginPopupContextItem("IosCallMsgCtx_" .. i) then
+                        if imgui.Selectable(u8"Скопировать") then imgui.SetClipboardText(u8(msgData.msg)) end
+                        imgui.EndPopup()
+                    end
+                end
+            else
+                imgui.TextColored(pal.textSecondary, u8"Пустой разговор.")
+            end
+        end
+        if deleteCallIndex then
+            table.remove(profile.calls[activeContact], deleteCallIndex)
+            save_all_data()
+            needSortContacts = true
+        end
+        imgui.EndChild()
+        popIosStyles()
+        return
+    end
+
+    -- =========================================================================
+    -- ЭКРАН 2: ДИАЛОГ iMessage iOS 26
+    -- =========================================================================
+    imgui.SetCursorPos(imgui.ImVec2(16 * scale, 38 * scale))
+    local backClick = DrawIosVectorBtn("##ios_back_list", "back", 15 * scale, pal.glassBtn, pal.glassBtnHover, pal.textPrimary, pal.glassBorder, scale)
+    if backClick then
+        SaveCurrentDraft()
+        activeContact = nil
+        activeChatId = nil
+        activeChatHistory = nil
+        UI.showMessageSearch = false
+        popIosStyles()
+        return
+    end
+
+    if not isSystemChat then
+        imgui.SetCursorPos(imgui.ImVec2(winSize.x - 46 * scale, 38 * scale))
+        local callClick, callHov = DrawIosVectorBtn("##ios_top_call", "call", 15 * scale, pal.glassBtn, pal.glassBtnHover, pal.accent, pal.glassBorder, scale)
+        if callHov then imgui.SetTooltip(u8"Позвонить") end
+        if callClick then
+            sampSendChat("/call " .. activeContact)
+            UI.windowState[0] = false
+        end
+    end
+
+    -- Центральный аватар + капсула с именем контакта
+    local headAvR = 16 * scale
+    -- Приподнимаем чуть выше (на 52), чтобы освободить место и избежать "челки"
+    local headAvCenter = imgui.ImVec2(winPos.x + winSize.x / 2, winPos.y + 52 * scale)
+    
+    local drawnAv = false
+    if globalVerified[activeContact] and globalVerified[activeContact].avatar_url and globalVerified[activeContact].avatar_url ~= "" then
+        local url = globalVerified[activeContact].avatar_url
+        if not imageCache[url] then
+            if globalSettings.autoDownloadMedia then downloadImageToCache(url) else imageCache[url] = { status = 4 } end
+        end
+        if imageCache[url] and imageCache[url].status == 2 then
+            dl:AddImageRounded(imageCache[url].tex, imgui.ImVec2(headAvCenter.x - headAvR, headAvCenter.y - headAvR), imgui.ImVec2(headAvCenter.x + headAvR, headAvCenter.y + headAvR), imgui.ImVec2(0,0), imgui.ImVec2(1,1), imgui.GetColorU32Vec4(imgui.ImVec4(1,1,1,1)), headAvR)
+            
+            -- В шапке мы оставляем прозрачную кнопку, но клик по ней просто игнорируется (чтобы не перекрывать кнопку карточки)
+            imgui.SetCursorScreenPos(imgui.ImVec2(headAvCenter.x - headAvR, headAvCenter.y - headAvR))
+            imgui.InvisibleButton("ios_av_head", imgui.ImVec2(headAvR * 2, headAvR * 2))
+            
+            drawnAv = true
+        end
+    end
+    
+    if not drawnAv then
+        dl:AddCircleFilled(headAvCenter, headAvR, imgui.GetColorU32Vec4(getAvatarColor(activeContact, 1.0)), 32)
+        local hInit = getContactInitials(activeContact, rawName)
+        local hInitSz = imgui.CalcTextSize(hInit)
+        dl:AddText(imgui.ImVec2(headAvCenter.x - hInitSz.x / 2, headAvCenter.y - hInitSz.y / 2), imgui.GetColorU32Vec4(imgui.ImVec4(1, 1, 1, 1)), hInit)
+    end
+
+    local pillLabel = truncateText(shortTitle, 145 * scale)
+    local pillTextSz = imgui.CalcTextSize(pillLabel)
+    local badgeSpc = isVerifiedChat and (20 * scale) or 0
+    local pillW = pillTextSz.x + badgeSpc + 16 * scale
+    local pillH = pillTextSz.y + 6 * scale
+    local pillMin = imgui.ImVec2(winPos.x + (winSize.x - pillW) / 2, headAvCenter.y + headAvR + 4 * scale)
+    local pillMax = imgui.ImVec2(pillMin.x + pillW, pillMin.y + pillH)
+    dl:AddRectFilled(pillMin, pillMax, imgui.GetColorU32Vec4(pal.glassBtn), pillH / 2)
+    dl:AddText(imgui.ImVec2(pillMin.x + 8 * scale, pillMin.y + 3 * scale), imgui.GetColorU32Vec4(pal.textPrimary), pillLabel)
+    if isVerifiedChat then
+        DrawVerificationBadge(dl, imgui.ImVec2(pillMin.x + 8 * scale + pillTextSz.x + 10 * scale, pillMin.y + pillH / 2), 5.5 * scale, scale)
+    end
+
+    local clickBoxW = math.max(pillW, headAvR * 2)
+    local clickBoxH = (pillMax.y - (headAvCenter.y - headAvR))
+    imgui.SetCursorScreenPos(imgui.ImVec2(winPos.x + (winSize.x - clickBoxW) / 2, headAvCenter.y - headAvR))
+    if imgui.InvisibleButton("##ios_open_contact_card", imgui.ImVec2(clickBoxW, clickBoxH)) then
+        UI.showContactProfile = true
+    end
+    if imgui.IsItemHovered() then imgui.SetMouseCursor(imgui.MouseCursor.Hand) end
+
+    -- Опускаем зону скролла сообщений вниз
+    local chatTopY = 104 * scale
+    if UI.showMessageSearch then
+        imgui.SetCursorPos(imgui.ImVec2(14 * scale, chatTopY + 2 * scale))
+        imgui.PushItemWidth(winSize.x - 28 * scale)
+        if UI.requestFocusSearch then
+            imgui.SetKeyboardFocusHere()
+            UI.requestFocusSearch = false
+        end
+        imgui.InputTextWithHint("##IosSearchMsg", u8"Поиск в диалоге...", UI.inputSearchMessage, 256)
+        imgui.PopItemWidth()
+        chatTopY = chatTopY + 32 * scale
+    end
+
+    imgui.SetCursorPos(imgui.ImVec2(8 * scale, chatTopY))
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(0, 0))
+    imgui.BeginChild("IosChatHistory", imgui.ImVec2(winSize.x - 16 * scale, winSize.y - chatTopY - 58 * scale), false)
+    imgui.PopStyleVar()
+
+    imgui.Dummy(imgui.ImVec2(0, 8 * scale))
+    local currentHistory = activeChatHistory or {}
+    local cCalls = (profile.calls and profile.calls[activeContact]) or {}
+    local deleteMsgIndex = nil
+    local timeline = {}
+    for idx, mData in ipairs(currentHistory) do
+        table.insert(timeline, { itemType = "sms", index = idx, data = mData, timestamp = mData.timestamp or 0 })
+    end
+    for idx, cData in ipairs(cCalls) do
+        table.insert(timeline, { itemType = "call", index = idx, data = cData, timestamp = cData.timestamp or 0 })
+    end
+    table.sort(timeline, function(a, b)
+        if a.timestamp == b.timestamp then
+            if a.itemType ~= b.itemType then return a.itemType == "sms" end
+            return a.index < b.index
+        end
+        return a.timestamp < b.timestamp
+    end)
+
+    if #timeline > 0 then
+        local last_date_str = ""
+        local scrollY = imgui.GetScrollY()
+        local windowH = imgui.GetWindowHeight()
+        local culling_buffer = 200 * scale
+        local sMsgText = cp1251_lower(u8:decode(ffi.string(UI.inputSearchMessage)))
+        local isMsgSearching = UI.showMessageSearch and sMsgText ~= ""
+        local wrap_width = 210 * scale
+
+        for _, entry in ipairs(timeline) do
+            if entry.itemType == "call" then
+                if not isMsgSearching then
+                    local callData = entry.data
+                    local callIdx = entry.index
+                    local current_date_str = get_day_string(callData.timestamp)
+                    if current_date_str ~= last_date_str then
+                        imgui.Spacing()
+                        local tSize = imgui.CalcTextSize(u8(current_date_str)).x
+                        imgui.SetCursorPosX((imgui.GetWindowWidth() - tSize) / 2)
+                        imgui.TextColored(pal.textSecondary, u8(current_date_str))
+                        imgui.Spacing()
+                        last_date_str = current_date_str
+                    end
+                    local calc_duration = callData.duration or 0
+                    if calc_duration == 0 and callData.messages and #callData.messages > 0 then
+                        calc_duration = callData.messages[#callData.messages].timestamp - callData.messages[1].timestamp
+                    end
+                    local callTextU8 = u8("Звонок (" .. formatCallDuration(calc_duration) .. ")")
+                    local tSize = imgui.CalcTextSize(callTextU8)
+                    local posX = (imgui.GetWindowWidth() - tSize.x) / 2
+                    local posY = imgui.GetCursorPosY()
+                    imgui.SetCursorPosX(posX)
+                    imgui.InvisibleButton("##ios_call_btn_" .. callIdx, imgui.ImVec2(tSize.x, tSize.y + 4 * scale))
+                    if imgui.IsItemHovered() then
+                        imgui.SetMouseCursor(imgui.MouseCursor.Hand)
+                        if imgui.IsMouseClicked(0) then
+                            UI.showCallHistory = true
+                            UI.viewingCallIndex = callIdx
+                            UI.callOpenedFromChat = true
+                        end
+                    end
+                    imgui.SetCursorPos(imgui.ImVec2(posX, posY))
+                    imgui.TextColored(pal.accent, callTextU8)
+                    imgui.Spacing()
+                end
+            else
+                local index = entry.index
+                local msgData = entry.data
+                local skipMsg = false
+                if isMsgSearching then
+                    local lowerMsg = cp1251_lower(msgData.msg)
+                    if not lowerMsg:find(sMsgText, 1, true) then skipMsg = true end
+                end
+                if not skipMsg then
+                    local text = u8(msgData.msg)
+                    local urls = {}
+                    local foundUrls = {}
+                    local textToDisplay = text
+                    for word in text:gmatch("%S+") do
+                        local isUrl = false
+                        if word:match("^https?://[a-zA-Z0-9_%-%.%?%.:/%+=&]+") then isUrl = true
+                        elseif word:match("^[a-zA-Z0-9%-]+%.[a-zA-Z0-9%-%.]*[a-zA-Z][a-zA-Z]+[a-zA-Z0-9_%-%.%?%.:/%+=&]*$") then isUrl = true
+                        elseif word:match("^%d+%.%d+%.%d+%.%d+[:%d]*$") then isUrl = true end
+                        if isUrl and not foundUrls[word] then
+                            foundUrls[word] = true
+                            table.insert(urls, word)
+                            local safeWord = word:gsub("[%-%^%$%(%)%%%.%[%]%*%+%?]", "%%%1")
+                            textToDisplay = textToDisplay:gsub(safeWord, "")
+                        end
+                    end
+                    textToDisplay = textToDisplay:gsub(" +", " "):match("^%s*(.-)%s*$") or ""
+                    local current_date_str = get_day_string(msgData.timestamp)
+                    local has_date = (current_date_str ~= last_date_str)
+                    local date_h = has_date and (10 + imgui.GetTextLineHeight()) or 0
+                    local timeText = (msgData.timestamp and msgData.timestamp > 0) and os.date("%H:%M", msgData.timestamp) or "00:00"
+
+                    local urlsStr = table.concat(urls, "|")
+                    local loadedStr = "ios_"
+                    for _, url in ipairs(urls) do
+                        if imageCache[url] and imageCache[url].status == 2 then
+                            loadedStr = loadedStr .. url .. imageCache[url].w .. "x" .. imageCache[url].h
+                        elseif imageCache[url] and imageCache[url].status == 3 then
+                            loadedStr = loadedStr .. url .. "err"
+                        elseif imageCache[url] and imageCache[url].status == 4 then
+                            loadedStr = loadedStr .. url .. "manual"
+                        end
+                    end
+
+                    if not msgData.bubbleSize or msgData.cachedScale ~= scale or msgData.urlsStr ~= urlsStr or msgData.loadedStr ~= loadedStr then
+                        local msgTextSize = (textToDisplay ~= "") and imgui.CalcTextSize(textToDisplay, nil, false, wrap_width) or imgui.ImVec2(0, 0)
+                        local timeSize = imgui.CalcTextSize(timeText)
+                        local padding = imgui.ImVec2(12 * scale, 8 * scale)
+                        local b_width = (textToDisplay ~= "") and msgTextSize.x or 0
+                        local b_height = padding.y * 1.5 + timeSize.y
+                        if textToDisplay ~= "" then b_height = b_height + msgTextSize.y + 4 end
+                        for _, url in ipairs(urls) do
+                            local lUrl = url:lower()
+                            local isImg = lUrl:match("^https?://i%.imgur%.com/") and (lUrl:match("%.png$") or lUrl:match("%.jpe?g$") or lUrl:match("%.gif$"))
+                            if isImg then
+                                if imageCache[url] and imageCache[url].status == 2 then
+                                    local iw = math.min(imageCache[url].w * scale, wrap_width)
+                                    local ih = iw * (imageCache[url].h / imageCache[url].w)
+                                    b_width = math.max(b_width, iw)
+                                    b_height = b_height + ih + 5
+                                else
+                                    b_width = math.max(b_width, 130 * scale)
+                                    b_height = b_height + 100 * scale + 5
+                                end
+                            else
+                                local linkSize = imgui.CalcTextSize(url, nil, false, wrap_width)
+                                b_width = math.max(b_width, linkSize.x)
+                                b_height = b_height + linkSize.y + 5
+                            end
+                        end
+                        b_width = math.max(b_width, timeSize.x + 10)
+                        msgData.bubbleSize = {x = b_width + padding.x * 2, y = b_height}
+                        msgData.timeSize = {x = timeSize.x, y = timeSize.y}
+                        msgData.cachedScale = scale
+                        msgData.urls = urls
+                        msgData.urlsStr = urlsStr
+                        msgData.loadedStr = loadedStr
+                        msgData.textToDisplay = textToDisplay
+                    end
+
+                    local bubbleSize = imgui.ImVec2(msgData.bubbleSize.x, msgData.bubbleSize.y)
+                    local timeSize = imgui.ImVec2(msgData.timeSize.x, msgData.timeSize.y)
+                    local padding = imgui.ImVec2(12 * scale, 8 * scale)
+                    local startY = imgui.GetCursorPosY()
+                    local item_total_h = date_h + bubbleSize.y + 6
+
+                    if startY + item_total_h < scrollY - culling_buffer or startY > scrollY + windowH + culling_buffer then
+                        imgui.SetCursorPosY(startY + item_total_h)
+                        if has_date then last_date_str = current_date_str end
+                    else
+                        if has_date then
+                            imgui.Spacing()
+                            local tSize = imgui.CalcTextSize(u8(current_date_str)).x
+                            imgui.SetCursorPosX((imgui.GetWindowWidth() - tSize) / 2)
+                            imgui.TextColored(pal.textSecondary, u8(current_date_str))
+                            imgui.Spacing()
+                            last_date_str = current_date_str
+                        end
+                        local bubble_start_y = imgui.GetCursorPosY()
+                        local windowWidth = imgui.GetWindowWidth()
+                        local isMe = (msgData.sender == "me")
+                        local cursorX = isMe and (windowWidth - bubbleSize.x - 8 * scale) or (8 * scale)
+
+                        imgui.SetCursorPos(imgui.ImVec2(cursorX, bubble_start_y))
+                        local screenPos = imgui.GetCursorScreenPos()
+                        local bColor = isMe and pal.bubbleMe or pal.bubbleThem
+                        local tColor = isMe and pal.bubbleMeText or pal.bubbleThemText
+                        local tmColor = isMe and pal.bubbleMeTime or pal.bubbleThemTime
+                        local bdl = imgui.GetWindowDrawList()
+
+                        DrawSmoothRoundedRect(
+                            bdl,
+                            screenPos,
+                            imgui.ImVec2(screenPos.x + bubbleSize.x, screenPos.y + bubbleSize.y),
+                            imgui.GetColorU32Vec4(bColor),
+                            14.0 * scale
+                        )
+
+                        imgui.SetCursorPos(imgui.ImVec2(cursorX, bubble_start_y))
+                        imgui.InvisibleButton("ios_msgbtn_" .. index, bubbleSize)
+                        imgui.SetItemAllowOverlap()
+                        if imgui.BeginPopupContextItem("IosMsgPopup_" .. index) then
+                            if imgui.Selectable(u8"Скопировать") then imgui.SetClipboardText(text) end
+                            imgui.Separator()
+                            if imgui.Selectable(u8"Удалить") then deleteMsgIndex = index end
+                            imgui.EndPopup()
+                        end
+
+                        local currentOffset = bubble_start_y + padding.y
+                        if msgData.textToDisplay ~= "" then
+                            imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
+                            imgui.PushStyleColor(imgui.Col.Text, tColor)
+                            imgui.PushTextWrapPos(imgui.GetCursorPosX() + wrap_width)
+                            imgui.Text(msgData.textToDisplay)
+                            imgui.PopTextWrapPos()
+                            imgui.PopStyleColor()
+                            currentOffset = currentOffset + imgui.CalcTextSize(msgData.textToDisplay, nil, false, wrap_width).y + 4
+                        end
+
+                        for u_idx, url in ipairs(msgData.urls) do
+                            local lUrl = url:lower()
+                            local isImg = lUrl:match("^https?://i%.imgur%.com/") and (lUrl:match("%.png$") or lUrl:match("%.jpe?g$") or lUrl:match("%.gif$"))
+                            if isImg then
+                                imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
+                                if not imageCache[url] then
+                                    if globalSettings.autoDownloadMedia then downloadImageToCache(url) else imageCache[url] = { status = 4 } end
+                                end
+                                if imageCache[url].status == 2 then
+                                    local iw = math.min(imageCache[url].w * scale, wrap_width)
+                                    local ih = iw * (imageCache[url].h / imageCache[url].w)
+                                    imgui.Image(imageCache[url].tex, imgui.ImVec2(iw, ih))
+                                    imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
+                                    imgui.InvisibleButton("ios_img_" .. index .. "_" .. u_idx, imgui.ImVec2(iw, ih))
+                                    if imgui.IsItemHovered() and imgui.IsMouseClicked(0) then UI.viewingImage = url end
+                                    if imgui.BeginPopupContextItem("IosImgCtx_" .. index .. "_" .. u_idx) then
+                                        if imgui.Selectable(u8"В галерею") then
+                                            globalSettings.gallery = globalSettings.gallery or {}
+                                            local exists = false
+                                            for _, v in ipairs(globalSettings.gallery) do if v == url then exists = true break end end
+                                            if not exists then
+                                                table.insert(globalSettings.gallery, url)
+                                                save_all_data()
+                                                showSystemNotification(u8"Картинка сохранена в галерею", 1)
+                                            end
+                                        end
+                                        imgui.Separator()
+                                        if imgui.Selectable(u8"Скопировать ссылку") then imgui.SetClipboardText(url) end
+                                        if imgui.Selectable(u8"Открыть в браузере") then
+                                            UI.linkToOpen = url
+                                            UI.requestLinkModal = true
+                                        end
+                                        imgui.EndPopup()
+                                    end
+                                    currentOffset = currentOffset + ih + 5
+                                else
+                                    imgui.TextColored(tmColor, u8"Медиа...")
+                                    currentOffset = currentOffset + 25 * scale
+                                end
+                            else
+                                imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
+                                local lnkCol = isMe and imgui.ImVec4(0.85, 0.95, 1.0, 1.0) or pal.accent
+                                imgui.PushStyleColor(imgui.Col.Text, lnkCol)
+                                imgui.PushTextWrapPos(imgui.GetCursorPosX() + wrap_width)
+                                imgui.Text(url)
+                                imgui.PopTextWrapPos()
+                                imgui.PopStyleColor()
+                                local linkSize = imgui.CalcTextSize(url, nil, false, wrap_width)
+                                imgui.SetCursorPos(imgui.ImVec2(cursorX + padding.x, currentOffset))
+                                if imgui.InvisibleButton("ios_lnk_" .. index .. "_" .. u_idx, linkSize) then
+                                    UI.linkToOpen = url
+                                    UI.requestLinkModal = true
+                                end
+                                currentOffset = currentOffset + linkSize.y + 5
+                            end
+                        end
+
+                        local time_x = cursorX + bubbleSize.x - timeSize.x - padding.x + 4
+                        local time_y = bubble_start_y + bubbleSize.y - timeSize.y - padding.y / 2
+                        imgui.SetCursorPos(imgui.ImVec2(time_x, time_y))
+                        imgui.TextColored(tmColor, timeText)
+                        imgui.SetCursorPosY(bubble_start_y + bubbleSize.y + 6)
+                    end
+                end
+            end
+        end
+
+        if deleteMsgIndex then
+            table.remove(currentHistory, deleteMsgIndex)
+            if #currentHistory > 0 then
+                local lMsg = currentHistory[#currentHistory]
+                profile.metadata[activeContact] = { sender = lMsg.sender, text = lMsg.msg, timestamp = lMsg.timestamp }
+            else
+                profile.metadata[activeContact] = nil
+            end
+            save_chat_data(myNick, activeContact, currentHistory)
+            save_all_data()
+            needSortContacts = true
+        end
+    end
+
+    if UI.scrollToBottom then
+        UI.scrollTicks = 2
+        UI.scrollToBottom = false
+    end
+    if UI.scrollTicks and UI.scrollTicks > 0 then
+        imgui.SetScrollY(imgui.GetScrollMaxY() + 999999.0)
+        UI.scrollTicks = UI.scrollTicks - 1
+    end
+    imgui.EndChild()
+
+    -- Нижняя панель ввода iOS 26 (поднята над скруглением и выровнена строго внутри рамки)
+    local inputRowY = winSize.y - 52 * scale
+    if isSystemChat then
+        local bText = u8"Системный канал (только чтение)"
+        local bw = imgui.CalcTextSize(bText).x
+        imgui.SetCursorPos(imgui.ImVec2((winSize.x - bw) / 2, inputRowY + 4 * scale))
+        imgui.TextColored(pal.textSecondary, bText)
+    else
+        imgui.SetCursorPos(imgui.ImVec2(16 * scale, inputRowY))
+        local pClick, pHov = DrawIosVectorBtn("##ios_plus_btn", "plus", 14 * scale, pal.glassBtn, pal.glassBtnHover, pal.textPrimary, pal.glassBorder, scale)
+        if pHov then imgui.SetTooltip(u8"Вложения и действия") end
+        if pClick then imgui.OpenPopup("IosPlusMenu") end
+
+        if imgui.BeginPopup("IosPlusMenu") then
+            if imgui.Selectable(u8"Отправить геопозицию") then triggerAutoGeoMacro(activeContact) end
+            if imgui.Selectable(u8"Галерея медиа") then UI.showGallery[0] = not UI.showGallery[0] end
+            if imgui.Selectable(u8"Поиск по сообщениям") then
+                UI.showMessageSearch = not UI.showMessageSearch
+                if UI.showMessageSearch then UI.requestFocusSearch = true else UI.inputSearchMessage[0] = 0 end
+            end
+            if imgui.Selectable(u8"История звонков") then
+                UI.showCallHistory = true
+                UI.viewingCallIndex = 0
+                UI.callOpenedFromChat = false
+            end
+            if imgui.Selectable(u8"Карточка контакта") then
+                UI.showContactProfile = true
+            end
+            imgui.EndPopup()
+        end
+
+        local inputX = 50 * scale
+        local sendBtnX = winSize.x - 44 * scale
+        local inputW = sendBtnX - inputX - 6 * scale
+        local padY = math.max(4 * scale, (28 * scale - imgui.GetTextLineHeight()) / 2)
+
+        imgui.SetCursorPos(imgui.ImVec2(inputX, inputRowY))
+        imgui.PushItemWidth(inputW)
+        imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 14.0 * scale)
+        imgui.PushStyleVarVec2(imgui.StyleVar.FramePadding, imgui.ImVec2(12 * scale, padY))
+        if imgui.InputTextWithHint("##IosMessageInput", u8"iMessage...", UI.inputMessage, 2048, imgui.InputTextFlags.EnterReturnsTrue) then
+            sendMessage(activeContact)
+        end
+        if UI.requestFocus then
+            imgui.SetKeyboardFocusHere(-1)
+            UI.requestFocus = false
+        end
+        imgui.PopStyleVar(2)
+        imgui.PopItemWidth()
+
+        imgui.SetCursorPos(imgui.ImVec2(sendBtnX, inputRowY))
+        local sClick = DrawIosVectorBtn("##ios_send_btn", "send", 14 * scale, pal.accent, pal.accent, imgui.ImVec4(1, 1, 1, 1), nil, scale)
+        if sClick then sendMessage(activeContact) end
+    end
+
+    -- Маска рисуется ТОЛЬКО если мы находимся на главном экране (список контактов)
+    if not activeContact then
+        local finalDl = imgui.GetWindowDrawList()
+        local fOuterMin = winPos
+        local fOuterMax = imgui.ImVec2(winPos.x + winSize.x, winPos.y + winSize.y)
+        local fBezelMin = imgui.ImVec2(winPos.x + 2.5 * scale, winPos.y + 2.5 * scale)
+        local fBezelMax = imgui.ImVec2(winPos.x + winSize.x - 2.5 * scale, winPos.y + winSize.y - 2.5 * scale)
+        finalDl:AddRect(fOuterMin, fOuterMax, imgui.GetColorU32Vec4(pal.frameOuter), 34.0 * scale, 15, 6.0 * scale)
+        finalDl:AddRect(fBezelMin, fBezelMax, imgui.GetColorU32Vec4(pal.frameBezel), 31.5 * scale, 15, 6.0 * scale)
+    end
+
+    popIosStyles()
+end
+
+local wasWindowOpen = false
 local newFrame = imgui.OnFrame(
     function() return UI.windowState[0] or UI.viewingImage ~= nil or UI.showGallery[0] end,
     function(player)
+        local profile = phoneData[myNick]
+        if not profile then return end
+
         if globalSettings.font and globalSettings.font > 1 and customFonts[globalSettings.font] then
             imgui.PushFont(customFonts[globalSettings.font])
         end
@@ -4635,44 +6398,58 @@ local newFrame = imgui.OnFrame(
         imgui.GetIO().FontGlobalScale = baseScale * fontPreview
         
         local resX, resY = getScreenResolution()
-        imgui.SetNextWindowPos(imgui.ImVec2(resX / 2, resY / 2), imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
-        
-        local sizeCond = UI.forceResize and imgui.Cond.Always or imgui.Cond.FirstUseEver
-        imgui.SetNextWindowSize(imgui.ImVec2(750 * scale, 500 * scale), sizeCond)
-        if UI.forceResize then UI.forceResize = false end
-        
-        local profile = phoneData[myNick]
-        if not profile then return end
-        
         local active_theme = GetActiveTheme()
         ApplyTheme(active_theme, 0.95)
-        
+
+        local isPhone = globalSettings.iosPhoneMode
+
         imgui.PushStyleVarFloat(imgui.StyleVar.FrameRounding, 6.0 * scale)
         imgui.PushStyleVarFloat(imgui.StyleVar.ChildRounding, 6.0 * scale)
-        imgui.PushStyleVarFloat(imgui.StyleVar.PopupRounding, 6.0 * scale)
+        imgui.PushStyleVarFloat(imgui.StyleVar.PopupRounding, 10.0 * scale)
         imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 8.0 * scale)
 
+        local sizeCond = UI.forceResize and imgui.Cond.Always or imgui.Cond.FirstUseEver
         DrawThemeEditor(scale, sizeCond)
 
-        if imgui.Begin(u8"Мессенджер", UI.windowState, imgui.WindowFlags.NoCollapse) then
+        if UI.windowState[0] and not wasWindowOpen then
+            imgui.SetNextWindowFocus()
+        end
+        wasWindowOpen = UI.windowState[0]
 
-            DrawModals(scale)
+        if isPhone then
+            imgui.SetNextWindowPos(imgui.ImVec2(resX - 28 * scale, resY - 28 * scale), imgui.Cond.FirstUseEver, imgui.ImVec2(1.0, 1.0))
+            imgui.SetNextWindowSize(imgui.ImVec2(335 * scale, 610 * scale), imgui.Cond.Always)
+            if UI.forceResize then UI.forceResize = false end
 
-            profile = phoneData[myNick]
+            imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(0, 0))
+            imgui.PushStyleVarFloat(imgui.StyleVar.WindowBorderSize, 0.0)
+            local phoneFlags = imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoBackground
+            local begun = imgui.Begin("##Ios26PhoneWindow", UI.windowState, phoneFlags)
+            imgui.PopStyleVar(2)
 
-            imgui.Columns(2, "PhoneColumns", false)
-            imgui.SetColumnWidth(0, 280 * scale)
+            if begun then
+                DrawModals(scale)
+                profile = phoneData[myNick]
+                DrawIosPhoneContent(scale, profile)
+                imgui.End()
+            end
+        else
+            imgui.SetNextWindowPos(imgui.ImVec2(resX / 2, resY / 2), imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
+            imgui.SetNextWindowSize(imgui.ImVec2(750 * scale, 500 * scale), sizeCond)
+            if UI.forceResize then UI.forceResize = false end
 
-            local leftAvailW = imgui.GetContentRegionAvail().x
-            
-            DrawContactsList(scale, profile, leftAvailW)
-
-            imgui.NextColumn()
-
-            DrawChatHistory(scale, profile)
-
-            imgui.Columns(1)
-            imgui.End()
+            if imgui.Begin(u8"Мессенджер", UI.windowState, imgui.WindowFlags.NoCollapse) then
+                DrawModals(scale)
+                profile = phoneData[myNick]
+                imgui.Columns(2, "PhoneColumns", false)
+                imgui.SetColumnWidth(0, 280 * scale)
+                local leftAvailW = imgui.GetContentRegionAvail().x
+                DrawContactsList(scale, profile, leftAvailW)
+                imgui.NextColumn()
+                DrawChatHistory(scale, profile)
+                imgui.Columns(1)
+                imgui.End()
+            end
         end
         
         DrawGalleryWindow(scale)
@@ -4692,7 +6469,7 @@ function sendMessage(number)
     text = text:gsub("[\r\n]+", " "):match("^%s*(.-)%s*$") or ""
     if text ~= "" then
         local prefixLen = 6 + #tostring(number)
-        local maxLen = 125 - prefixLen
+        local maxLen = 128 - prefixLen - 1
         if maxLen < 20 then maxLen = 20 end
         
         local chunks = {}
@@ -4734,9 +6511,11 @@ function sendMessage(number)
         pendingLocalSms[number].time = os.clock()
         
         for i, chunk in ipairs(chunks) do
-            if i == 1 and #smsOutQueue == 0 and (os.clock() - lastSmsOutTime > 1.2) then
+            if i == 1 and #smsOutQueue == 0 and (os.clock() - lastSmsOutTime > smsSendDelay) then
+                lastSentSmsTask = { num = number, text = chunk }
                 sampSendChat("/sms " .. number .. " " .. chunk)
                 lastSmsOutTime = os.clock()
+                smsSendDelay = 1.0
             else
                 table.insert(smsOutQueue, { num = number, text = chunk })
             end
